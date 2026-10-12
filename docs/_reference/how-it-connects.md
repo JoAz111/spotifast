@@ -46,8 +46,13 @@ do not replay after a connection changes.
 
 ## Rate limits
 
-API requests are paced at most once per 500 ms per authorization. Every queued
-request rechecks the shared cooldown after acquiring an in-flight slot. A Spotify
+API requests are paced at most once per 500 ms per authorization. Token preparation
+finishes before admission; expiry and grant revocation are rechecked at the paced
+start. Waiting for pacing or cooldown does not occupy an in-flight slot. Foreground
+pages, search and playback intent receive the next eligible slot ahead of optional
+Home shelves and enrichment. Each priority class remains FIFO; sustained foreground
+work can delay optional shelves. Only optional work uses the background-work cap.
+A Spotify
 429 response preserves the full `Retry-After` period; it is not capped at 30 seconds.
 Requests resume at the paced rate, avoiding a release burst. Ordered queue writes
 keep their existing order while waiting. This reduces unnecessary traffic, but

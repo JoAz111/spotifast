@@ -13,17 +13,16 @@ use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::sync::Semaphore;
 
 use super::ApiSource;
+use super::admission::{RequestGate, RequestPermit, current_priority};
 use super::models::*;
 use crate::http::Http;
 
 const BASE_URL: &str = "https://api.spotify.com/v1";
-const MAX_IN_FLIGHT: usize = 6;
 const RATE_LIMIT_RETRIES: u32 = 3;
-// Pace starts as well as limiting concurrency: a release from cooldown must
-// not send an entire queue of requests in the same instant.
+// Must match the admission gate; the transport regression checks paced starts.
+#[cfg(test)]
 const REQUEST_SPACING: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, Error)]
@@ -88,15 +87,42 @@ pub enum TokenProvider {
 }
 
 impl TokenProvider {
-    async fn access_token(&self) -> Result<String> {
+    async fn prepare_token(&self) -> Result<PreparedToken> {
         match self {
-            Self::Web(tokens) => tokens.access_token(false).await,
+            Self::Web(tokens) => tokens.prepare_token(false).await,
         }
+    }
+
+    /// Recheck revocation and expiry after a potentially long admission wait.
+    fn admitted_token_is_valid(&self, token: &PreparedToken) -> Result<bool> {
+        let Self::Web(tokens) = self;
+        if !tokens.lease.current() {
+            return Err(ApiError::SignInExpired {
+                api_source: tokens.source,
+            });
+        }
+        Ok(!token.expired())
     }
 
     async fn invalidate(&self) {
         let Self::Web(tokens) = self;
-        let _ = tokens.access_token(true).await;
+        let _ = tokens.prepare_token(true).await;
+    }
+}
+
+/// A token prepared before admission, with only synchronous validation at send.
+struct PreparedToken {
+    value: String,
+    expires_at: u64,
+}
+
+impl PreparedToken {
+    fn expired(&self) -> bool {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default()
+            >= self.expires_at
     }
 }
 
@@ -142,7 +168,12 @@ impl WebTokens {
 
     /// A valid access token, refreshing first when it is close to expiry or
     /// `force` asks for a fresh one after a 401.
+    #[cfg(test)]
     async fn access_token(&self, force: bool) -> Result<String> {
+        self.prepare_token(force).await.map(|token| token.value)
+    }
+
+    async fn prepare_token(&self, force: bool) -> Result<PreparedToken> {
         let mut guard = self.token.lock().await;
         if !self.lease.current() {
             return Err(ApiError::SignInExpired {
@@ -203,7 +234,15 @@ impl WebTokens {
                 }
             }
         }
-        Ok(guard.access_token.clone())
+        if guard.expired() {
+            return Err(ApiError::SignInExpired {
+                api_source: self.source,
+            });
+        }
+        Ok(PreparedToken {
+            value: guard.access_token.clone(),
+            expires_at: guard.expires_at,
+        })
     }
 }
 
@@ -333,10 +372,8 @@ pub struct ApiClient {
     base_url: Option<String>,
     http: Http,
     tokens: Mutex<Option<TokenProvider>>,
-    limiter: Semaphore,
+    admission: Arc<RequestGate>,
     queue_writes: tokio::sync::Mutex<()>,
-    cooldown_until: tokio::sync::Mutex<tokio::time::Instant>,
-    next_request_at: tokio::sync::Mutex<tokio::time::Instant>,
     search_limit: u32,
     artist_albums_limit: u32,
     source: ApiSource,
@@ -356,10 +393,8 @@ impl ApiClient {
             base_url: None,
             http: http.into(),
             tokens: Mutex::new(None),
-            limiter: Semaphore::new(MAX_IN_FLIGHT),
+            admission: RequestGate::new(),
             queue_writes: tokio::sync::Mutex::new(()),
-            cooldown_until: tokio::sync::Mutex::new(tokio::time::Instant::now()),
-            next_request_at: tokio::sync::Mutex::new(tokio::time::Instant::now()),
             search_limit,
             artist_albums_limit,
             source,
@@ -393,30 +428,12 @@ impl ApiClient {
             .ok_or(ApiError::NotSignedIn)
     }
 
-    async fn wait_for_request_slot(&self) {
-        loop {
-            let mut next = self.next_request_at.lock().await;
-            let until = self.cooldown_until.lock().await;
-            let now = tokio::time::Instant::now();
-            let due = (*next).max(*until);
-            if due > now {
-                drop(until);
-                drop(next);
-                tokio::time::sleep_until(due).await;
-                continue;
-            }
-            *next = now + REQUEST_SPACING;
-            return;
-        }
+    async fn wait_for_request_slot(&self) -> RequestPermit {
+        self.admission.acquire(current_priority()).await
     }
 
     async fn extend_cooldown(&self, wait: Duration) {
-        let mut until = self.cooldown_until.lock().await;
-        let now = tokio::time::Instant::now();
-        let requested = now
-            .checked_add(wait)
-            .unwrap_or_else(|| now + Duration::from_secs(u32::MAX.into()));
-        *until = (*until).max(requested);
+        self.admission.extend_cooldown(wait);
     }
 
     // ---- transport -------------------------------------------------------
@@ -459,22 +476,21 @@ impl ApiClient {
         let mut attempt = 0;
         let queue_write = method == Method::POST && path == "/me/player/queue";
         loop {
+            // Token refresh must finish before paced admission: otherwise
+            // multiple admitted requests can gather behind it and send a burst.
+            let token = provider.prepare_token().await?;
+            let permit = self.wait_for_request_slot().await;
+            if !provider.admitted_token_is_valid(&token)? {
+                drop(permit);
+                continue;
+            }
             attempt = u32::saturating_add(attempt, 1);
-            let permit = self
-                .limiter
-                .acquire()
-                .await
-                .map_err(|_| ApiError::NotSignedIn)?;
-            // A request that was queued on the semaphore must recheck a
-            // cooldown set by another request before it sends anything.
-            self.wait_for_request_slot().await;
-            let token = provider.access_token().await?;
             let mut request = self
                 .http
                 .client()
                 .map_err(ApiError::Network)?
                 .request(method.clone(), &url)
-                .bearer_auth(&token)
+                .bearer_auth(&token.value)
                 .query(query);
             if let Some(jpeg) = jpeg {
                 request = request
@@ -1193,6 +1209,113 @@ impl ApiClient {
 mod tests {
     use super::*;
 
+    fn admission_client(
+        label: &str,
+    ) -> (
+        crate::credentials::Store,
+        Arc<WebTokens>,
+        Arc<ApiClient>,
+        std::path::PathBuf,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "spotifast-admission-{label}-{}",
+            std::process::id()
+        ));
+        let store = crate::credentials::Store::in_memory(crate::paths::AppDirs {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+        });
+        let tokens = WebTokens::new(
+            reqwest::Client::new(),
+            crate::auth::StoredToken {
+                client_id: "0123456789abcdef0123456789abcdef".into(),
+                access_token: "dummy-access".into(),
+                refresh_token: "dummy-refresh".into(),
+                expires_at: u64::MAX,
+                scope: String::new(),
+            },
+            store.lease(crate::credentials::Slot::Shared),
+            ApiSource::Shared,
+            Arc::new(|_| {}),
+        );
+        let mut client = ApiClient::new(
+            reqwest::Client::new(),
+            Arc::new(NetActivity::default()),
+            10,
+            10,
+            ApiSource::Shared,
+        );
+        // These fixtures must never send even dummy credentials to Spotify.
+        client.base_url = Some("http://127.0.0.1:9".into());
+        client.set_token_provider(Some(TokenProvider::Web(Arc::clone(&tokens))));
+        (store, tokens, Arc::new(client), root)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_a_token_never_consumes_a_paced_request_slot() {
+        let (_store, tokens, client, root) = admission_client("token-wait");
+        let held = tokens.token.lock().await;
+        let pending = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.send(Method::GET, "/me", &[], None).await })
+        };
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let available = tokio::time::timeout(Duration::ZERO, client.wait_for_request_slot()).await;
+        assert!(
+            available.is_ok(),
+            "token preparation must not reserve capacity or a paced start"
+        );
+        drop(available);
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        drop(held);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn revocation_during_admission_never_sends_a_prepared_token() {
+        let (store, _tokens, client, root) = admission_client("revoke-wait");
+        client.extend_cooldown(Duration::from_secs(120)).await;
+        let pending = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.send(Method::GET, "/me", &[], None).await })
+        };
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(119)).await;
+        tokio::task::yield_now().await;
+        assert!(!pending.is_finished());
+        store.revoke_spotify().unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(ApiError::SignInExpired {
+                api_source: ApiSource::Shared
+            })
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepared_tokens_retain_their_expiry_for_post_admission_validation() {
+        assert!(
+            PreparedToken {
+                value: "expired-dummy".into(),
+                expires_at: 0,
+            }
+            .expired()
+        );
+        assert!(
+            !PreparedToken {
+                value: "valid-dummy".into(),
+                expires_at: u64::MAX,
+            }
+            .expired()
+        );
+    }
+
+
     #[tokio::test]
     async fn revoked_provider_cannot_return_or_persist_its_token() {
         let root =
@@ -1573,7 +1696,7 @@ mod tests {
             ApiSource::Personal,
         );
         shared.extend_cooldown(Duration::from_secs(10)).await;
-        assert!(*shared.cooldown_until.lock().await > tokio::time::Instant::now());
-        assert!(*personal.cooldown_until.lock().await <= tokio::time::Instant::now());
+        assert!(shared.admission.cooling_down());
+        assert!(!personal.admission.cooling_down());
     }
 }

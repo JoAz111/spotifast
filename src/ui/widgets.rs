@@ -2913,8 +2913,6 @@ pub fn switch(ui: &mut Ui, palette: &Palette, label: &str, on: &mut bool) -> egu
     response
 }
 
-/// The author's website, linked from the credit line.
-
 /// The width a settings row keeps for its control: switches, fields and
 /// buttons fit in it.
 const SETTING_CONTROL_WIDTH: f32 = 260.0;

@@ -681,6 +681,7 @@ fn folder_rows(app: &App, user_id: &str, entries: &mut Vec<Entry>) {
         .enumerate()
         .map(|(index, playlist)| (playlist.uri.as_str(), (index, playlist)))
         .collect();
+    let counts = folder_playlist_counts(&app.rootlist);
     let mut depth = 0u8;
     // Rows inside a rolled-up folder stay off the list; the stack knows
     // how deep the rolled-up one sits.
@@ -691,7 +692,7 @@ fn folder_rows(app: &App, user_id: &str, entries: &mut Vec<Entry>) {
             RootlistEntry::FolderStart { id, name } => {
                 let collapsed = app.collapsed_folders.contains(id);
                 if hidden_from.is_none() {
-                    let count = folder_playlists(&app.rootlist, id);
+                    let count = counts.get(id.as_str()).copied().unwrap_or_default();
                     entries.push(Entry {
                         image: None,
                         grid_image: None,
@@ -762,33 +763,38 @@ fn folder_rows(app: &App, user_id: &str, entries: &mut Vec<Entry>) {
     }
 }
 
-/// How many playlists a folder holds, nested ones included.
-fn folder_playlists(rootlist: &[crate::player::RootlistEntry], id: &str) -> usize {
+/// Count every folder in linear time. Prefix counts include nested, duplicate
+/// and not-yet-loaded playlists, matching the rootlist's own rows. Preserve the
+/// first occurrence of a folder id if Spotify supplies it more than once.
+fn folder_playlist_counts(
+    rootlist: &[crate::player::RootlistEntry],
+) -> std::collections::HashMap<&str, usize> {
     use crate::player::RootlistEntry;
-    let mut counting = false;
-    let mut depth = 0usize;
-    let mut count = 0;
-    for row in rootlist {
+    let mut counts = vec![0; rootlist.len()];
+    let mut stack = Vec::new();
+    let mut playlists = 0;
+    for (index, row) in rootlist.iter().enumerate() {
         match row {
-            RootlistEntry::FolderStart { id: this, .. } => {
-                if counting {
-                    depth += 1;
-                } else if this == id {
-                    counting = true;
-                    depth = 1;
+            RootlistEntry::FolderStart { .. } => stack.push((index, playlists)),
+            RootlistEntry::FolderEnd => {
+                if let Some((start, before)) = stack.pop() {
+                    counts[start] = playlists - before;
                 }
             }
-            RootlistEntry::FolderEnd if counting => {
-                depth -= 1;
-                if depth == 0 {
-                    return count;
-                }
-            }
-            RootlistEntry::Playlist(_) if counting => count += 1,
-            _ => {}
+            RootlistEntry::Playlist(_) => playlists += 1,
         }
     }
-    count
+    // An incomplete rootlist still gives each open folder its known children.
+    for (start, before) in stack {
+        counts[start] = playlists - before;
+    }
+    let mut by_id = std::collections::HashMap::new();
+    for (index, row) in rootlist.iter().enumerate() {
+        if let RootlistEntry::FolderStart { id, .. } = row {
+            by_id.entry(id.as_str()).or_insert(counts[index]);
+        }
+    }
+    by_id
 }
 
 fn playlist_entry(
@@ -2327,6 +2333,37 @@ mod ordering_tests {
             "recreating a saved arrangement still leaves the automatic sort"
         );
         app.backend.shutdown();
+    }
+
+    #[test]
+    fn folder_counts_include_nested_duplicate_and_unloaded_rows() {
+        use crate::player::RootlistEntry::{FolderEnd, FolderStart, Playlist};
+        let folder = |id: &str| FolderStart {
+            id: id.into(),
+            name: String::new(),
+        };
+        let rootlist = vec![
+            FolderEnd,
+            folder("outer"),
+            Playlist(uri("unloaded")),
+            folder("inner"),
+            Playlist(uri("repeat")),
+            Playlist(uri("repeat")),
+            FolderEnd,
+            folder("empty"),
+            FolderEnd,
+            FolderEnd,
+            folder("inner"),
+            Playlist(uri("other")),
+            FolderEnd,
+            folder("unfinished"),
+            Playlist(uri("tail")),
+        ];
+        let counts = folder_playlist_counts(&rootlist);
+        assert_eq!(counts["outer"], 3);
+        assert_eq!(counts["inner"], 2, "first duplicate id wins");
+        assert_eq!(counts["empty"], 0);
+        assert_eq!(counts["unfinished"], 1);
     }
 
     #[test]

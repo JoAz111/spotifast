@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+pub(crate) mod admission;
 pub mod client;
 pub mod gateway;
 pub mod models;
