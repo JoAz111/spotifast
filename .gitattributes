@@ -1,1 +1,3 @@
 .github/workflows/*.lock.yml linguist-generated=true
+# Unified patches preserve blank context lines and nested patch prefixes.
+runtime/*.patch -whitespace

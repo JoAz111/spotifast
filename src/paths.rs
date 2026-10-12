@@ -17,7 +17,11 @@ pub struct AppDirs {
 
 impl AppDirs {
     pub fn discover() -> Self {
-        Self::for_name("spotifast")
+        Self::for_name(if std::env::var_os("SPOTIFAST_SOLOIST_SOCKET").is_some() {
+            "spotifast-soloist"
+        } else {
+            "spotifast"
+        })
     }
 
     fn for_name(name: &str) -> Self {

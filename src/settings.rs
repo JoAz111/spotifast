@@ -223,6 +223,8 @@ fn proxy_mode_is_system(mode: &ProxyMode) -> bool {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Keep the main experience focused on music.
+    pub music_only: bool,
     /// The Spotify Connect name other devices see.
     pub device_name: String,
     /// 96, 160, or 320 kbps.
@@ -416,6 +418,7 @@ impl std::fmt::Debug for Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            music_only: true,
             device_name: "Spotifast".to_string(),
             bitrate: 320,
             normalisation: false,
@@ -453,7 +456,8 @@ impl Default for Settings {
             playback_authorized: false,
             keep_playing_in_background: true,
             mac_notch_widget: false,
-            check_for_updates: true,
+            // This fork must never replace itself with an upstream release.
+            check_for_updates: false,
             download_updates_automatically: false,
             pinned_contexts: Vec::new(),
             liked_songs_pinned: true,

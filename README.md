@@ -1,3 +1,5 @@
+> **Personal Soloist Mac fork:** this branch adds Spotify's official Soloist engine through an experimental Apple Silicon compatibility runtime and makes the interface music focused. See [Soloist on macOS](docs/SOLOIST_MACOS.md) for setup, limitations and verification status. Upstream releases linked below describe the original librespot client.
+
 <p align="center">
   <img src="docs/assets/images/logo.svg" alt="Spotifast logo" width="88" height="88">
 </p>

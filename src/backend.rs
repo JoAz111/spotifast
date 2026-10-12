@@ -305,6 +305,8 @@ pub enum ApiRequest {
         device_id: Option<String>,
         play: PlayRequest,
     },
+    /// Complete context/offset load after private Soloist activation.
+    SoloistPlay(crate::player::LoadSpec),
     AddToQueue {
         uri: String,
         device_id: Option<String>,
@@ -602,6 +604,15 @@ pub enum Command {
         config: ProxyConfig,
     },
     Player(PlayerCommand),
+    /// A load delegated after Soloist confirms that it is the active receiver.
+    SoloistLoad {
+        generation: u64,
+        spec: crate::player::LoadSpec,
+    },
+    SoloistUpdate {
+        generation: u64,
+        update: crate::soloist::Update,
+    },
     Api(ApiRequest),
     ApiFinished {
         generation: u64,
@@ -761,6 +772,8 @@ pub struct LyricsRequest {
 }
 
 pub enum Event {
+    MusicSession(bool),
+    SoloistPlayback(LocalPlayback),
     ProxyRestored {
         config: ProxyConfig,
         password: Option<crate::credentials::ProxyPassword>,
@@ -1455,6 +1468,10 @@ struct Worker {
     commands: mpsc::UnboundedSender<Command>,
     waker: Waker,
     engine: Option<Arc<Engine>>,
+    /// Playback is independent of the librespot session used for metadata.
+    soloist: Option<crate::soloist::Handle>,
+    soloist_ready: bool,
+    soloist_state: crate::player::LocalState,
     /// What the engine is heard at, so the engine that replaces it starts
     /// there. `engine_config` alone knows only the level the app launched
     /// with.
@@ -1508,6 +1525,18 @@ impl Worker {
         commands: mpsc::UnboundedSender<Command>,
         waker: Waker,
     ) -> Self {
+        let session = watch::channel(0).0;
+        let soloist = std::env::var_os("SPOTIFAST_SOLOIST_SOCKET").map(|path| {
+            let commands = commands.clone();
+            let session = session.clone();
+            crate::soloist::Handle::start(
+                path.into(),
+                Arc::new(move |update| {
+                    let generation = *session.borrow();
+                    let _ = commands.send(Command::SoloistUpdate { generation, update });
+                }),
+            )
+        });
         Self {
             #[cfg(not(test))]
             credentials: CredentialStore::new(dirs.clone()),
@@ -1522,7 +1551,7 @@ impl Worker {
             spotify_restore_started: false,
             proxy_revision: 0,
             authorization_attempt: 0,
-            session: watch::channel(0).0,
+            session,
             dirs,
             engine_config,
             engine_proxy: None,
@@ -1536,6 +1565,9 @@ impl Worker {
             commands,
             waker,
             engine: None,
+            soloist,
+            soloist_ready: false,
+            soloist_state: crate::player::LocalState::default(),
             heard: None,
             rootlist_pending: false,
             album_type_lookup: AlbumTypeLookup::default(),
@@ -1828,6 +1860,20 @@ impl Worker {
                     self.change_proxy(request, config, false)
                 }
                 Command::Player(command) => {
+                    if let Some(soloist) = &self.soloist {
+                        if !self.signed_in {
+                            self.emit(Event::Error(
+                                "Sign in before controlling Soloist playback.".into(),
+                            ));
+                            continue;
+                        }
+                        if let Err(error) =
+                            soloist.command_for_session(command, *self.session.borrow())
+                        {
+                            self.emit(Event::Error(error));
+                        }
+                        continue;
+                    }
                     if matches!(&command, PlayerCommand::Load(_)) {
                         self.resume = None;
                     }
@@ -1843,6 +1889,35 @@ impl Worker {
                     }
                 }
                 Command::Api(ApiRequest::Search { query, serial }) => self.search(query, serial),
+                Command::SoloistUpdate { generation, update } => {
+                    if generation == *self.session.borrow() {
+                        self.on_soloist_update(update);
+                    }
+                }
+                Command::SoloistLoad { generation, spec } => {
+                    if generation != *self.session.borrow() {
+                        continue;
+                    }
+                    if !self.signed_in || self.soloist.is_none() {
+                        self.emit(Event::Error(
+                            "Sign in before starting Soloist playback.".into(),
+                        ));
+                        continue;
+                    }
+                    // The local protocol has no context-offset or track-list load.
+                    // Preserve these through the official Web API after activation.
+                    self.dispatch_web(ApiRequest::SoloistPlay(spec));
+                }
+                Command::Api(ApiRequest::Queue { seq })
+                    if self.soloist.is_some() && self.soloist_state.is_active() =>
+                {
+                    if let Err(error) = self.soloist.as_ref().unwrap().request_queue(seq) {
+                        self.emit(Event::Api(Box::new(ApiResponse::Queue {
+                            seq,
+                            result: Err(ApiError::Network(error)),
+                        })));
+                    }
+                }
                 Command::Api(request) => {
                     self.dispatch(request);
                 }
@@ -1869,6 +1944,7 @@ impl Worker {
                         if source == ApiSource::Personal {
                             self.emit(Event::WebApp { client_id: None });
                         } else {
+                            self.cancel_soloist_requests();
                             self.signed_in = false;
                             self.emit(Event::Auth(AuthStatus::Failed(
                                 "Your Spotify sign-in expired. Please sign in again.".into(),
@@ -2425,6 +2501,7 @@ impl Worker {
             ),
         };
         if source == ApiSource::Shared || !other_ready {
+            self.cancel_soloist_requests();
             self.signed_in = false;
             self.emit(Event::Auth(AuthStatus::Failed(message.clone())));
         }
@@ -2441,6 +2518,7 @@ impl Worker {
         if let Err(error) = self.api.install(source, AccountId::new(user.id.clone())) {
             self.api.clear(source);
             if source == ApiSource::Shared {
+                self.cancel_soloist_requests();
                 self.signed_in = false;
                 self.emit(Event::Auth(AuthStatus::Failed(error.to_string())));
             }
@@ -2647,6 +2725,12 @@ impl Worker {
     }
 
     fn sign_out(&mut self) {
+        if let Some(soloist) = &self.soloist
+            && let Err(error) = soloist.pause()
+        {
+            self.emit(Event::Error(error));
+        }
+        self.emit(Event::MusicSession(false));
         self.spotify_restore_started = true;
         self.cancel_search();
         self.signed_in = false;
@@ -2689,6 +2773,61 @@ impl Worker {
 
     // ---- local playback engine -------------------------------------------
 
+    fn cancel_soloist_requests(&self) {
+        if let Some(soloist) = &self.soloist {
+            self.session.send_modify(|generation| *generation += 1);
+            if let Err(error) = soloist.pause() {
+                self.emit(Event::Error(error));
+            }
+        }
+    }
+
+    fn on_soloist_update(&mut self, update: crate::soloist::Update) {
+        match update {
+            crate::soloist::Update::State(state) => {
+                self.soloist_state = state.clone();
+                if self.signed_in {
+                    self.emit(Event::Local(Box::new(state)));
+                }
+            }
+            crate::soloist::Update::Ready(ready) => {
+                self.soloist_ready = ready;
+                if self.signed_in {
+                    self.publish_soloist_state();
+                }
+            }
+            crate::soloist::Update::Queue { seq, queue } if self.signed_in => {
+                self.emit(Event::Api(Box::new(ApiResponse::Queue {
+                    seq,
+                    result: Ok(*queue),
+                })));
+            }
+            crate::soloist::Update::Load { spec, generation }
+                if self.signed_in && generation == *self.session.borrow() =>
+            {
+                let _ = self
+                    .commands
+                    .send(Command::SoloistLoad { generation, spec });
+            }
+            crate::soloist::Update::Error(error) => self.emit(Event::Error(error)),
+            _ => {}
+        }
+    }
+
+    fn publish_soloist_state(&self) {
+        if self.soloist.is_none() {
+            return;
+        }
+        self.emit(Event::SoloistPlayback(if self.soloist_ready {
+            LocalPlayback::Ready {
+                device_id: "soloist-local".into(),
+            }
+        } else {
+            LocalPlayback::Unavailable
+        }));
+        self.emit(Event::Local(Box::new(self.soloist_state.clone())));
+    }
+
     fn on_playback_authorized(&mut self, access_token: String) {
         let Some(credentials) = playback_credentials(self.api.account(), access_token) else {
             self.engine_busy = false;
@@ -2701,6 +2840,7 @@ impl Worker {
     }
 
     fn engine_notify(&self) -> crate::player::Notify {
+        let soloist_playback = self.soloist.is_some();
         let events = self.events.clone();
         let commands = self.commands.clone();
         let waker = self.waker.clone();
@@ -2711,8 +2851,10 @@ impl Worker {
             }
             match event {
                 EngineEvent::State(state) => {
-                    let _ = events.send(Event::Local(Box::new(state)));
-                    waker.wake();
+                    if !soloist_playback {
+                        let _ = events.send(Event::Local(Box::new(state)));
+                        waker.wake();
+                    }
                 }
                 EngineEvent::SessionEnded => {
                     let _ = commands.send(Command::Reconnect);
@@ -2931,6 +3073,7 @@ impl Worker {
         let proxy = config.proxy.librespot_url();
         self.engine_proxy = proxy.clone();
         let notify = self.engine_notify();
+        let metadata_only = self.soloist.is_some();
         let events = self.events.clone();
         let commands = self.commands.clone();
         let waker = self.waker.clone();
@@ -2949,13 +3092,13 @@ impl Worker {
                     return;
                 }
             };
-            let connect_outcome = connect_engine_with_deadline(Engine::connect(
-                &config,
-                proxy,
-                credentials,
-                cache,
-                notify,
-            ))
+            let connect_outcome = connect_engine_with_deadline(async {
+                if metadata_only {
+                    Engine::connect_metadata(&config, proxy, credentials, cache, notify).await
+                } else {
+                    Engine::connect(&config, proxy, credentials, cache, notify).await
+                }
+            })
             .await;
             let outcome = match connect_outcome {
                 Ok(Ok(engine)) => Command::EngineConnected {
@@ -3049,15 +3192,19 @@ impl Worker {
                     self.schedule_resume_check(1_500);
                 }
                 self.engine = Some(engine);
+                self.emit(Event::MusicSession(true));
                 self.start_rootlist();
                 self.reconnects.clear();
-                self.emit(Event::Playback(LocalPlayback::Ready { device_id }));
+                if self.soloist.is_none() {
+                    self.emit(Event::Playback(LocalPlayback::Ready { device_id }));
+                }
                 self.start_album_type_lookup();
                 self.start_audiobook_lookup();
                 self.start_playlist_header_lookup();
                 self.start_radio();
             }
             None => {
+                self.emit(Event::MusicSession(false));
                 if !self.network_reachable {
                     self.waiting_for_network = true;
                     self.emit(Event::Playback(LocalPlayback::WaitingForNetwork));
@@ -3085,6 +3232,7 @@ impl Worker {
                 }
             }
         }
+        self.publish_soloist_state();
     }
 
     /// Starts the engine only for Premium accounts. librespot 0.8 calls
@@ -3092,6 +3240,7 @@ impl Worker {
     /// unknown, preserve the previous behavior and start the engine.
     fn on_account_checked(&mut self, premium: Option<bool>) {
         self.premium = premium;
+        self.publish_soloist_state();
         if premium == Some(false) {
             self.album_type_lookup.clear_engine_work();
             self.playlist_header_lookup.clear_engine_work();
@@ -3579,13 +3728,21 @@ impl Worker {
     }
 
     fn dispatch(&self, request: ApiRequest) -> tokio::task::AbortHandle {
+        self.dispatch_using(request, false)
+    }
+
+    fn dispatch_web(&self, request: ApiRequest) -> tokio::task::AbortHandle {
+        self.dispatch_using(request, true)
+    }
+
+    fn dispatch_using(&self, request: ApiRequest, web_only: bool) -> tokio::task::AbortHandle {
         let api = Arc::clone(&self.api);
         let connect = Arc::clone(&self.connect);
         let shared_lease = self.credentials.lease(CredentialSlot::Shared);
         let personal_lease = self.credentials.lease(CredentialSlot::Personal);
         let background_api = Arc::clone(&self.background_api);
         let background = request.background();
-        let engine = self.engine.clone();
+        let engine = if web_only { None } else { self.engine.clone() };
         let commands = self.commands.clone();
         let mut session = self.session.subscribe();
         let generation = *session.borrow_and_update();
@@ -3666,6 +3823,7 @@ fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
         | ApiRequest::Remote { .. }
         | ApiRequest::Transfer { .. }
         | ApiRequest::ShufflePlay { .. }
+        | ApiRequest::SoloistPlay(_)
         | ApiRequest::AddToQueue { .. }
         | ApiRequest::AddManyToQueue { .. } => Operation::Playback,
         ApiRequest::RecentlyPlayed { .. }
@@ -3811,7 +3969,7 @@ async fn handle(
         return (response, None);
     }
     let selected = api.client_for(operation).await;
-    let expired = std::cell::Cell::new(None);
+    let mut expired = None;
     macro_rules! routed {
         ($method:ident($($argument:expr),* $(,)?)) => {{
             let result = match &selected {
@@ -3819,7 +3977,7 @@ async fn handle(
                 Err(error) => Err(error.clone()),
             };
             if let Err(ApiError::SignInExpired { api_source }) = &result {
-                expired.set(Some(*api_source));
+                expired = Some(*api_source);
             }
             result
         }};
@@ -4177,6 +4335,34 @@ async fn handle(
                 result,
             }
         }
+        ApiRequest::SoloistPlay(spec) => {
+            let play = PlayRequest {
+                context_uri: spec.context_uri,
+                uris: spec.uris,
+                offset_uri: spec.offset_uri,
+                offset_position: spec.offset_index,
+                position_ms: spec.position_ms,
+            };
+            let result = async {
+                if let Some(enabled) = spec.shuffle {
+                    routed!(set_shuffle(enabled, None))?;
+                }
+                if let Some(mode) = spec.repeat {
+                    let repeat = mode.api_name();
+                    routed!(set_repeat(repeat, None))?;
+                }
+                routed!(play(None, Some(&play)))?;
+                if !spec.play {
+                    routed!(pause(None))?;
+                }
+                Ok(())
+            }
+            .await;
+            ApiResponse::Remote {
+                action: RemoteAction::Play,
+                result,
+            }
+        }
         ApiRequest::Transfer { device_id, play } => ApiResponse::Transferred {
             result: routed!(transfer(&device_id, play)),
             device_id,
@@ -4199,7 +4385,7 @@ async fn handle(
                 Err(error) => (0, Err(error.clone())),
             };
             if let Err(ApiError::SignInExpired { api_source }) = &result {
-                expired.set(Some(*api_source));
+                expired = Some(*api_source);
             }
             ApiResponse::QueueBatchAdded {
                 request,
@@ -4209,7 +4395,7 @@ async fn handle(
         }
     };
     observe_playlists(api, &response);
-    (response, expired.get())
+    (response, expired)
 }
 
 /// Player commands for a device the Web API refuses (a Sonos, say) go over
@@ -5471,6 +5657,54 @@ fn playback_credentials(account: Option<AccountId>, access_token: String) -> Opt
 #[cfg(test)]
 mod authorization_tests {
     use super::*;
+
+    #[test]
+    fn soloist_load_keeps_its_account_generation_at_the_worker_boundary() {
+        let (_runtime, mut worker, _) = worker("soloist-account-load");
+        let (commands, mut receiver) = mpsc::unbounded_channel();
+        worker.commands = commands;
+        worker.signed_in = true;
+        worker.session.send_replace(42);
+        let spec = crate::player::LoadSpec {
+            context_uri: Some("spotify:playlist:chosen".into()),
+            offset_index: Some(7),
+            position_ms: 1234,
+            play: true,
+            shuffle: Some(false),
+            ..Default::default()
+        };
+        worker.on_soloist_update(crate::soloist::Update::Load {
+            spec: spec.clone(),
+            generation: 41,
+        });
+        assert!(
+            receiver.try_recv().is_err(),
+            "an old activation cannot enter a new account"
+        );
+        worker.on_soloist_update(crate::soloist::Update::Load {
+            spec: spec.clone(),
+            generation: 42,
+        });
+        match receiver.try_recv().unwrap() {
+            Command::SoloistLoad {
+                generation,
+                spec: forwarded,
+            } => {
+                assert_eq!(generation, 42);
+                assert_eq!(forwarded, spec);
+            }
+            _ => panic!("expected the complete activated load"),
+        }
+        worker.signed_in = false;
+        worker.on_soloist_update(crate::soloist::Update::Load {
+            spec,
+            generation: 42,
+        });
+        assert!(
+            receiver.try_recv().is_err(),
+            "sign-out blocks even a current activation"
+        );
+    }
 
     #[test]
     fn playlist_cache_store_does_not_hold_up_the_command_loop() {

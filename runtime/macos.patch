@@ -1,0 +1,3360 @@
+diff --git a/.gitignore b/.gitignore
+index a94c5a8..a39d8a8 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -14,4 +14,6 @@ __pycache__/
+ /soloist
+ /soloist_*.tar.gz
+ /downloads/
++/engine/
++/runtime-home/
+ /*-source.zip
+diff --git a/README.md b/README.md
+index 5b31adb..2e3642a 100644
+--- a/README.md
++++ b/README.md
+@@ -14,6 +14,12 @@ entitlements, SIP changes, or authentication bypasses are used. The repository
+ contains integration source and an elfuse patch, **not Soloist, account keys,
+ session data, or music**. It is unofficial and not endorsed by Spotify.
+ 
++## Spotifast integration checkpoint (October 12, 2026)
++
++This working branch adds an owner-only Unix control transport with syscall-level bind substitution, guarded profile reset, and an optional bundled Spotifast frontend. Account-free listener/alias/epoll regression checks pass. Safe explicit CoreAudio output modules replace the legacy detector after two detector startup abort reports. Those reports do not establish why the Mac itself crashed. Newly connected output devices require a receiver restart.
++
++The current fork has not yet completed authenticated playback or lossless verification. The historical upstream status below describes earlier experiments, not qualification of this integration. See [quick start](packaging/QUICKSTART.md) for the current private transport and profile behavior.
++
+ ## Status
+ 
+ Authenticated playback and song skipping have worked with Soloist 1.3.8.36.
+@@ -63,7 +69,7 @@ permission test; do not treat this as a finished one-click release. No public
+ notarization or API access-control claim is made.
+ See [package build/integration instructions](docs/PACKAGING.md) and
+ [local quick start](packaging/QUICKSTART.md).
+-The launcher defaults to Spotify Connect only, with an opt-in loopback
++The launcher defaults to Spotify Connect only, with an opt-in owner-only Unix
+ WebSocket for local clients, a configurable Spotify Connect name, remembered
+ audio output selection and separate Run on login / Auto start on launch options.
+ The build workflow can produce a draft
+diff --git a/docs/LOCAL_CONTROL.md b/docs/LOCAL_CONTROL.md
+index 18d20a8..52e72a8 100644
+--- a/docs/LOCAL_CONTROL.md
++++ b/docs/LOCAL_CONTROL.md
+@@ -9,9 +9,9 @@ and validation plan, not an implemented music UI or an offline-playback claim.
+ 
+ - Use the receiver's local API directly, not the official Spotify client's
+   connection or a cloud round-trip as the path for local playback controls.
+-  Loopback communication on the same Mac does not require its Wi-Fi interface.
+-  Before release, finish the local API access-control work; loopback alone is
+-  not authentication. Do not expose the current unauthenticated API to the LAN.
++  The owner-only Unix socket does not require the Mac’s Wi-Fi interface.
++  The runtime substitutes it for the guest’s selected TCP bind; no reachable
++  unauthenticated TCP upstream remains. Same-user processes and root are trusted.
+ - Keep receiver reachability, Soloist session authentication, active-device state
+   and Spotify/network connectivity separate. Do not interpret `logged_in` as a
+   network-reachability measurement or disable all controls on a Wi-Fi event.
+@@ -57,3 +57,29 @@ so they do not depend on a tool/cloud connection remaining usable during it.
+    receiver replacement or lost local controls. Record failures and limitations.
+ 
+ Reference: [Soloist's documented local WebSocket API](https://developer.spotify.com/documentation/soloist/reference/websocket-api).
++
++## Current-run diagnostic evidence
++
++The supervisor replaces the mode-0600 `state/receiver-diagnostics.json` snapshot
++at each run start, after enrolling/validating the private profile and acquiring
++its exclusive receiver lock. A strict schema bounds its event tail to 64 entries
++and file size to 32 KiB. Only fixed event codes, elapsed times, supervisor PID,
++typed authentication booleans and recognized codec/rate/format values survive.
++Raw output, engine error suffixes, account/device identities, keys, session
++contents and song metadata are never retained. The `diagnostics` helper validates
++the private profile, directory identity, file type/owner/mode, size and full schema
++before emitting the snapshot; it follows no diagnostic-file symlink.
++
++The existing local health query records authentication independently of process
++and socket readiness. Log phrases such as “signed in” are diagnostic events and
++cannot assert authentication. The native window reads this snapshot without
++opening another engine connection, and only accepts the running supervisor PID.
++The first health check follows the 30-second startup grace; later checks occur
++every ten seconds. Snapshot reads occur every five seconds. Same-user processes
++and root remain trusted; these files are not a sandbox boundary against them.
++
++An observed FLAC codec plus sample rate is decoder evidence. Audible playback,
++source bit depth, hardware format and bit-perfect output require their own proof.
++Offline fixtures are `scripts/test-current-diagnostics.py` and
++`scripts/test-receiver.py`; they use synthetic lines and a private Unix socket,
++with no account, key, audio server or real profile access.
+diff --git a/docs/PACKAGING.md b/docs/PACKAGING.md
+index b9b70db..f19e638 100644
+--- a/docs/PACKAGING.md
++++ b/docs/PACKAGING.md
+@@ -99,8 +99,8 @@ Run on login setting uses macOS ServiceManagement for the main app, not a
+ global system service. Auto start on launch is a separate app preference. No
+ hosted fork backend is installed.
+ 
+-Packaged state/cache defaults to `~/Library/Application Support/Soloist Runtime/`.
+-Development runs retain their repository-local profile. An absolute
++Packaged state/cache defaults to `~/Library/Application Support/Spotifast Soloist/`.
++Development runs use a dedicated ignored `runtime-home/` profile. An absolute
+ `SOLOIST_RUNTIME_HOME` overrides the CLI profile for isolated tests. No runtime
+ writes belong in the application bundle. `configure` atomically copies the
+ user-selected executable to private profile storage after validating its
+@@ -113,11 +113,7 @@ option remains available for source/CLI use. `installation` reports
+ build and expiry metadata without account data. Spotify receives authentication
+ requests on startup.
+ 
+-Packaged `run` and the launcher default to Spotify Connect with local WebSocket
+-off. `run --websocket on` enables a loopback-only, unauthenticated API for
+-same-Mac clients. The launcher's preference checkbox provides the same opt-in. Local
+-health checking falls back to the private audio process when WebSocket is off;
+-the richer API responsiveness check requires it to be on.
++Packaged `run` defaults to Connect-only. `run --websocket on` now creates an owner-only AF_UNIX socket, and the elfuse bind adapter substitutes it for the selected guest loopback bind. No TCP WebSocket listener is opened. A bundled Spotifast frontend enables this automatically. The discovery file and socket are owner-only, and accepted peers must have the same UID. This is a local control boundary, not an application sandbox: same-user programs and root remain trusted.
+ 
+ The launcher persists a Spotify Connect device name and an optional CoreAudio
+ output UID in app preferences. Without a selected UID, the private PulseAudio
+@@ -127,8 +123,10 @@ or system-default output during health checks and moves its stream when needed.
+ `audio outputs` and `audio select [--uid UID]` expose the same output controls to
+ other local clients without changing the system-wide audio device.
+ 
+-The control endpoint remains unauthenticated loopback preview API. Packaging
+-does not make it safe to expose to browsers or a LAN. See [local control](LOCAL_CONTROL.md)
+-and [release gates](RELEASE_READINESS.md). The future client/runtime must preserve
+-local control across Internet loss without assuming that every offline engine
+-command will succeed.
++Newly connected audio outputs require a receiver restart. The runtime enumerates current outputs safely and loads explicit CoreAudio output modules; it does not use the legacy allocation-failing CoreAudio detector. No microphone source or TCP PulseAudio module is enabled.
++
++`reset-pairing` requires a previously initialized private profile marker bound to its canonical root, UID and filesystem identity. Root/state/cache must be owned mode700 directories; the marker is mode600. Cleanup is performed through checked directory descriptors under an exclusive receiver lock. It preserves the engine, API key and installation settings, and does not revoke cloud sessions.
++
++Use `--frontend /path/to/spotifast` to bundle a separately built client, `--name "Spotifast Soloist"` for the app name, and `--output-dir /path/to/output` for a local destination. The launcher owns both processes, waits for the private endpoint before launching the frontend, and stops the receiver when the frontend exits. Pair both interfaces using the same Spotify account; the local API lacks an identity for automatic cross-checking.
++
++See [local control](LOCAL_CONTROL.md) and [release gates](RELEASE_READINESS.md). The client must preserve local control across Internet loss without assuming every offline engine command will succeed.
+diff --git a/docs/RELEASE_READINESS.md b/docs/RELEASE_READINESS.md
+index b8999f3..0880274 100644
+--- a/docs/RELEASE_READINESS.md
++++ b/docs/RELEASE_READINESS.md
+@@ -62,9 +62,7 @@ do not invent command names or claim a regular skip is a DJ-segment command.
+   compiler, Python or Homebrew on PATH. No packaged authenticated playback claim.
+ - Audit dependency licenses/notices and version manifest; verify fresh install
+   and a later official Soloist build without executable-specific offsets.
+-- Resolve local API access control. Loopback is not authentication. A proxy in
+-  front of an otherwise reachable unauthenticated upstream port is insufficient.
+-  Do not expose the current WebSocket API to a LAN, browser client or mobile app.
++- The October12 integration replaces the selected guest TCP listener with an inherited owner-only Unix socket, including alias and epoll readiness handling. Its account-free fixture passes; same-user programs/root remain trusted. Authenticated packaged playback remains unqualified.
+ - Validate a production signing/notarization/distribution route separately from
+   the current local ad-hoc signature. No publishing is authorized by this work.
+ 
+diff --git a/packaging/QUICKSTART.md b/packaging/QUICKSTART.md
+index 3cf25c3..701ef7f 100644
+--- a/packaging/QUICKSTART.md
++++ b/packaging/QUICKSTART.md
+@@ -1,92 +1,24 @@
+-# Soloist Runtime - local macOS preview
++# Spotifast Soloist — local Mac preview
+ 
+-1. Download and extract the **Linux ARM64** executable from
+-   [Spotify's official Soloist download page](https://developer.spotify.com/documentation/soloist/reference/downloads-and-updates).
+-2. Get your own API key from [Spotify's Soloist dashboard](https://developer.spotify.com/dashboard/soloist).
+-3. Open **Soloist Runtime.app**, choose the extracted executable, enter the API
+-   key and click **Start**. The key is visible while you type and masked when
+-   the field loses focus. It is saved in macOS Keychain, not app preferences or
+-   a standing plaintext file. The selected executable is copied into private
+-   Application Support storage after a credential-free version check. You may
+-   move or delete the downloaded original afterward.
+-4. Select **Soloist Runtime** in Spotify Connect to authenticate and play.
++1. Download and extract the **Linux ARM64** executable from [Spotify’s official Soloist downloads](https://developer.spotify.com/documentation/soloist/reference/downloads-and-updates).
++2. Get your personal API key from [Spotify’s Soloist dashboard](https://developer.spotify.com/dashboard/soloist).
++3. Open **Spotifast Soloist.app**, use **Choose…** to select the extracted executable, enter the key in the secure field using **Edit → Paste** or **Cmd-V**, and click **Start**. The key stays masked and is saved in macOS Keychain. It is never accepted in command arguments or written to a standing plaintext key file. Saving clears the native field editor’s undo history.
++4. In Spotify, select **Spotifast Soloist** in Spotify Connect and play a song to pair. Use the **same Spotify account** when signing into the Spotifast music interface. Soloist does not expose an account identifier that lets this preview check the account match automatically.
+ 
+-The **Spotify Connect device name** field controls how the receiver appears in
+-Spotify; changing it takes effect after restarting the receiver. **Audio output**
+-defaults to the current macOS output, not the first detected display or sound
+-device. You can choose a specific output instead; the app remembers its CoreAudio
+-UID across launches. If that output is disconnected, playback falls back to the
+-current macOS default until it returns. Use **Refresh** after connecting a new
+-device. A selection made while the receiver is playing is applied immediately.
++The official executable is copied into private Application Support storage after an ARM64/version check. That check does not establish publisher provenance: obtain it from Spotify’s official download page. The app shows expected expiry; official builds expire after 90 days. The engine and your key are never bundled into this app.
+ 
+-The launcher shows the installed version and expected expiry calculated from
+-Soloist's build timestamp plus its documented 90-day lifetime. Select a newer
+-official executable and click Start to replace an expiring or expired build.
+-Soloist's own expired-build exit code is authoritative. The **Get Soloist**
+-button opens the official downloads page; no Spotify archive or executable is
+-included in this package or its releases.
++The bundled music interface opens after the owned receiver’s private control socket is ready. Closing the interface or clicking **Stop** stops the receiver; closing the launcher does likewise. A bounded pause is attempted before graceful termination. A crashed Mac may leave a stale discovery file; the next receiver launch replaces it under its exclusive profile lock.
+ 
+-Connect-only mode is the default. Enable **local WebSocket control** before
+-starting if you want a same-Mac client to use Soloist's documented API.
+-It binds only to `127.0.0.1` on an assigned port. The API has no client
+-authentication, so do not forward it to a browser, LAN or Internet endpoint.
+-The checkbox is saved in app preferences. **Run on login** registers the app
+-with macOS Login Items; macOS may require approval in System Settings. It only
+-opens the app. The separate **Auto start on launch** preference starts the
+-configured receiver whenever the app opens, including at login if both options
+-are enabled.
++An open music interface does not prove pairing. The setup window says **Waiting for pairing** until the official local API reports an authenticated session. Its first authentication health check occurs after the 30-second startup grace period; later checks occur every 10 seconds. The window reads the safe snapshot every five seconds.
+ 
+-Close the app or click Stop to shut down the receiver. No global audio daemon
+-is installed. This package contains the compatibility runtime and
+-its dependencies; it does not require Homebrew, Python, Xcode or a music client
+-to run. Initial pairing still uses Spotify's supported flow and your account.
++Control uses an owner-only Unix socket, with no TCP WebSocket listener. Browser pages and other users cannot open it; other programs running as you and root remain trusted. Spotify Connect discovery/pairing still uses the local network and may trigger the macOS incoming-connections prompt for **elfuse**. That permission is separate from the private control API.
+ 
+-This first local preview is Apple Silicon/macOS 27 only and ad-hoc signed, not
+-notarized. It is not a public release or an iOS/Windows package. Do not disable
+-Gatekeeper, SIP or other system security to run it.
++**Audio output** follows the Mac default or a remembered output. Outputs are safely enumerated before starting the private playback server; the legacy CoreAudio detector is not loaded. Existing outputs can be switched while running. **Restart the receiver after connecting a new output** so it gets a playback sink. Microphone recording and TCP PulseAudio access are disabled. Decoded FLAC playback does not itself prove source bit depth or bit-perfect hardware output.
+ 
+-Graphical first-run file selection still needs on-device validation; the
+-command-line import has been tested with an official build. Do not grant Full
+-Disk Access as a workaround. If setup waits, check for a macOS file-access
+-prompt or stop it; file-picker/permission behavior remains a release gate.
++The dedicated profile is `~/Library/Application Support/Spotifast Soloist/`. A private initialization marker guards **Reset Soloist Pairing and Cache** in the app menu. Reset only accepts this initialized, canonical, owner-only profile while stopped; it retains the installed engine, API key and setup. It clears local receiver pairing/cache, not Spotifast’s separate Web API login or Spotify cloud sessions.
+ 
+-The installed executable, its version/expiry metadata and engine session state
+-live in `~/Library/Application Support/Soloist Runtime/`, not inside the app.
+-The API key persists in macOS Keychain. At startup, the runtime reads it into
+-an inherited, already-unlinked private file descriptor for Soloist's argument
+-loader; no persistent plaintext key file is created. Spotify receives
+-authentication requests when the receiver starts.
++This Apple Silicon/macOS 27 preview is locally ad-hoc signed. Public notarization, redistribution review, authenticated playback and lossless validation of this fork remain separate checks. Do not disable Gatekeeper, SIP or grant Full Disk Access as a workaround.
+ 
+-## Without the launcher, or from another application
++The bundled helper is `Contents/Helpers/runtime-cli.app/Contents/MacOS/runtime-cli`. Its `describe`, `doctor`, `installation` and `run --help` commands expose safe setup diagnostics. `diagnostics` reads `state/receiver-diagnostics.json`, an owner-only current-run snapshot containing at most 64 fixed pairing/error events, typed authentication booleans and recognized codec/sample-rate/sample-format values. It excludes raw stdout/stderr, keys, account identity, music metadata, device names and server error text. Each run replaces the previous snapshot; pairing reset clears it. `status` returns authentication state promptly while logged out. A FLAC event demonstrates decoder selection, and does not by itself establish source bit depth, bit-perfect output or audible playback.
+ 
+-Use the bundled command-line executable:
+-
+-```sh
+-"Soloist Runtime.app/Contents/Helpers/runtime-cli.app/Contents/MacOS/runtime-cli" describe
+-"Soloist Runtime.app/Contents/Helpers/runtime-cli.app/Contents/MacOS/runtime-cli" doctor --audio --soloist /path/to/soloist
+-"Soloist Runtime.app/Contents/Helpers/runtime-cli.app/Contents/MacOS/runtime-cli" credential store
+-"Soloist Runtime.app/Contents/Helpers/runtime-cli.app/Contents/MacOS/runtime-cli" audio outputs
+-"Soloist Runtime.app/Contents/Helpers/runtime-cli.app/Contents/MacOS/runtime-cli" configure --soloist /path/to/soloist --keychain
+-"Soloist Runtime.app/Contents/Helpers/runtime-cli.app/Contents/MacOS/runtime-cli" installation
+-"Soloist Runtime.app/Contents/Helpers/runtime-cli.app/Contents/MacOS/runtime-cli" run
+-```
+-
+-`credential store` prompts without echo in a terminal or reads standard input
+-when piped; it never accepts the key as a command argument. The legacy
+-`configure --api-key-file /path/to/private.api` remains available for scripts.
+-
+-Add `--websocket on` to `run` to enable `status`, `endpoint` and `control` while
+-running; packaged `run` defaults to Connect-only. `run --help`
+-shows `--device-name`, `--audio-output-uid`, test-duration, buffer and recovery
+-options. Use `audio select --uid UID` to change a running receiver's private
+-output, or `audio select` to resume following the Mac default. `SOLOIST_RUNTIME_HOME` can
+-select a different absolute data directory for isolated CLI integration tests.
+-The graphical launcher uses the default profile.
+-
+-The local WebSocket API is currently unauthenticated and loopback-only. **Do not
+-expose it to browsers, a LAN or the Internet.** Finishing its access-control
+-design is a release gate, not something that packaging automatically solves.
+-
+-The manifest records library versions and payload checksums. Bundled license
+-notices are under `Contents/Resources/Licenses`. Redistribution compliance and
+-Developer ID signing/notarization need separate review before any public release.
++`credential store` prompts without echo; `run --websocket on` uses the private Unix transport. A custom `SOLOIST_RUNTIME_HOME` must be a canonical dedicated private directory, explicitly initialized by configure/run. Reset never initializes a directory itself.
+diff --git a/packaging/launcher.m b/packaging/launcher.m
+index bd939f5..ebebb99 100644
+--- a/packaging/launcher.m
++++ b/packaging/launcher.m
+@@ -1,9 +1,42 @@
+ #import <AppKit/AppKit.h>
+ #import <ServiceManagement/ServiceManagement.h>
+ #include <string.h>
++#include <stdlib.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++#include <unistd.h>
+ 
+ static NSString *const KeyMask = @"••••••••";
+ 
++static NSMenu *StandardMainMenu(void) {
++    NSMenu *menu = [NSMenu new];
++    NSMenuItem *application = [NSMenuItem new];
++    [menu addItem:application];
++    NSMenu *actions = [NSMenu new];
++    [actions addItemWithTitle:@"Reset Soloist Pairing and Cache" action:@selector(resetPairing:) keyEquivalent:@""];
++    [actions addItemWithTitle:@"Quit Spotifast Soloist" action:@selector(terminate:) keyEquivalent:@"q"];
++    application.submenu = actions;
++
++    NSMenuItem *edit = [NSMenuItem new];
++    edit.title = @"Edit";
++    NSMenu *editing = [[NSMenu alloc] initWithTitle:@"Edit"];
++    NSMenuItem *undo = [editing addItemWithTitle:@"Undo" action:@selector(undo:) keyEquivalent:@"z"];
++    NSMenuItem *redo = [editing addItemWithTitle:@"Redo" action:@selector(redo:) keyEquivalent:@"z"];
++    redo.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
++    [editing addItem:NSMenuItem.separatorItem];
++    NSMenuItem *cut = [editing addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
++    NSMenuItem *copy = [editing addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
++    NSMenuItem *paste = [editing addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
++    [editing addItem:NSMenuItem.separatorItem];
++    NSMenuItem *selectAll = [editing addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
++    for (NSMenuItem *item in @[undo, redo, cut, copy, paste, selectAll])
++        item.target = nil; // Native field editor decides availability and handles the action.
++    edit.submenu = editing;
++    [menu addItem:edit];
++    return menu;
++}
++
+ @interface Launcher : NSObject <NSApplicationDelegate, NSTextFieldDelegate>
+ @property NSWindow *window;
+ @property NSTextField *engine;
+@@ -25,12 +58,28 @@ static NSString *const KeyMask = @"••••••••";
+ @property BOOL autoStart;
+ @property BOOL credentialEdited;
+ @property BOOL receiverRunning;
++@property NSTask *frontend;
++@property BOOL stopping;
++@property BOOL pendingReset;
+ @end
+ 
+ @implementation Launcher
+ - (NSURL *)helper {
+     return [NSBundle.mainBundle.bundleURL URLByAppendingPathComponent:@"Contents/Helpers/runtime-cli.app/Contents/MacOS/runtime-cli"];
+ }
++- (NSURL *)configurationURL {
++    const char *profile = getenv("SOLOIST_RUNTIME_HOME");
++    if (profile && profile[0] == '/')
++        return [[NSURL fileURLWithPath:[NSString stringWithUTF8String:profile] isDirectory:YES]
++                URLByAppendingPathComponent:@"state/installation.json"];
++    NSURL *support = [[NSFileManager defaultManager] URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
++    return [support URLByAppendingPathComponent:@"Spotifast Soloist/state/installation.json"];
++}
++- (NSURL *)frontendURL {
++    NSString *name = [NSBundle.mainBundle objectForInfoDictionaryKey:@"SoloistFrontendExecutable"];
++    return [name isKindOfClass:NSString.class] ?
++        [NSBundle.mainBundle.bundleURL URLByAppendingPathComponent:[@"Contents/MacOS/" stringByAppendingString:name]] : nil;
++}
+ - (NSTextField *)label:(NSString *)text size:(CGFloat)size {
+     NSTextField *label = [NSTextField wrappingLabelWithString:text];
+     label.font = [NSFont systemFontOfSize:size];
+@@ -38,17 +87,11 @@ static NSString *const KeyMask = @"••••••••";
+ }
+ - (void)applicationDidFinishLaunching:(NSNotification *)notification {
+     (void)notification;
+-    NSMenu *menu = [NSMenu new];
+-    NSMenuItem *application = [NSMenuItem new];
+-    [menu addItem:application];
+-    NSMenu *actions = [NSMenu new];
+-    [actions addItemWithTitle:@"Quit Soloist Runtime" action:@selector(terminate:) keyEquivalent:@"q"];
+-    application.submenu = actions;
+-    NSApp.mainMenu = menu;
++    NSApp.mainMenu = StandardMainMenu();
+     self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 620, 450)
+                                             styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable
+                                               backing:NSBackingStoreBuffered defer:NO];
+-    self.window.title = @"Soloist Runtime";
++    self.window.title = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: @"Spotifast Soloist";
+     self.window.releasedWhenClosed = NO;
+     NSStackView *stack = [NSStackView new];
+     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+@@ -60,7 +103,7 @@ static NSString *const KeyMask = @"••••••••";
+         [stack.leadingAnchor constraintEqualToAnchor:self.window.contentView.leadingAnchor constant:24],
+         [stack.trailingAnchor constraintEqualToAnchor:self.window.contentView.trailingAnchor constant:-24],
+         [stack.topAnchor constraintEqualToAnchor:self.window.contentView.topAnchor constant:24]]];
+-    NSTextField *title = [self label:@"Soloist Runtime" size:24];
++    NSTextField *title = [self label:self.window.title size:24];
+     NSView *spacer = [NSView new];
+     [spacer setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+     NSButton *download = [NSButton buttonWithTitle:@"Get Soloist" target:self action:@selector(download:)];
+@@ -68,7 +111,7 @@ static NSString *const KeyMask = @"••••••••";
+     titleRow.spacing = 8;
+     [stack addArrangedSubview:titleRow];
+     [titleRow.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
+-    self.deviceName = [NSTextField textFieldWithString:[[NSUserDefaults standardUserDefaults] stringForKey:@"deviceName"] ?: @"Soloist Runtime"];
++    self.deviceName = [NSTextField textFieldWithString:[[NSUserDefaults standardUserDefaults] stringForKey:@"deviceName"] ?: @"Spotifast Soloist"];
+     self.deviceName.placeholderString = @"Name shown in Spotify Connect";
+     self.deviceName.accessibilityLabel = @"Spotify Connect device name";
+     self.deviceName.delegate = self;
+@@ -83,9 +126,10 @@ static NSString *const KeyMask = @"••••••••";
+     [stack addArrangedSubview:engineRow];
+     [engineRow.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
+     [browse.widthAnchor constraintEqualToConstant:128].active = YES;
+-    self.key = [NSTextField textFieldWithString:@""];
++    self.key = [[NSSecureTextField alloc] initWithFrame:NSZeroRect];
++    self.key.stringValue = @"";
+     self.key.placeholderString = @"Soloist API key";
+-    self.key.accessibilityLabel = @"Soloist API key; visible while editing, hidden afterward";
++    self.key.accessibilityLabel = @"Soloist API key; secure entry";
+     self.key.toolTip = @"Click to enter or replace the key. A saved key is never revealed.";
+     self.key.delegate = self;
+     NSButton *getKey = [NSButton buttonWithTitle:@"Get Soloist Key" target:self action:@selector(getKey:)];
+@@ -118,7 +162,11 @@ static NSString *const KeyMask = @"••••••••";
+     self.websocket = [NSButton checkboxWithTitle:@"Enable local WebSocket control" target:self action:@selector(websocketChanged:)];
+     self.websocket.state = [[NSUserDefaults standardUserDefaults] boolForKey:@"enableWebSocket"]
+         ? NSControlStateValueOn : NSControlStateValueOff;
+-    self.websocket.toolTip = @"Unauthenticated API on this Mac only (127.0.0.1). Never expose it to a LAN or browser.";
++    if (self.frontendURL) {
++        self.websocket.state = NSControlStateValueOn;
++        self.websocket.enabled = NO;
++    }
++    self.websocket.toolTip = @"Owner-only Unix socket for local clients. Browser pages and other macOS users cannot open it.";
+     [stack addArrangedSubview:self.websocket];
+     self.runOnLogin = [NSButton checkboxWithTitle:@"Run on login" target:self action:@selector(loginChanged:)];
+     SMAppServiceStatus loginStatus = SMAppService.mainAppService.status;
+@@ -134,8 +182,7 @@ static NSString *const KeyMask = @"••••••••";
+     self.stop = [NSButton buttonWithTitle:@"Stop" target:self action:@selector(stop:)];
+     self.stop.enabled = NO;
+     [stack addArrangedSubview:[NSStackView stackViewWithViews:@[self.start, self.stop]]];
+-    NSURL *support = [[NSFileManager defaultManager] URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
+-    NSURL *config = [support URLByAppendingPathComponent:@"Soloist Runtime/state/installation.json"];
++    NSURL *config = self.configurationURL;
+     NSData *data = [NSData dataWithContentsOfURL:config];
+     NSDictionary *settings = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+     if ([settings[@"soloist"] isKindOfClass:NSString.class]) self.engine.stringValue = settings[@"soloist"];
+@@ -150,8 +197,7 @@ static NSString *const KeyMask = @"••••••••";
+     [NSApp activate];
+ }
+ - (void)refreshExpiry {
+-    NSURL *support = [[NSFileManager defaultManager] URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
+-    NSURL *config = [support URLByAppendingPathComponent:@"Soloist Runtime/state/installation.json"];
++    NSURL *config = self.configurationURL;
+     NSData *data = [NSData dataWithContentsOfURL:config];
+     NSDictionary *settings = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+     if ([settings[@"soloist"] isKindOfClass:NSString.class]) self.engine.stringValue = settings[@"soloist"];
+@@ -312,11 +358,14 @@ static NSString *const KeyMask = @"••••••••";
+         self.pendingStart = NO;
+         self.status.stringValue = @"The API key must be one nonempty line of at most 4096 bytes.";
+         self.key.stringValue = self.hasSavedKey ? KeyMask : @"";
++        [[self.window fieldEditor:NO forObject:self.key].undoManager removeAllActions];
++        [self.window.undoManager removeAllActions];
+         return;
+     }
+     self.credentialEdited = YES;
+     self.savingKey = YES;
+     self.key.stringValue = KeyMask;
++    [[self.window fieldEditor:NO forObject:self.key].undoManager removeAllActions];
+     [self.window.undoManager removeAllActions];
+     self.status.stringValue = @"Saving API key in macOS Keychain…";
+     NSTask *task = [NSTask new];
+@@ -473,6 +522,7 @@ static NSString *const KeyMask = @"••••••••";
+     }
+ }
+ - (void)launchReceiver {
++    self.stopping = NO;
+     [[NSUserDefaults standardUserDefaults] setBool:self.websocket.state == NSControlStateValueOn forKey:@"enableWebSocket"];
+     NSTask *task = [NSTask new];
+     task.executableURL = self.helper;
+@@ -488,7 +538,12 @@ static NSString *const KeyMask = @"••••••••";
+             self.receiverRunning = NO;
+             self.start.enabled = YES;
+             self.stop.enabled = NO;
+-            self.status.stringValue = finished.terminationStatus == 0 ? @"Receiver stopped." : @"Receiver stopped after an error. Run the bundled doctor command for diagnostics.";
++            self.status.stringValue = finished.terminationStatus == 0 ? @"Receiver stopped." : @"Receiver stopped after an error. Run the bundled diagnostics command for pairing and codec evidence.";
++            if (self.frontend.running) [self.frontend terminate];
++            if (self.pendingReset) {
++                self.pendingReset = NO;
++                [self finishResetPairing];
++            }
+             if (self.quitting && !self.savingKey) [NSApp replyToApplicationShouldTerminate:YES];
+         });
+     };
+@@ -502,13 +557,168 @@ static NSString *const KeyMask = @"••••••••";
+     }
+     self.stop.enabled = YES;
+     self.receiverRunning = YES;
+-    self.status.stringValue = @"Receiver starting. Select “Soloist Runtime” in Spotify Connect to pair. Closing this app stops it.";
++    self.status.stringValue = [NSString stringWithFormat:@"Receiver starting. Pair “%@” in Spotify Connect using the same Spotify account as Spotifast. Closing this app stops it.", self.deviceName.stringValue];
++    [self refreshReceiverStatus:task];
++    if (self.frontendURL) [self awaitFrontend:task remaining:100];
++}
++- (void)refreshReceiverStatus:(NSTask *)receiver {
++    if (self.task != receiver || !receiver.running || self.stopping) return;
++    // Read the helper's strict private snapshot, without another engine query.
++    NSTask *check = [NSTask new];
++    check.executableURL = self.helper;
++    check.arguments = @[@"diagnostics"];
++    NSPipe *output = [NSPipe pipe];
++    check.standardOutput = output;
++    check.standardError = [NSFileHandle fileHandleWithNullDevice];
++    void (^again)(void) = ^{
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
++            [self refreshReceiverStatus:receiver];
++        });
++    };
++    check.terminationHandler = ^(NSTask *finished) {
++        NSData *data = [output.fileHandleForReading readDataToEndOfFile];
++        NSDictionary *reply = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
++        dispatch_async(dispatch_get_main_queue(), ^{
++            if (self.task != receiver || !receiver.running || self.stopping) return;
++            if (finished.terminationStatus == 0 && [reply isKindOfClass:NSDictionary.class] &&
++                [reply[@"supervisor_pid"] intValue] == receiver.processIdentifier) {
++                NSString *phase = reply[@"phase"];
++                if ([phase isEqualToString:@"authenticated"])
++                    self.status.stringValue = @"Spotify Connect authenticated. Choose music in Spotifast. Closing this app stops the receiver.";
++                else if ([phase isEqualToString:@"waiting_for_pairing"])
++                    self.status.stringValue = [NSString stringWithFormat:@"Waiting for pairing. Select “%@” in Spotify Connect and play a song using the same Spotify account as Spotifast.", self.deviceName.stringValue];
++                else if ([phase isEqualToString:@"unresponsive"])
++                    self.status.stringValue = @"Receiver is running; its local status is temporarily unavailable. Checking again…";
++                else if ([phase isEqualToString:@"error"])
++                    self.status.stringValue = @"Receiver reported an error. The bundled diagnostics command has private pairing and codec evidence.";
++            }
++            again();
++        });
++    };
++    if (![check launchAndReturnError:nil]) {
++        again();
++        return;
++    }
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
++        if (check.running) [check terminate];
++    });
++}
++- (void)awaitFrontend:(NSTask *)receiver remaining:(NSInteger)remaining {
++    if (self.task != receiver || !receiver.running || self.stopping || self.frontend) return;
++    NSURL *hint = [[self.configurationURL URLByDeletingLastPathComponent] URLByAppendingPathComponent:@"ws.socket"];
++    NSString *path = [[NSString stringWithContentsOfURL:hint encoding:NSUTF8StringEncoding error:nil]
++        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
++    BOOL ready = NO;
++    if (path.length && path.isAbsolutePath) {
++        NSData *bytes = [path dataUsingEncoding:NSUTF8StringEncoding];
++        struct sockaddr_un address = {0};
++        struct stat node, parent;
++        NSString *parentPath = path.stringByDeletingLastPathComponent;
++        if (bytes.length < sizeof(address.sun_path) &&
++            lstat(path.fileSystemRepresentation, &node) == 0 && S_ISSOCK(node.st_mode) &&
++            node.st_uid == geteuid() && (node.st_mode & 0777) == 0600 &&
++            lstat(parentPath.fileSystemRepresentation, &parent) == 0 && S_ISDIR(parent.st_mode) &&
++            parent.st_uid == geteuid() && (parent.st_mode & 0777) == 0700) {
++            address.sun_family = AF_UNIX;
++            address.sun_len = sizeof(address);
++            memcpy(address.sun_path, bytes.bytes, bytes.length);
++            int descriptor = socket(AF_UNIX, SOCK_STREAM, 0);
++            if (descriptor >= 0) {
++                ready = connect(descriptor, (struct sockaddr *)&address, sizeof(address)) == 0;
++                close(descriptor);
++            }
++        }
++    }
++    if (ready) {
++        NSTask *frontend = [NSTask new];
++        frontend.executableURL = self.frontendURL;
++        NSMutableDictionary *environment = [NSProcessInfo.processInfo.environment mutableCopy];
++        environment[@"SPOTIFAST_SOLOIST_SOCKET"] = path;
++        frontend.environment = environment;
++        frontend.standardOutput = [NSFileHandle fileHandleWithNullDevice];
++        frontend.standardError = [NSFileHandle fileHandleWithNullDevice];
++        frontend.terminationHandler = ^(NSTask *finished) {
++            (void)finished;
++            dispatch_async(dispatch_get_main_queue(), ^{
++                if (self.frontend == frontend) self.frontend = nil;
++                if (self.receiverRunning && !self.stopping) [self stop:nil];
++            });
++        };
++        NSError *error = nil;
++        self.frontend = frontend;
++        if (![frontend launchAndReturnError:&error]) {
++            self.frontend = nil;
++            [self stop:nil];
++            self.status.stringValue = @"Spotifast could not start. Receiver is stopping.";
++        } else {
++            self.status.stringValue = [NSString stringWithFormat:@"Spotifast is open. Waiting for Spotify Connect pairing: select “%@” using the same Spotify account and play a song.", self.deviceName.stringValue];
++        }
++        return;
++    }
++    if (remaining <= 0) {
++        [self stop:nil];
++        self.status.stringValue = @"The private control socket did not become ready. Receiver is stopping.";
++        return;
++    }
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
++        [self awaitFrontend:receiver remaining:remaining - 1];
++    });
+ }
+ - (void)stop:(id)sender {
+     (void)sender;
++    if (self.stopping) return;
++    self.stopping = YES;
+     self.stop.enabled = NO;
+     self.status.stringValue = @"Stopping receiver cleanly…";
+-    if (self.task.running) [self.task terminate];
++    if (self.frontend.running) [self.frontend terminate];
++    NSTask *receiver = self.task;
++    if (!receiver.running) return;
++    if (!self.receiverRunning) {
++        [receiver terminate];
++        return;
++    }
++    // Best-effort bounded pause before graceful guest termination. This does
++    // not activate the receiver or seize playback from another Connect device.
++    NSTask *pause = [NSTask new];
++    pause.executableURL = self.helper;
++    pause.arguments = @[@"control", @"pause"];
++    pause.standardOutput = [NSFileHandle fileHandleWithNullDevice];
++    pause.standardError = [NSFileHandle fileHandleWithNullDevice];
++    pause.terminationHandler = ^(NSTask *finished) {
++        (void)finished;
++        dispatch_async(dispatch_get_main_queue(), ^{
++            if (self.task == receiver && receiver.running) [receiver terminate];
++        });
++    };
++    if (![pause launchAndReturnError:nil]) [receiver terminate];
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
++        if (pause.running) [pause terminate];
++        if (self.task == receiver && receiver.running) [receiver terminate];
++    });
++}
++- (void)resetPairing:(id)sender {
++    (void)sender;
++    if (self.task) {
++        self.pendingReset = YES;
++        [self stop:nil];
++    } else {
++        [self finishResetPairing];
++    }
++}
++- (void)finishResetPairing {
++    NSTask *reset = [NSTask new];
++    reset.executableURL = self.helper;
++    reset.arguments = @[@"reset-pairing"];
++    reset.standardOutput = [NSFileHandle fileHandleWithNullDevice];
++    reset.standardError = [NSFileHandle fileHandleWithNullDevice];
++    reset.terminationHandler = ^(NSTask *finished) {
++        dispatch_async(dispatch_get_main_queue(), ^{
++            self.status.stringValue = finished.terminationStatus == 0
++                ? @"Soloist local pairing and cache cleared. Spotify Connect pairing is required again. Spotifast Web API login is separate."
++                : @"Could not reset local pairing. Ensure the receiver is stopped.";
++        });
++    };
++    if (![reset launchAndReturnError:nil]) self.status.stringValue = @"The reset helper could not start.";
+ }
+ - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
+     (void)sender;
+@@ -525,6 +735,9 @@ static NSString *const KeyMask = @"••••••••";
+ 
+ int main(void) {
+     @autoreleasepool {
++        NSString *profile = [NSBundle.mainBundle objectForInfoDictionaryKey:@"SoloistRuntimeHome"];
++        if (!getenv("SOLOIST_RUNTIME_HOME") && [profile isKindOfClass:NSString.class] && [profile hasPrefix:@"/"])
++            setenv("SOLOIST_RUNTIME_HOME", profile.fileSystemRepresentation, 1);
+         NSApplication *app = NSApplication.sharedApplication;
+         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
+         __attribute__((objc_precise_lifetime)) Launcher *launcher = [Launcher new];
+diff --git a/patches/elfuse-soloist.patch b/patches/elfuse-soloist.patch
+index 46d2f6d..5f8fb16 100644
+--- a/patches/elfuse-soloist.patch
++++ b/patches/elfuse-soloist.patch
+@@ -1,5 +1,5 @@
+ diff --git a/Makefile b/Makefile
+-index cf126f2..46d61e2 100644
++index cf126f2..48ef1a1 100644
+ --- a/Makefile
+ +++ b/Makefile
+ @@ -27,6 +27,7 @@ SRCS := \
+@@ -10,6 +10,14 @@ index cf126f2..46d61e2 100644
+      core/rosetta.c \
+      core/sysroot.c \
+      runtime/thread.c \
++@@ -65,6 +66,7 @@ SRCS := \
++     syscall/exec.c \
++     syscall/signal.c \
++     syscall/net.c \
+++    syscall/net-private.c \
++     syscall/net-msg.c \
++     syscall/net-abi.c \
++     syscall/net-identity.c \
+ diff --git a/src/core/elf.c b/src/core/elf.c
+ index 9ac44e2..8ef20e9 100644
+ --- a/src/core/elf.c
+@@ -150,8 +158,150 @@ index bbe068b..45ef0de 100644
+      /* Bring-up failed: unwind whatever exists so far, including the temp unlink
+       * this side owns past the prepare call (contract in launch.h). Staged
+       * --user credentials are dropped too (proc.h).
++diff --git a/src/core/text-integrity.c b/src/core/text-integrity.c
++new file mode 100644
++index 0000000..869d26c
++--- /dev/null
+++++ b/src/core/text-integrity.c
++@@ -0,0 +1,103 @@
+++/*
+++ * Optional main-ELF/interpreter integrity diagnostic. Snapshots come from the
+++ * input files, not guest memory. No guest writes or instruction substitution.
+++ * This checks two points in time, not transient writes between them; libraries
+++ * subsequently loaded through mmap are not covered by this diagnostic.
+++ */
+++#include <errno.h>
+++#include <fcntl.h>
+++#include <stdlib.h>
+++#include <string.h>
+++#include <unistd.h>
+++
+++#include "core/text-integrity.h"
+++
+++#define TEXT_SNAPSHOT_LIMIT (256U * 1024U * 1024U)
+++
+++bool text_integrity_add(text_integrity_t *check,
+++                        const elf_info_t *info,
+++                        uint64_t base,
+++                        const char *path)
+++{
+++    if (info->has_text_relocations || info->num_segments < 0 ||
+++        info->num_segments > ELF_MAX_SEGMENTS || check->total > TEXT_SNAPSHOT_LIMIT)
+++        return false;
+++    int fd = open(path, O_RDONLY | O_CLOEXEC);
+++    if (fd < 0)
+++        return false;
+++    bool ok = true;
+++    for (int i = 0; i < info->num_segments; i++) {
+++        const elf_segment_t *seg = &info->segments[i];
+++        if (!(seg->flags & PF_X))
+++            continue;
+++        if ((seg->flags & PF_W) || seg->filesz > seg->memsz ||
+++            seg->memsz > TEXT_SNAPSHOT_LIMIT - check->total ||
+++            base > UINT64_MAX - seg->gpa ||
+++            base + seg->gpa > UINT64_MAX - seg->memsz ||
+++            seg->offset > INT64_MAX ||
+++            seg->filesz > (uint64_t) INT64_MAX - seg->offset ||
+++            check->count >= 2 * ELF_MAX_SEGMENTS) {
+++            ok = false;
+++            break;
+++        }
+++        if (!seg->memsz)
+++            continue;
+++        unsigned char *bytes = calloc(1, (size_t) seg->memsz);
+++        if (!bytes) {
+++            ok = false;
+++            break;
+++        }
+++        uint64_t done = 0;
+++        while (done < seg->filesz) {
+++            ssize_t count = pread(fd, bytes + done,
+++                                  (size_t) (seg->filesz - done),
+++                                  (off_t) (seg->offset + done));
+++            if (count < 0 && errno == EINTR)
+++                continue;
+++            if (count <= 0) {
+++                ok = false;
+++                break;
+++            }
+++            done += (uint64_t) count;
+++        }
+++        if (!ok) {
+++            free(bytes);
+++            break;
+++        }
+++        check->segments[check->count++] = (text_snapshot_t) {
+++            .address = base + seg->gpa,
+++            .size = (size_t) seg->memsz,
+++            .bytes = bytes,
+++        };
+++        check->total += (size_t) seg->memsz;
+++    }
+++    close(fd);
+++    return ok;
+++}
+++
+++bool text_integrity_verify(const text_integrity_t *check, const guest_t *g)
+++{
+++    unsigned char buffer[4096];
+++    if (!check->count)
+++        return false;
+++    for (size_t i = 0; i < check->count; i++) {
+++        const text_snapshot_t *seg = &check->segments[i];
+++        for (size_t offset = 0; offset < seg->size;) {
+++            size_t count = seg->size - offset;
+++            if (count > sizeof(buffer))
+++                count = sizeof(buffer);
+++            if (guest_read(g, seg->address + offset, buffer, count) < 0 ||
+++                memcmp(buffer, seg->bytes + offset, count) != 0)
+++                return false;
+++            offset += count;
+++        }
+++    }
+++    return true;
+++}
+++
+++void text_integrity_destroy(text_integrity_t *check)
+++{
+++    for (size_t i = 0; i < check->count; i++)
+++        free(check->segments[i].bytes);
+++    memset(check, 0, sizeof(*check));
+++}
++diff --git a/src/core/text-integrity.h b/src/core/text-integrity.h
++new file mode 100644
++index 0000000..a1b3067
++--- /dev/null
+++++ b/src/core/text-integrity.h
++@@ -0,0 +1,27 @@
+++/* Local diagnostic: compare guest executable bytes without modifying them. */
+++#pragma once
+++
+++#include <stdbool.h>
+++#include <stddef.h>
+++#include <stdint.h>
+++
+++#include "core/elf.h"
+++#include "core/guest.h"
+++
+++typedef struct {
+++    uint64_t address;
+++    size_t size;
+++    unsigned char *bytes;
+++} text_snapshot_t;
+++
+++typedef struct {
+++    text_snapshot_t segments[2 * ELF_MAX_SEGMENTS];
+++    size_t count, total;
+++} text_integrity_t;
+++
+++bool text_integrity_add(text_integrity_t *check,
+++                        const elf_info_t *info,
+++                        uint64_t base,
+++                        const char *path);
+++bool text_integrity_verify(const text_integrity_t *check, const guest_t *g);
+++void text_integrity_destroy(text_integrity_t *check);
+ diff --git a/src/main.c b/src/main.c
+-index 1f82b0c..618c203 100644
++index 1f82b0c..a35b5aa 100644
+ --- a/src/main.c
+ +++ b/src/main.c
+ @@ -18,6 +18,7 @@
+@@ -170,7 +320,15 @@ index 1f82b0c..618c203 100644
+  #include <unistd.h>
+  
+  #include "utils.h"
+-@@ -51,6 +53,62 @@
++@@ -43,6 +45,7 @@
++ 
++ #include "syscall/fuse.h"
++ #include "syscall/path.h"
+++#include "syscall/net-private.h"
++ #include "syscall/proc.h"
++ #include "syscall/wakeup-pipe.h"
++ 
++@@ -51,6 +54,62 @@
+  
+  extern char **environ;
+  
+@@ -233,7 +391,7 @@ index 1f82b0c..618c203 100644
+  static int parse_int_arg(const char *s, int min, int max, int *out)
+  {
+      /* Seed end with s (strtol's no-conversion result) so the end == s guard
+-@@ -215,7 +260,8 @@ static int host_dc_zva_assert(void)
++@@ -215,7 +274,8 @@ static int host_dc_zva_assert(void)
+      "usage: elfuse [--verbose] [--timeout N] [--sysroot PATH]" sep         \
+      "[--create-sysroot PATH] [--no-rosetta] [--fakeroot] [--gdb PORT]" sep \
+      "[--gdb-stop-on-entry] [--user UID[:GID]] [--workdir DIR]" sep         \
+@@ -243,7 +401,7 @@ index 1f82b0c..618c203 100644
+  
+  #define ELFUSE_USAGE ELFUSE_USAGE_BODY(" ")
+  #define ELFUSE_USAGE_WRAPPED ELFUSE_USAGE_BODY("\n              ")
+-@@ -256,6 +302,7 @@ int main(int argc, char **argv)
++@@ -256,6 +316,7 @@ int main(int argc, char **argv)
+      char **env_overrides = NULL;
+      int n_env_overrides = 0;
+      bool clear_env = false;
+@@ -251,7 +409,7 @@ index 1f82b0c..618c203 100644
+      int arg_start = 1;
+  
+      /* Everything the shared cleanup label reads is declared and initialized
+-@@ -462,6 +509,10 @@ int main(int argc, char **argv)
++@@ -462,6 +523,17 @@ int main(int argc, char **argv)
+              }
+              env_overrides[n_env_overrides++] = argv[arg_start + 1];
+              arg_start += 2;
+@@ -259,10 +417,17 @@ index 1f82b0c..618c203 100644
+ +                   arg_start + 1 < argc) {
+ +            private_arg_path = argv[arg_start + 1];
+ +            arg_start += 2;
+++        } else if (!strcmp(argv[arg_start], "--private-tcp-listener") &&
+++                   arg_start + 2 < argc) {
+++            if (net_private_configure(argv[arg_start + 1], argv[arg_start + 2]) < 0) {
+++                log_error("invalid private listener configuration");
+++                goto cleanup;
+++            }
+++            arg_start += 3;
+          } else if (!strcmp(argv[arg_start], "--clear-env")) {
+              clear_env = true;
+              arg_start++;
+-@@ -596,13 +647,13 @@ int main(int argc, char **argv)
++@@ -596,13 +668,13 @@ int main(int argc, char **argv)
+          }
+      }
+      sysroot = sysroot_path;
+@@ -278,7 +443,7 @@ index 1f82b0c..618c203 100644
+          guest_argv[i] = strdup(argv[arg_start + i]);
+          if (!guest_argv[i]) {
+              log_error("out of memory");
+-@@ -610,6 +661,18 @@ int main(int argc, char **argv)
++@@ -610,6 +682,18 @@ int main(int argc, char **argv)
+          }
+      }
+  
+@@ -297,6 +462,14 @@ index 1f82b0c..618c203 100644
+      if (create_sysroot) {
+          if (sysroot_create_mount(sysroot_path, &sysroot_mount) < 0) {
+              log_error("failed to provision case-sensitive sysroot at %s: %s",
++@@ -780,6 +864,7 @@ int main(int argc, char **argv)
++     exit_code = elfuse_launch(&largs);
++ 
++ cleanup:
+++    net_private_cleanup();
++     /* Single unwind for every exit past the state block above: frees the
++      * caller-owned heap copies, detaches the sysroot mount, restores the host
++      * cwd, and drops a still-owned FUSE-materialized temp ELF. This must run
+ diff --git a/src/runtime/futex.c b/src/runtime/futex.c
+ index 705914e..038d4e7 100644
+ --- a/src/runtime/futex.c
+@@ -776,6 +949,189 @@ index d358a2c..45513da 100644
+      host_fd_ref_t host_ref;
+      fd_block_state_t sock_st;
+      int64_t ref_err = host_fd_ref_open_state(fd, &host_ref, &sock_st);
++diff --git a/src/syscall/net-private.c b/src/syscall/net-private.c
++new file mode 100644
++index 0000000..ac64604
++--- /dev/null
+++++ b/src/syscall/net-private.c
++@@ -0,0 +1,159 @@
+++/*
+++ * Replace one explicitly selected loopback TCP bind with a prebound AF_UNIX
+++ * socket inherited from the supervisor. There is never a TCP listener behind
+++ * this transport. This is a local access boundary, not a filesystem sandbox.
+++ */
+++#include "syscall/net-private.h"
+++#include <errno.h>
+++#include <fcntl.h>
+++#include <limits.h>
+++#include <stdatomic.h>
+++#include <stdlib.h>
+++#include <string.h>
+++#include <sys/stat.h>
+++#include <sys/un.h>
+++#include <netinet/in.h>
+++#include <unistd.h>
+++
+++static int private_fd = -1;
+++static uint16_t private_port;
+++static char private_path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
+++static atomic_bool claimed;
+++
+++static bool number(const char *text, long maximum, long *value)
+++{
+++    if (!text || !*text)
+++        return false;
+++    for (const char *p = text; *p; p++)
+++        if (*p < '0' || *p > '9')
+++            return false;
+++    char *end;
+++    errno = 0;
+++    long parsed = strtol(text, &end, 10);
+++    if (errno || *end || parsed < 0 || parsed > maximum)
+++        return false;
+++    *value = parsed;
+++    return true;
+++}
+++
+++int net_private_configure(const char *port, const char *descriptor)
+++{
+++    long p, fd;
+++    if (private_fd >= 0 || !number(port, 65535, &p) || p == 0 ||
+++        !number(descriptor, INT_MAX, &fd) || fd < 3)
+++        return -1;
+++    struct sockaddr_un address;
+++    socklen_t length = sizeof(address);
+++    int type;
+++    socklen_t type_length = sizeof(type);
+++    if (getsockopt((int) fd, SOL_SOCKET, SO_TYPE, &type, &type_length) < 0 ||
+++        type != SOCK_STREAM ||
+++        getsockname((int) fd, (struct sockaddr *) &address, &length) < 0 ||
+++        address.sun_family != AF_UNIX || address.sun_path[0] != '/' ||
+++        !memchr(address.sun_path, 0, sizeof(address.sun_path)))
+++        return -1;
+++    struct stat node, parent;
+++    if (lstat(address.sun_path, &node) < 0 || !S_ISSOCK(node.st_mode) ||
+++        node.st_uid != geteuid() || (node.st_mode & 0777) != 0600)
+++        return -1;
+++    char directory[sizeof(address.sun_path)];
+++    memcpy(directory, address.sun_path, sizeof(directory));
+++    char *slash = strrchr(directory, '/');
+++    if (!slash || slash == directory)
+++        return -1;
+++    *slash = 0;
+++    if (lstat(directory, &parent) < 0 || !S_ISDIR(parent.st_mode) ||
+++        parent.st_uid != geteuid() || (parent.st_mode & 0777) != 0700)
+++        return -1;
+++    int copy = fcntl((int) fd, F_DUPFD_CLOEXEC, 3);
+++    if (copy < 0)
+++        return -1;
+++    int flags = fcntl(copy, F_GETFL);
+++    if (flags < 0 || fcntl(copy, F_SETFL, flags | O_NONBLOCK) < 0) {
+++        close(copy);
+++        return -1;
+++    }
+++    private_fd = copy;
+++    private_port = htons((uint16_t) p);
+++    memcpy(private_path, address.sun_path, sizeof(private_path));
+++    atomic_store(&claimed, false);
+++    return 0;
+++}
+++
+++int net_private_bind(int host_fd, const struct sockaddr *address, socklen_t len)
+++{
+++    if (private_fd < 0 ||
+++        (address->sa_family != AF_INET && address->sa_family != AF_INET6) ||
+++        len < sizeof(struct sockaddr_in))
+++        return 1;
+++    const struct sockaddr_in *inet = (const struct sockaddr_in *) address;
+++    /* Both host INET layouts store the network-order port at offset2. The
+++     * selected port is reserved by this policy even if a future guest uses a
+++     * wildcard/IPv6 address: that must fail closed, never expose TCP. */
+++    if (inet->sin_port != private_port)
+++        return 1;
+++    if (address->sa_family != AF_INET ||
+++        inet->sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
+++        errno = EACCES;
+++        return -1;
+++    }
+++    int type;
+++    socklen_t length = sizeof(type);
+++    struct sockaddr_storage old_address;
+++    socklen_t old_length = sizeof(old_address);
+++    if (getsockopt(host_fd, SOL_SOCKET, SO_TYPE, &type, &length) < 0 ||
+++        type != SOCK_STREAM ||
+++        getsockname(host_fd, (struct sockaddr *) &old_address, &old_length) < 0 ||
+++        old_address.ss_family != AF_INET ||
+++        ((struct sockaddr_in *) &old_address)->sin_port != 0) {
+++        errno = EINVAL;
+++        return -1;
+++    }
+++    bool expected = false;
+++    if (!atomic_compare_exchange_strong(&claimed, &expected, true)) {
+++        errno = EADDRINUSE;
+++        return -1;
+++    }
+++    int fdflags = fcntl(host_fd, F_GETFD);
+++    if (fdflags < 0 || dup2(private_fd, host_fd) < 0 ||
+++        fcntl(host_fd, F_SETFD, fdflags) < 0)
+++        return -1; /* fail closed; never fall back to TCP */
+++    return 0;
+++}
+++
+++bool net_private_socket(int host_fd)
+++{
+++    if (private_fd < 0)
+++        return false;
+++    struct sockaddr_un address;
+++    socklen_t length = sizeof(address);
+++    memset(&address, 0, sizeof(address));
+++    return getsockname(host_fd, (struct sockaddr *) &address, &length) == 0 &&
+++           address.sun_family == AF_UNIX &&
+++           !strncmp(address.sun_path, private_path, sizeof(private_path));
+++}
+++
+++void net_private_address(struct sockaddr_storage *address, socklen_t *len)
+++{
+++    memset(address, 0, sizeof(*address));
+++    struct sockaddr_in *inet = (struct sockaddr_in *) address;
+++    inet->sin_len = sizeof(*inet);
+++    inet->sin_family = AF_INET;
+++    inet->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+++    inet->sin_port = private_port;
+++    *len = sizeof(*inet);
+++}
+++
+++bool net_private_peer_allowed(int host_fd)
+++{
+++    uid_t user;
+++    gid_t group;
+++    return getpeereid(host_fd, &user, &group) == 0 && user == geteuid();
+++}
+++
+++void net_private_cleanup(void)
+++{
+++    if (private_fd >= 0)
+++        close(private_fd);
+++    private_fd = -1;
+++}
++diff --git a/src/syscall/net-private.h b/src/syscall/net-private.h
++new file mode 100644
++index 0000000..f946aae
++--- /dev/null
+++++ b/src/syscall/net-private.h
++@@ -0,0 +1,12 @@
+++/* Explicit TCP-listener-to-private-Unix transport for trusted guest servers. */
+++#pragma once
+++#include <stdbool.h>
+++#include <sys/socket.h>
+++
+++int net_private_configure(const char *port, const char *descriptor);
+++/* 1: unrelated address; 0: redirected; -1: failed, errno set. */
+++int net_private_bind(int host_fd, const struct sockaddr *address, socklen_t len);
+++bool net_private_socket(int host_fd);
+++void net_private_address(struct sockaddr_storage *address, socklen_t *len);
+++bool net_private_peer_allowed(int host_fd);
+++void net_private_cleanup(void);
+ diff --git a/src/syscall/net-sockopt.c b/src/syscall/net-sockopt.c
+ index 53724cf..0b73690 100644
+ --- a/src/syscall/net-sockopt.c
+@@ -799,10 +1155,97 @@ index 53724cf..0b73690 100644
+              return -1;
+          }
+ diff --git a/src/syscall/net.c b/src/syscall/net.c
+-index fd91d4c..4a6fa54 100644
++index fd91d4c..2d4bd5a 100644
+ --- a/src/syscall/net.c
+ +++ b/src/syscall/net.c
+-@@ -1162,6 +1162,12 @@ int64_t sys_recvfrom(guest_t *g,
++@@ -38,6 +38,8 @@
++ #include "syscall/net.h"
++ #include "syscall/net-abi.h"
++ #include "syscall/net-absock.h"
+++#include "syscall/net-private.h"
+++#include "syscall/poll.h"
++ #include "syscall/net-sockopt.h"
++ #include "syscall/proc.h"
++ #include "syscall/io.h"
++@@ -520,7 +522,8 @@ int64_t sys_bind(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
++         return netlink_bind(fd, g, addr_gva, addrlen);
++ 
++     host_fd_ref_t host_ref;
++-    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+++    fd_entry_t bind_entry;
+++    int64_t ref_err = host_fd_ref_open_entry(fd, &host_ref, &bind_entry);
++     if (ref_err < 0)
++         return ref_err;
++ 
++@@ -560,6 +563,15 @@ int64_t sys_bind(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
++         }
++     }
++ 
+++    int redirected = net_private_bind(host_ref.fd, (struct sockaddr *) &mac_sa,
+++                                      (socklen_t) mac_len);
+++    if (redirected <= 0) {
+++        int64_t result = redirected == 0
+++            ? epoll_note_fd_rebound(fd, host_ref.fd, bind_entry.generation)
+++            : linux_errno();
+++        host_fd_ref_close(&host_ref);
+++        return result;
+++    }
++     if (bind(host_ref.fd, (struct sockaddr *) &mac_sa, (socklen_t) mac_len) <
++         0) {
++         if (absock_idx >= 0)
++@@ -639,6 +651,7 @@ static int64_t do_accept(guest_t *g,
++     struct sockaddr_storage mac_sa;
++     socklen_t mac_len;
++     int new_fd;
+++    bool private_listener = net_private_socket(host_ref.fd);
++ 
++     /* Wait, accept, and retry the EAGAIN a blocking guest must not see. elfuse
++      * owns O_NONBLOCK on the listener, so a sibling that takes the connection
++@@ -656,8 +669,15 @@ static int64_t do_accept(guest_t *g,
++ 
++         mac_len = sizeof(mac_sa);
++         new_fd = accept(host_ref.fd, (struct sockaddr *) &mac_sa, &mac_len);
++-        if (new_fd >= 0)
+++        if (new_fd >= 0) {
+++            if (private_listener && !net_private_peer_allowed(new_fd)) {
+++                close(new_fd);
+++                continue;
+++            }
+++            if (private_listener)
+++                net_private_address(&mac_sa, &mac_len);
++             break;
+++        }
++         if (!net_recv_should_retry(&sock_st, host_ref.fd, 0, -1)) {
++             host_fd_ref_close(&host_ref);
++             return linux_errno();
++@@ -686,6 +706,8 @@ static int64_t do_accept(guest_t *g,
++     }
++     fd_table[gfd].linux_flags = sock_creation_flags(nonblock, cloexec);
++     net_socket_cache_init_accept(gfd, listener_passcred);
+++    if (private_listener)
+++        net_socket_cache_set_index(gfd, SOCK_OPT_TCP_NODELAY, 0);
++ 
++     /* Write back peer address if requested. The accept has already succeeded
++      * and gfd is valid; EFAULT here mirrors Linux kernel behavior (close the
++@@ -948,6 +970,8 @@ int64_t sys_getsockname(guest_t *g,
++         host_fd_ref_close(&host_ref);
++         return linux_errno();
++     }
+++    if (net_private_socket(host_ref.fd))
+++        net_private_address(&mac_sa, &mac_len);
++ 
++     uint32_t guest_addrlen;
++     if (guest_read_small(g, addrlen_gva, &guest_addrlen,
++@@ -1005,6 +1029,8 @@ int64_t sys_getpeername(guest_t *g,
++         host_fd_ref_close(&host_ref);
++         return linux_errno();
++     }
+++    if (net_private_socket(host_ref.fd))
+++        net_private_address(&mac_sa, &mac_len);
++ 
++     uint32_t guest_addrlen;
++     if (guest_read_small(g, addrlen_gva, &guest_addrlen,
++@@ -1162,6 +1188,12 @@ int64_t sys_recvfrom(guest_t *g,
+      if (fd_get_type(fd) == FD_NETLINK)
+          return netlink_recv(fd, g, buf_gva, len, flags, src_gva, addrlen_gva);
+  
+@@ -815,7 +1258,7 @@ index fd91d4c..4a6fa54 100644
+      host_fd_ref_t host_ref;
+      fd_block_state_t recv_st;
+      int64_t ref_err = host_fd_ref_open_state(fd, &host_ref, &recv_st);
+-@@ -1345,8 +1351,16 @@ static bool translate_sockopt_level(int level,
++@@ -1345,8 +1377,16 @@ static bool translate_sockopt_level(int level,
+      }
+      if (level == LINUX_IPPROTO_IPV6) {
+          *mac_level = IPPROTO_IPV6;
+@@ -833,7 +1276,7 @@ index fd91d4c..4a6fa54 100644
+      }
+      return true;
+  }
+-@@ -1404,6 +1418,15 @@ int64_t sys_setsockopt(guest_t *g,
++@@ -1404,6 +1444,15 @@ int64_t sys_setsockopt(guest_t *g,
+  
+      int small_int_opt = socket_opt_uses_small_int(level, optname);
+  
+@@ -849,7 +1292,7 @@ index fd91d4c..4a6fa54 100644
+      /* SO_PASSCRED: emulated entirely in elfuse. Cache the flag value so
+       * getsockopt returns it and recvmsg knows to inject SCM_CREDENTIALS. macOS
+       * has no equivalent. Do not forward.
+-@@ -1451,7 +1474,8 @@ int64_t sys_setsockopt(guest_t *g,
++@@ -1451,7 +1500,8 @@ int64_t sys_setsockopt(guest_t *g,
+          }
+          return 0;
+      }
+@@ -859,7 +1302,7 @@ index fd91d4c..4a6fa54 100644
+          /* No macOS equivalent for the Linux extended-error queue. Accept and
+           * discard; the queue stays empty, so subsequent recvmsg with
+           * MSG_ERRQUEUE returns -EAGAIN as Linux would for a quiescent
+-@@ -1464,7 +1488,9 @@ int64_t sys_setsockopt(guest_t *g,
++@@ -1464,7 +1514,9 @@ int64_t sys_setsockopt(guest_t *g,
+          int value = 0;
+          if (guest_read_small(g, optval_gva, &value, optlen) < 0)
+              return -LINUX_EFAULT;
+@@ -870,7 +1313,7 @@ index fd91d4c..4a6fa54 100644
+          return 0;
+      }
+  
+-@@ -1530,8 +1556,23 @@ setsockopt_translated:
++@@ -1530,8 +1582,30 @@ setsockopt_translated:
+           * IP_RECVTOS). The value has already been zero-extended into an int, so
+           * always call the host with sizeof(int).
+           */
+@@ -891,12 +1334,19 @@ index fd91d4c..4a6fa54 100644
+ +        const void *host_value = multicast_byte ? (const void *) &byte_value
+ +                                               : (const void *) &value;
+ +        socklen_t host_len = multicast_byte ? sizeof(byte_value) : sizeof(value);
+++        /* TCP timing options do not apply to the selected Unix transport.
+++         * Keep the guest's supported option round-trip without exposing TCP. */
+++        if (level == LINUX_IPPROTO_TCP && net_private_socket(host_ref.fd)) {
+++            net_socket_cached_int_set(fd, level, optname, value);
+++            host_fd_ref_close(&host_ref);
+++            return 0;
+++        }
+ +        if (setsockopt(host_ref.fd, mac_level, mac_optname, host_value,
+ +                       host_len) < 0) {
+              log_debug("setsockopt(fd=%d, level=%d/%d, opt=%d/%d, len=%u): %s",
+                        fd, level, mac_level, optname, mac_optname, optlen,
+                        strerror(errno));
+-@@ -1632,8 +1673,7 @@ int64_t sys_getsockopt(guest_t *g,
++@@ -1632,8 +1706,7 @@ int64_t sys_getsockopt(guest_t *g,
+          return 0;
+      }
+  
+@@ -906,7 +1356,7 @@ index fd91d4c..4a6fa54 100644
+          if (!net_socket_fd_is_valid(fd))
+              return -LINUX_EBADF;
+          if (guest_optlen >= sizeof(int)) {
+-@@ -1654,6 +1694,20 @@ int64_t sys_getsockopt(guest_t *g,
++@@ -1654,6 +1727,20 @@ int64_t sys_getsockopt(guest_t *g,
+          return 0;
+      }
+  
+@@ -927,7 +1377,7 @@ index fd91d4c..4a6fa54 100644
+      if (socket_opt_uses_small_int(level, optname)) {
+          int value = 0;
+          if (net_socket_cached_int_get(fd, level, optname, &value)) {
+-@@ -1721,6 +1775,13 @@ getsockopt_translated:
++@@ -1721,6 +1808,13 @@ getsockopt_translated:
+          }
+  
+          actual_len = used_cache ? sizeof(int) : (uint32_t) mac_optlen;
+@@ -958,200 +1408,105 @@ index 122a428..216f885 100644
+  
+  /* Linux msghdr (aarch64). */
+  typedef struct {
+-diff --git a/tests/test-elf-headers-host.c b/tests/test-elf-headers-host.c
+-index adffc47..caa20a7 100644
+---- a/tests/test-elf-headers-host.c
+-+++ b/tests/test-elf-headers-host.c
+-@@ -456,6 +456,39 @@ static void test_placement(void)
+-                               0x3000));
++diff --git a/src/syscall/poll.c b/src/syscall/poll.c
++index 400a15e..7e85fb0 100644
++--- a/src/syscall/poll.c
+++++ b/src/syscall/poll.c
++@@ -1283,6 +1283,80 @@ void epoll_note_fd_closed(int closed_fd, uint64_t closed_ofd_id)
++     }
+  }
+  
+-+static void test_dynamic_tags(void)
+-+{
+-+    image_t img;
+-+    elf_info_t info;
+-+    image_init(&img, ET_DYN);
+-+    image_add_load(&img, 0x1000, 256, 256);
+-+    elf64_phdr_t *ph = image_add_ph(&img, PT_DYNAMIC);
+-+    ph->p_offset = DATA_OFF;
+-+    ph->p_filesz = 32;
+-+    uint64_t entries[4] = {22, 0, 0, 0};
+-+    memcpy(img.data, entries, sizeof(entries));
+-+    current = "DT_TEXTREL is identified";
+-+    CHECK(parse(&img, &info));
+-+    CHECK(info.has_text_relocations);
+-+    entries[0] = 30;
+-+    entries[1] = 4;
+-+    memcpy(img.data, entries, sizeof(entries));
+-+    current = "DF_TEXTREL is identified";
+-+    CHECK(parse(&img, &info));
+-+    CHECK(info.has_text_relocations);
+-+    entries[1] = 0;
+-+    memcpy(img.data, entries, sizeof(entries));
+-+    current = "ordinary dynamic flags remain loadable";
+-+    CHECK(parse(&img, &info));
+-+    CHECK(!info.has_text_relocations);
+-+    ph->p_filesz = 16;
+-+    current = "unterminated dynamic table rejected";
+-+    CHECK(!parse(&img, &info));
+-+    ph->p_offset = UINT64_MAX;
+-+    current = "dynamic table overflow rejected";
+-+    CHECK(!parse(&img, &info));
+-+}
+-+
+- int main(void)
+- {
+-     test_baseline();
+-@@ -466,6 +499,7 @@ int main(void)
+-     test_mapper_ignores_segment_order();
+-     test_interp_loadable();
+-     test_placement();
+-+    test_dynamic_tags();
+- 
+-     return host_summary("test-elf-headers-host");
+- }
+-diff --git a/src/core/text-integrity.c b/src/core/text-integrity.c
+-new file mode 100644
+-index 0000000..869d26c
+---- /dev/null
+-+++ b/src/core/text-integrity.c
+-@@ -0,0 +1,103 @@
+-+/*
+-+ * Optional main-ELF/interpreter integrity diagnostic. Snapshots come from the
+-+ * input files, not guest memory. No guest writes or instruction substitution.
+-+ * This checks two points in time, not transient writes between them; libraries
+-+ * subsequently loaded through mmap are not covered by this diagnostic.
+++/* Asynchronous servers may register a newly created socket before bind(). A
+++ * deliberate TCP->Unix substitution closes the old host description, which
+++ * silently removes its kqueue filters. Linux bind preserves both descriptor
+++ * aliases and epoll interests; reproduce that here after the explicit rebind.
+++ * This path is cold, bounded and only used by the private listener option.
+ + */
+-+#include <errno.h>
+-+#include <fcntl.h>
+-+#include <stdlib.h>
+-+#include <string.h>
+-+#include <unistd.h>
+-+
+-+#include "core/text-integrity.h"
+-+
+-+#define TEXT_SNAPSHOT_LIMIT (256U * 1024U * 1024U)
+-+
+-+bool text_integrity_add(text_integrity_t *check,
+-+                        const elf_info_t *info,
+-+                        uint64_t base,
+-+                        const char *path)
+++int epoll_note_fd_rebound(int guest_fd, int host_fd, uint64_t generation)
+ +{
+-+    if (info->has_text_relocations || info->num_segments < 0 ||
+-+        info->num_segments > ELF_MAX_SEGMENTS || check->total > TEXT_SNAPSHOT_LIMIT)
+-+        return false;
+-+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+-+    if (fd < 0)
+-+        return false;
+-+    bool ok = true;
+-+    for (int i = 0; i < info->num_segments; i++) {
+-+        const elf_segment_t *seg = &info->segments[i];
+-+        if (!(seg->flags & PF_X))
+++    int result = 0;
+++    pthread_mutex_lock(&fd_lock);
+++    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE) ||
+++        fd_table[guest_fd].type != FD_SOCKET ||
+++        fd_table[guest_fd].host_fd != host_fd ||
+++        fd_table[guest_fd].generation != generation) {
+++        result = -LINUX_EBADF;
+++        goto done;
+++    }
+++    uint64_t ofd = fd_table[guest_fd].ofd_id;
+++    for (int alias = 0; alias < FD_TABLE_SIZE; alias++) {
+++        fd_entry_t *entry = &fd_table[alias];
+++        if (alias == guest_fd || entry->type != FD_SOCKET || entry->ofd_id != ofd)
+ +            continue;
+-+        if ((seg->flags & PF_W) || seg->filesz > seg->memsz ||
+-+            seg->memsz > TEXT_SNAPSHOT_LIMIT - check->total ||
+-+            base > UINT64_MAX - seg->gpa ||
+-+            base + seg->gpa > UINT64_MAX - seg->memsz ||
+-+            seg->offset > INT64_MAX ||
+-+            seg->filesz > (uint64_t) INT64_MAX - seg->offset ||
+-+            check->count >= 2 * ELF_MAX_SEGMENTS) {
+-+            ok = false;
+-+            break;
+++        int flags = fcntl(entry->host_fd, F_GETFD);
+++        if (flags < 0 || dup2(host_fd, entry->host_fd) < 0 ||
+++            fcntl(entry->host_fd, F_SETFD, flags) < 0) {
+++            result = (int) linux_errno();
+++            goto done;
+ +        }
+-+        if (!seg->memsz)
+++    }
+++    for (int epfd = 0; epfd < FD_TABLE_SIZE; epfd++) {
+++        if (fd_table[epfd].type != FD_EPOLL || !fd_table[epfd].dir)
+ +            continue;
+-+        unsigned char *bytes = calloc(1, (size_t) seg->memsz);
+-+        if (!bytes) {
+-+            ok = false;
+-+            break;
+-+        }
+-+        uint64_t done = 0;
+-+        while (done < seg->filesz) {
+-+            ssize_t count = pread(fd, bytes + done,
+-+                                  (size_t) (seg->filesz - done),
+-+                                  (off_t) (seg->offset + done));
+-+            if (count < 0 && errno == EINTR)
+++        epoll_instance_t *inst = (epoll_instance_t *) fd_table[epfd].dir;
+++        pthread_mutex_lock(&inst->lock);
+++        for (int target = 0; target < FD_TABLE_SIZE; target++) {
+++            epoll_reg_t *reg = &inst->regs[target];
+++            if (!reg->active || reg->oneshot_armed || reg->ofd_id != ofd ||
+++                reg->generation != fd_table[target].generation)
+ +                continue;
+-+            if (count <= 0) {
+-+                ok = false;
+-+                break;
+++            uint16_t flags = EV_ADD;
+++            if (reg->events & LINUX_EPOLLET)
+++                flags |= EV_CLEAR;
+++            if (reg->events & LINUX_EPOLLONESHOT)
+++                flags |= EV_ONESHOT;
+++            struct kevent changes[2];
+++            int count = 0;
+++            void *data = (void *) (uintptr_t) target;
+++            int rebound_host = fd_table[target].host_fd;
+++            if (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
+++                EV_SET(&changes[count], rebound_host, EVFILT_READ, flags, 0, 0, data);
+++                count++;
+ +            }
+-+            done += (uint64_t) count;
+++            if (reg->events & LINUX_EPOLLOUT) {
+++                EV_SET(&changes[count], rebound_host, EVFILT_WRITE, flags, 0, 0, data);
+++                count++;
+++            }
+++            for (int index = 0; index < count; index++) {
+++                if (kevent(fd_table[epfd].host_fd, &changes[index], 1, NULL, 0, NULL) < 0) {
+++                    result = (int) linux_errno();
+++                    break;
+++                }
+++            }
+++            if (result < 0)
+++                break;
+ +        }
+-+        if (!ok) {
+-+            free(bytes);
+++        pthread_mutex_unlock(&inst->lock);
+++        if (result < 0)
+ +            break;
+-+        }
+-+        check->segments[check->count++] = (text_snapshot_t) {
+-+            .address = base + seg->gpa,
+-+            .size = (size_t) seg->memsz,
+-+            .bytes = bytes,
+-+        };
+-+        check->total += (size_t) seg->memsz;
+-+    }
+-+    close(fd);
+-+    return ok;
+-+}
+-+
+-+bool text_integrity_verify(const text_integrity_t *check, const guest_t *g)
+-+{
+-+    unsigned char buffer[4096];
+-+    if (!check->count)
+-+        return false;
+-+    for (size_t i = 0; i < check->count; i++) {
+-+        const text_snapshot_t *seg = &check->segments[i];
+-+        for (size_t offset = 0; offset < seg->size;) {
+-+            size_t count = seg->size - offset;
+-+            if (count > sizeof(buffer))
+-+                count = sizeof(buffer);
+-+            if (guest_read(g, seg->address + offset, buffer, count) < 0 ||
+-+                memcmp(buffer, seg->bytes + offset, count) != 0)
+-+                return false;
+-+            offset += count;
+-+        }
+ +    }
+-+    return true;
+++done:
+++    pthread_mutex_unlock(&fd_lock);
+++    return result;
+ +}
+ +
+-+void text_integrity_destroy(text_integrity_t *check)
+-+{
+-+    for (size_t i = 0; i < check->count; i++)
+-+        free(check->segments[i].bytes);
+-+    memset(check, 0, sizeof(*check));
+-+}
+-diff --git a/src/core/text-integrity.h b/src/core/text-integrity.h
+-new file mode 100644
+-index 0000000..a1b3067
+---- /dev/null
+-+++ b/src/core/text-integrity.h
+-@@ -0,0 +1,27 @@
+-+/* Local diagnostic: compare guest executable bytes without modifying them. */
+-+#pragma once
+-+
+-+#include <stdbool.h>
+-+#include <stddef.h>
+-+#include <stdint.h>
+-+
+-+#include "core/elf.h"
+-+#include "core/guest.h"
+-+
+-+typedef struct {
+-+    uint64_t address;
+-+    size_t size;
+-+    unsigned char *bytes;
+-+} text_snapshot_t;
+-+
+-+typedef struct {
+-+    text_snapshot_t segments[2 * ELF_MAX_SEGMENTS];
+-+    size_t count, total;
+-+} text_integrity_t;
+-+
+-+bool text_integrity_add(text_integrity_t *check,
+-+                        const elf_info_t *info,
+-+                        uint64_t base,
+-+                        const char *path);
+-+bool text_integrity_verify(const text_integrity_t *check, const guest_t *g);
+-+void text_integrity_destroy(text_integrity_t *check);
++ /* Drop the fd-table's reference to an epoll instance and remove it from the
++  * live count. Called by fd_cleanup_entry() when an FD_EPOLL slot closes. The
++  * memory is freed here only if no in-flight epoll_ctl / epoll_pwait still holds
++diff --git a/src/syscall/poll.h b/src/syscall/poll.h
++index 743e9d4..42803d3 100644
++--- a/src/syscall/poll.h
+++++ b/src/syscall/poll.h
++@@ -42,6 +42,9 @@ int64_t sys_epoll_pwait(guest_t *g,
++  * single-threaded on the relaxed close path).
++  */
++ void epoll_note_fd_closed(int closed_fd, uint64_t closed_ofd_id);
+++/* Preserve aliases and pre-bind registrations after an explicit host socket
+++ * substitution. Caller holds a host reference, but does not hold fd_lock. */
+++int epoll_note_fd_rebound(int guest_fd, int host_fd, uint64_t generation);
++ 
++ /* Free an epoll instance (fd_table[epfd].dir) and drop it from the live count.
++  * Called from fd_cleanup_entry() for FD_EPOLL slots.
+ diff --git a/src/syscall/proc.c b/src/syscall/proc.c
+ index f93d2cb..8629c0f 100644
+ --- a/src/syscall/proc.c
+@@ -1250,3 +1605,55 @@ index f93d2cb..8629c0f 100644
+      if (wait_status_out) {
+          int signal_status = signal_take_termination_wait_status();
+          *wait_status_out =
++diff --git a/tests/test-elf-headers-host.c b/tests/test-elf-headers-host.c
++index adffc47..caa20a7 100644
++--- a/tests/test-elf-headers-host.c
+++++ b/tests/test-elf-headers-host.c
++@@ -456,6 +456,39 @@ static void test_placement(void)
++                               0x3000));
++ }
++ 
+++static void test_dynamic_tags(void)
+++{
+++    image_t img;
+++    elf_info_t info;
+++    image_init(&img, ET_DYN);
+++    image_add_load(&img, 0x1000, 256, 256);
+++    elf64_phdr_t *ph = image_add_ph(&img, PT_DYNAMIC);
+++    ph->p_offset = DATA_OFF;
+++    ph->p_filesz = 32;
+++    uint64_t entries[4] = {22, 0, 0, 0};
+++    memcpy(img.data, entries, sizeof(entries));
+++    current = "DT_TEXTREL is identified";
+++    CHECK(parse(&img, &info));
+++    CHECK(info.has_text_relocations);
+++    entries[0] = 30;
+++    entries[1] = 4;
+++    memcpy(img.data, entries, sizeof(entries));
+++    current = "DF_TEXTREL is identified";
+++    CHECK(parse(&img, &info));
+++    CHECK(info.has_text_relocations);
+++    entries[1] = 0;
+++    memcpy(img.data, entries, sizeof(entries));
+++    current = "ordinary dynamic flags remain loadable";
+++    CHECK(parse(&img, &info));
+++    CHECK(!info.has_text_relocations);
+++    ph->p_filesz = 16;
+++    current = "unterminated dynamic table rejected";
+++    CHECK(!parse(&img, &info));
+++    ph->p_offset = UINT64_MAX;
+++    current = "dynamic table overflow rejected";
+++    CHECK(!parse(&img, &info));
+++}
+++
++ int main(void)
++ {
++     test_baseline();
++@@ -466,6 +499,7 @@ int main(void)
++     test_mapper_ignores_segment_order();
++     test_interp_loadable();
++     test_placement();
+++    test_dynamic_tags();
++ 
++     return host_summary("test-elf-headers-host");
++ }
+diff --git a/probes/launcher-menu-test.m b/probes/launcher-menu-test.m
+new file mode 100644
+index 0000000..311a1c4
+--- /dev/null
++++ b/probes/launcher-menu-test.m
+@@ -0,0 +1,51 @@
++/* Offscreen native shortcut routing fixture. Never reads the system clipboard or Keychain. */
++#define main launcher_application_main
++#include "../packaging/launcher.m"
++#undef main
++
++@interface FixtureApplication : NSApplication
++@property NSWindow *fixtureWindow;
++@end
++@implementation FixtureApplication
++- (NSWindow *)keyWindow { return self.fixtureWindow; }
++- (NSWindow *)mainWindow { return self.fixtureWindow; }
++@end
++
++@interface FixtureSecureEditor : NSSecureTextField
++@property BOOL pasted;
++@end
++@implementation FixtureSecureEditor
++- (BOOL)becomeFirstResponder { return YES; }
++- (void)paste:(id)sender {
++    (void)sender;
++    self.pasted = YES;
++    self.stringValue = @"dummy-menu-fixture";
++}
++- (BOOL)validateMenuItem:(NSMenuItem *)item {
++    // Test routing only. Do not ask the real clipboard whether paste is available.
++    return item.action == @selector(paste:);
++}
++@end
++
++int main(void) {
++    @autoreleasepool {
++        FixtureApplication *app = [FixtureApplication sharedApplication];
++        app.fixtureWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,200,100)
++            styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:YES];
++        FixtureSecureEditor *editor = [[FixtureSecureEditor alloc] initWithFrame:NSMakeRect(0,0,200,100)];
++        [app.fixtureWindow.contentView addSubview:editor];
++        if (![app.fixtureWindow makeFirstResponder:editor]) return 1;
++        app.mainMenu = StandardMainMenu();
++        NSMenu *edit = [app.mainMenu itemAtIndex:1].submenu;
++        NSMenuItem *paste = [edit itemWithTitle:@"Paste"];
++        if (paste.target || paste.action != @selector(paste:) || ![paste.keyEquivalent isEqualToString:@"v"])
++            return 2;
++        NSEvent *event = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint
++            modifierFlags:NSEventModifierFlagCommand timestamp:0 windowNumber:app.fixtureWindow.windowNumber
++            context:nil characters:@"v" charactersIgnoringModifiers:@"v" isARepeat:NO keyCode:9];
++        if (![app.mainMenu performKeyEquivalent:event] || !editor.pasted ||
++            ![editor.stringValue isEqualToString:@"dummy-menu-fixture"]) return 3;
++        puts("native Cmd-V responder routing passed; synthetic secure editor; no clipboard read");
++    }
++    return 0;
++}
+diff --git a/probes/private-listener.c b/probes/private-listener.c
+new file mode 100644
+index 0000000..5d886a0
+--- /dev/null
++++ b/probes/private-listener.c
+@@ -0,0 +1,58 @@
++/* Account-free Linux ABI integration fixture: private listener and TCP refusal. */
++#include "linux-syscall.h"
++typedef unsigned short u16;
++typedef unsigned int u32;
++struct address { u16 family, port; u32 host; unsigned char pad[8]; };
++static void fail(void) { syscall6(93, 1, 0, 0, 0, 0, 0); }
++static void check(long value) { if (value < 0) fail(); }
++void _start(void)
++{
++    struct address target = {2, 0xfeff, 0x0100007f, {0}}; /* port65534, 127.0.0.1 */
++    long listener = syscall6(198, 2, 1, 0, 0, 0, 0);
++    check(listener);
++    long alias = syscall6(23, listener, 0, 0, 0, 0, 0);
++    check(alias);
++    struct { u32 events, pad; unsigned long data; } event = {1, 0, 123};
++    long epoll = syscall6(20, 0, 0, 0, 0, 0, 0);
++    check(epoll);
++    check(syscall6(21, epoll, 1, alias, (long)&event, 0, 0));
++    check(syscall6(200, listener, (long)&target, sizeof(target), 0, 0, 0));
++    struct address local = {0};
++    u32 length = sizeof(local);
++    check(syscall6(204, listener, (long)&local, (long)&length, 0, 0, 0));
++    if (length != sizeof(local) || local.family != 2 || local.port != target.port || local.host != target.host) fail();
++    check(syscall6(57, listener, 0, 0, 0, 0, 0));
++    listener = alias; /* alias must share the substituted listener after close */
++    check(syscall6(201, listener, 2, 0, 0, 0, 0));
++    /* Repeated and duplicate binds fail; they must never create TCP fallback. */
++    if (syscall6(200, listener, (long)&target, sizeof(target), 0, 0, 0) >= 0) fail();
++    long second = syscall6(198, 2, 1, 0, 0, 0, 0);
++    check(second);
++    if (syscall6(200, second, (long)&target, sizeof(target), 0, 0, 0) != -98) fail();
++    check(syscall6(57, second, 0, 0, 0, 0, 0));
++    long wildcard = syscall6(198, 2, 1, 0, 0, 0, 0);
++    check(wildcard);
++    struct address denied = target;
++    denied.host = 0;
++    if (syscall6(200, wildcard, (long)&denied, sizeof(denied), 0, 0, 0) != -13) fail();
++    check(syscall6(57, wildcard, 0, 0, 0, 0, 0));
++    static const char ready[] = "private-listener-ready\n";
++    check(syscall6(64, 1, (long)ready, sizeof(ready)-1, 0, 0, 0));
++    if (syscall6(22, epoll, (long)&event, 1, 5000, 0, 0) != 1 || !(event.events & 1)) fail();
++    struct address remote = {0};
++    length = sizeof(remote);
++    long peer = syscall6(202, listener, (long)&remote, (long)&length, 0, 0, 0);
++    check(peer);
++    if (remote.family != 2 || remote.host != target.host) fail();
++    int one = 1;
++    check(syscall6(208, peer, 6, 1, (long)&one, sizeof(one), 0)); /* TCP_NODELAY */
++    length = sizeof(remote);
++    check(syscall6(205, peer, (long)&remote, (long)&length, 0, 0, 0));
++    if (remote.family != 2 || remote.host != target.host) fail();
++    char byte = 0;
++    if (syscall6(63, peer, (long)&byte, 1, 0, 0, 0) != 1 || byte != 'x') fail();
++    check(syscall6(64, peer, (long)&byte, 1, 0, 0, 0));
++    check(syscall6(57, peer, 0, 0, 0, 0, 0));
++    check(syscall6(57, listener, 0, 0, 0, 0, 0));
++    syscall6(93, 0, 0, 0, 0, 0, 0);
++}
+diff --git a/scripts/build-package.py b/scripts/build-package.py
+index 572e84a..ecbac12 100644
+--- a/scripts/build-package.py
++++ b/scripts/build-package.py
+@@ -17,7 +17,7 @@ import tempfile
+ from paths import ROOT, RUNTIME
+ 
+ NATIVE_ROOT = Path("/opt/homebrew/opt/pulseaudio")
+-MODULES = ("module-native-protocol-unix.so", "module-coreaudio-detect.so",
++MODULES = ("module-native-protocol-unix.so",
+            "module-coreaudio-device.so", "module-suspend-on-idle.so")
+ 
+ 
+@@ -25,6 +25,14 @@ def run(*command, **kwargs):
+     return subprocess.run([str(value) for value in command], check=True, **kwargs)
+ 
+ 
++def remove_build_metadata(root):
++    # copy2 can preserve Finder metadata from local source dependencies. Only
++    # clear signature-incompatible resource/finder metadata on this new build;
++    # retain quarantine and all system security attributes.
++    for name in ("com.apple.ResourceFork", "com.apple.FinderInfo"):
++        run("xattr", "-dr", name, root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++
++
+ def dependencies(binary):
+     output = subprocess.check_output(["otool", "-L", str(binary)], text=True)
+     return [line.strip().split(" (", 1)[0] for line in output.splitlines()[1:]]
+@@ -133,22 +141,33 @@ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--name", default="Soloist Runtime", help="Local output app basename")
+     parser.add_argument("--version", default="0.1.0", help="Package version as MAJOR.MINOR.PATCH")
++    parser.add_argument("--runtime-home", type=Path,
++                        help="Local preview only: absolute private profile to use when opened from Finder")
++    parser.add_argument("--frontend", type=Path, help="Bundle a separately built local frontend Mach-O executable")
++    parser.add_argument("--output-dir", type=Path, default=ROOT / "dist", help="Destination for the local app")
+     args = parser.parse_args()
+     if not args.name or any(value in args.name for value in ("/", "\\", "..")):
+         parser.error("Choose a simple app basename")
+     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.version):
+         parser.error("Version must be MAJOR.MINOR.PATCH")
+-    output = ROOT / "dist" / (args.name + ".app")
++    if args.runtime_home is not None and not args.runtime_home.is_absolute():
++        parser.error("--runtime-home must be an absolute directory")
++    if args.frontend is not None and not args.frontend.is_file():
++        parser.error("--frontend must be a built executable")
++    output = args.output_dir.resolve() / (args.name + ".app")
+     if output.exists():
+         parser.error("Output already exists; choose another --name to preserve the previous build")
+     (ROOT / "build").mkdir(exist_ok=True)
+-    work = Path(tempfile.mkdtemp(prefix="package-", dir=ROOT / "build"))
++    # Application bundles staged in synced Documents can acquire FinderInfo
++    # attributes between signing steps. Build privately outside synced folders.
++    work = Path(tempfile.mkdtemp(prefix="soloist-package-", dir="/private/tmp"))
+     run(sys.executable, "-m", "PyInstaller", "--onedir", "--windowed", "--noupx", "--target-arch", "arm64",
+         "--osx-bundle-identifier", "local.soloistcompat.helper",
+         "--name", "runtime-cli", "--distpath", work / "frozen", "--workpath", work / "freeze-work",
+         "--specpath", work, "--copy-metadata", "websockets",
+         "--hidden-import", "keyring.backends.macOS", "--paths", ROOT / "scripts",
+-        ROOT / "scripts/runtime_cli.py")
++        ROOT / "scripts/runtime_cli.py",
++        env=dict(os.environ, PYINSTALLER_CONFIG_DIR=str(ROOT / "build/pyinstaller-cache")))
+     app = work / (args.name + ".app")
+     contents = app / "Contents"
+     helpers = contents / "Helpers"
+@@ -172,6 +191,10 @@ def main():
+     resources.mkdir()
+     licenses(resources / "Licenses", native)
+     shutil.copy2(ROOT / "packaging/QUICKSTART.md", resources / "QUICKSTART.md")
++    remove_build_metadata(helper)
++    for framework in (helper / "Contents/Frameworks").glob("*.framework"):
++        run("codesign", "--force", "--sign", "-", framework)
++    remove_build_metadata(helper)
+     run("codesign", "--force", "--sign", "-", helper)
+     manifest = {"version": args.version, "platform": "macos-arm64", "soloist_included": False,
+                 "source_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+@@ -186,25 +209,35 @@ def main():
+     (resources / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+     macos = contents / "MacOS"
+     macos.mkdir()
++    if args.frontend is not None:
++        shutil.copy2(args.frontend, macos / "Spotifast")
++        (macos / "Spotifast").chmod(0o755)
++        run("codesign", "--force", "--sign", "-", macos / "Spotifast")
+     run("xcrun", "clang", "-fobjc-arc", "-Wall", "-Wextra", "-Werror", "-arch", "arm64",
+         "-mmacosx-version-min=27.0", "-framework", "AppKit",
+         "-framework", "ServiceManagement", ROOT / "packaging/launcher.m",
+         "-o", macos / "SoloistRuntime")
+-    info = {"CFBundleExecutable": "SoloistRuntime", "CFBundleIdentifier": "local.soloistcompat.runtime",
+-            "CFBundleName": "Soloist Runtime", "CFBundleDisplayName": "Soloist Runtime",
++    info = {"CFBundleExecutable": "SoloistRuntime", "CFBundleIdentifier": "local.spotifast.soloist",
++            "CFBundleName": args.name, "CFBundleDisplayName": args.name,
+             "CFBundlePackageType": "APPL", "CFBundleVersion": args.version,
+             "CFBundleShortVersionString": args.version,
+             "LSMinimumSystemVersion": "27.0", "NSHighResolutionCapable": True,
+             "NSLocalNetworkUsageDescription": "Discover and pair your local Spotify Connect receiver."}
++    if args.runtime_home is not None:
++        info["SoloistRuntimeHome"] = str(args.runtime_home.resolve())
++    if args.frontend is not None:
++        info["SoloistFrontendExecutable"] = "Spotifast"
++        info["CFBundleDisplayName"] = args.name
+     with (contents / "Info.plist").open("wb") as stream:
+         plistlib.dump(info, stream)
++    remove_build_metadata(app)
+     run("codesign", "--force", "--sign", "-", app)
+     run("codesign", "--verify", "--deep", "--strict", app)
+     output.parent.mkdir(exist_ok=True)
+     shutil.move(app, output)
+     print("Built local preview:", output)
+     print("Soloist, API keys, sessions and playback caches were not packaged.")
+-    print("Public redistribution/notarization and local API hardening are still separate release gates.")
++    print("Public redistribution, notarization and authenticated lossless validation remain separate release gates.")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/scripts/client_api.py b/scripts/client_api.py
+index 240730d..d85c872 100644
+--- a/scripts/client_api.py
++++ b/scripts/client_api.py
+@@ -7,6 +7,7 @@ import asyncio
+ import json
+ import re
+ import websockets
++import private_api
+ from paths import STATE
+ 
+ QUERY_EVENTS = {"get_auth_state": "auth_state", "get_state": "playback_state",
+@@ -41,18 +42,17 @@ def command(name, **fields):
+ 
+ 
+ def endpoint(state=STATE):
+-    if (state / "ws.addr").read_text().strip() != "127.0.0.1":
+-        raise ValueError("Refusing non-loopback API")
+-    port = int((state / "ws.port").read_text().strip())
+-    if not 1 <= port <= 65535:
+-        raise ValueError("Invalid API port")
+-    return f"ws://127.0.0.1:{port}"
++    return private_api.endpoint(state)
++
++
++def connect(**options):
++    return websockets.unix_connect(endpoint(), uri="ws://localhost/", **options)
+ 
+ 
+ async def request(name, *, timeout=8, **fields):
+     message = command(name, **fields)
+     async with asyncio.timeout(timeout):
+-        async with websockets.connect(endpoint(), open_timeout=3, close_timeout=1,
++        async with connect(open_timeout=3, close_timeout=1,
+                                       max_size=1024 * 1024) as ws:
+             if name != "get_auth_state":
+                 while True:
+diff --git a/scripts/current_diagnostics.py b/scripts/current_diagnostics.py
+new file mode 100644
+index 0000000..f8a5b23
+--- /dev/null
++++ b/scripts/current_diagnostics.py
+@@ -0,0 +1,205 @@
++"""Bounded current-run diagnostics. Never persist raw engine output or metadata."""
++import json
++import os
++import re
++import secrets
++import stat
++import time
++
++import private_profile
++
++NAME = "receiver-diagnostics.json"
++MAX_EVENTS = 64
++MAX_BYTES = 32768
++PHASES = {"starting", "waiting_for_pairing", "authenticated", "unresponsive", "stopped", "error"}
++MARKERS = {
++    "mdns created successfully": "discovery_ready",
++    "Failed to initialize mdns": "discovery_failed",
++    "zeroconf: received addUser": "pairing_request",
++    "pairing complete, credentials stored": "pairing_complete",
++    "logged in as ": "engine_signed_in",
++    "Using PulseAudio": "native_output_selected",
++    "login failed": "login_failed",
++    "session_auth_info_not_found": "session_auth_info_missing",
++    "certificate verify failed": "tls_certificate_failed",
++    "first message received, connection established": "cloud_connected",
++    "became active device": "device_active",
++    "no longer active device": "device_inactive",
++    "Failed to create decompressor": "decoder_failed",
++    "websocket: received error:": "cloud_error",
++    "API key": "api_key_configuration_mentioned",
++    "client-token: Forbidden": "client_token_forbidden",
++    "client-token: unexpected response": "client_token_response_failed",
++    "client-token: unparsable": "client_token_parse_failed",
++    "decryption failed or bad record mac": "tls_record_failed",
++    "No valid session info after login completion": "session_info_missing",
++    "Invalid user credentials": "credentials_rejected",
++    "Forced logout received for session:": "server_logout",
++    "Session creation from stored credentials failed": "stored_session_failed",
++    "Session creation via Connect failed": "connect_session_failed",
++    "Connect session creation failed": "connect_session_failed",
++    "ConnectZeroconfLoginProtocol::login: failed": "zeroconf_login_failed",
++    "client-token: cannot fulfill a request": "client_token_request_failed",
++    "client-token: network request error": "client_token_network_failed",
++    "client-token: non-succesful HTTP status code returned": "client_token_http_failed",
++}
++CODES = set(MARKERS.values()) | {"run_started", "session_started", "discovery_service_started",
++        "integrity_preflight", "integrity_exit", "health_failed", "startup_failed", "run_stopped"}
++CODECS = {"flac", "vorbis", "ogg", "aac", "mp3"}
++FORMATS = {"s16le", "s16be", "s24le", "s24be", "s24-32le", "s24-32be", "s32le", "s32be",
++           "float32le", "float32be", "f32le", "f32be", "s16", "s24", "s32", "float32", "u8"}
++
++
++class DiagnosticError(ValueError):
++    """Only fixed messages; never include untrusted file contents."""
++
++
++def _integer(value, maximum=2**53 - 1):
++    return type(value) is int and 0 <= value <= maximum
++
++
++def validate(value):
++    """Reject unknown fields and values before exposing a private snapshot."""
++    fields = {"schema", "supervisor_pid", "phase", "logged_in", "is_active", "events", "dropped_events", "elapsed_ms"}
++    if type(value) is not dict or set(value) != fields or type(value["schema"]) is not int or value["schema"] != 1:
++        raise DiagnosticError("Current-run diagnostic schema is invalid")
++    if value["phase"] not in PHASES or any(value[key] is not None and type(value[key]) is not bool
++                                         for key in ("logged_in", "is_active")):
++        raise DiagnosticError("Current-run diagnostic state is invalid")
++    if not _integer(value["supervisor_pid"], 2**31 - 1) or value["supervisor_pid"] == 0 \
++            or value["phase"] == "authenticated" and value["logged_in"] is not True:
++        raise DiagnosticError("Current-run diagnostic identity or authentication state is invalid")
++    if not _integer(value["elapsed_ms"]) or not _integer(value["dropped_events"]):
++        raise DiagnosticError("Current-run diagnostic bounds are invalid")
++    events = value["events"]
++    if type(events) is not list or len(events) > MAX_EVENTS:
++        raise DiagnosticError("Current-run diagnostic event bounds are invalid")
++    for event in events:
++        if type(event) is not dict or set(event) not in ({"event", "elapsed_ms"}, {"event", "elapsed_ms", "value"}):
++            raise DiagnosticError("Current-run diagnostic event schema is invalid")
++        if not _integer(event["elapsed_ms"]):
++            raise DiagnosticError("Current-run diagnostic event time is invalid")
++        code = event["event"]
++        if "value" not in event:
++            valid = type(code) is str and code in CODES
++        elif code == "codec":
++            valid = type(event["value"]) is str and event["value"] in CODECS
++        elif code == "sample_format":
++            valid = type(event["value"]) is str and event["value"] in FORMATS
++        elif code == "sample_rate_hz":
++            valid = type(event["value"]) is int and 8000 <= event["value"] <= 768000
++        else:
++            valid = False
++        if not valid:
++            raise DiagnosticError("Current-run diagnostic event value is invalid")
++    return value
++
++
++def _open_state(state, expected=None):
++    previous = expected or private_profile.private_directory(state)
++    descriptor = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++    info = os.fstat(descriptor)
++    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o777 != 0o700 \
++            or (info.st_dev, info.st_ino) != (previous.st_dev, previous.st_ino):
++        os.close(descriptor)
++        raise DiagnosticError("Private diagnostic directory changed")
++    return descriptor
++
++
++def read(state, expected=None):
++    directory = _open_state(state, expected)
++    try:
++        descriptor = os.open(NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
++        with os.fdopen(descriptor, "rb") as stream:
++            info = os.fstat(stream.fileno())
++            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o777 != 0o600:
++                raise DiagnosticError("Current-run diagnostics must be an owner-only regular file")
++            raw = stream.read(MAX_BYTES + 1)
++    finally:
++        os.close(directory)
++    if len(raw) > MAX_BYTES:
++        raise DiagnosticError("Current-run diagnostic file exceeds its limit")
++    try:
++        return validate(json.loads(raw))
++    except (ValueError, TypeError, KeyError) as error:
++        raise DiagnosticError("Current-run diagnostic file is invalid") from error
++
++
++class Session:
++    def __init__(self, state):
++        self.directory = _open_state(state)
++        self.started = time.monotonic()
++        self.value = {"schema": 1, "supervisor_pid": os.getpid(), "phase": "starting", "logged_in": None, "is_active": None,
++                      "events": [], "dropped_events": 0, "elapsed_ms": 0}
++        try:
++            self.record("run_started")  # Atomic replacement resets the previous run.
++        except Exception:
++            self.close()
++            raise
++
++    def close(self):
++        os.close(self.directory)
++
++    def flush(self):
++        self.value["elapsed_ms"] = int((time.monotonic() - self.started) * 1000)
++        raw = (json.dumps(validate(self.value), separators=(",", ":")) + "\n").encode("ascii")
++        if len(raw) > MAX_BYTES:
++            raise DiagnosticError("Current-run diagnostic file exceeds its limit")
++        temporary = ".diagnostics-" + secrets.token_hex(12)
++        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
++                             0o600, dir_fd=self.directory)
++        try:
++            with os.fdopen(descriptor, "wb") as stream:
++                stream.write(raw)
++            os.replace(temporary, NAME, src_dir_fd=self.directory, dst_dir_fd=self.directory)
++        finally:
++            try:
++                os.unlink(temporary, dir_fd=self.directory)
++            except FileNotFoundError:
++                pass
++
++    def record(self, code, value=None):
++        event = {"event": code, "elapsed_ms": int((time.monotonic() - self.started) * 1000)}
++        if value is not None:
++            event["value"] = value
++        self.value["events"].append(event)
++        if len(self.value["events"]) > MAX_EVENTS:
++            self.value["events"].pop(0)
++            self.value["dropped_events"] += 1
++        self.flush()
++
++    def phase(self, phase):
++        self.value["phase"] = phase
++        if phase == "starting":
++            self.value["logged_in"] = self.value["is_active"] = None
++        self.flush()
++
++    def auth(self, event):
++        # Authentication claims come only from the official API's typed state.
++        if type(event.get("logged_in")) is not bool:
++            return
++        self.value["logged_in"] = event["logged_in"]
++        self.value["is_active"] = event.get("is_active") if type(event.get("is_active")) is bool else None
++        self.phase("authenticated" if event["logged_in"] else "waiting_for_pairing")
++
++    def observe_line(self, line):
++        # Called after key redaction. Never retain the original line or suffix.
++        for marker, code in MARKERS.items():
++            if marker in line:
++                self.record(code)
++                if code == "discovery_ready" and self.value["logged_in"] is not True:
++                    self.phase("waiting_for_pairing")
++        if re.search(r"Started ZeroConf service on port \d+ path /", line):
++            self.record("discovery_service_started")
++        for label, code in (("preflight", "integrity_preflight"), ("exit comparison", "integrity_exit")):
++            if re.fullmatch(r"INTEGRITY: executable-byte " + label + r" passed \(\d+ bytes\)", line):
++                self.record(code)
++        match = re.search(r"\bcodec:\s*(flac|vorbis|ogg|aac|mp3)\b", line, re.IGNORECASE)
++        if match:
++            self.record("codec", match[1].lower())
++        match = re.search(r"\bsample rate:\s*(\d{1,6}) Hz\b", line, re.IGNORECASE)
++        if match and 8000 <= int(match[1]) <= 768000:
++            self.record("sample_rate_hz", int(match[1]))
++        match = re.search(r"\bsample format:\s*([a-zA-Z0-9-]{1,32})\b", line, re.IGNORECASE)
++        if match and match[1].lower() in FORMATS:
++            self.record("sample_format", match[1].lower())
+diff --git a/scripts/native_audio.py b/scripts/native_audio.py
+index 7bef76f..5dcb522 100644
+--- a/scripts/native_audio.py
++++ b/scripts/native_audio.py
+@@ -7,7 +7,8 @@ import subprocess
+ import tempfile
+ import time
+ import audio_routing
+-from paths import PULSE, PACTL, PULSE_MODULES
++import private_profile
++from paths import PULSE, PACTL, PULSE_MODULES, DATA, RAW_DATA, STATE, CACHE
+ 
+ 
+ class AudioEnvironment(dict):
+@@ -28,6 +29,15 @@ class AudioEnvironment(dict):
+ 
+ @contextmanager
+ def native_audio(output_uid=""):
++    # Avoid PulseAudio's legacy CoreAudio detector: its empty-list allocation
++    # aborts when macOS returns no audio devices (for example in a restricted
++    # execution context). Enumerate safely first and load explicit outputs.
++    devices = audio_routing.available_outputs()
++    audio_routing.choose_output(devices, output_uid)
++    object_ids = sorted({item["id"] for item in devices})
++    if not object_ids or any(type(value) is not int or not 0 < value <= 0xffffffff for value in object_ids):
++        raise RuntimeError("No valid macOS output device is available")
++    private_profile.initialize(DATA, RAW_DATA, STATE, CACHE)
+     with tempfile.TemporaryDirectory(prefix="soloist-pulse-", dir="/tmp") as directory:
+         root = Path(directory)
+         environment = AudioEnvironment(PATH=os.defpath)
+@@ -41,9 +51,10 @@ def native_audio(output_uid=""):
+                    "--use-pid-file=no", "--exit-idle-time=-1", "--disallow-module-loading=yes",
+                    "--log-target=stderr", "--log-level=error", "--disable-shm=yes",
+                    "--high-priority=no", "--realtime=no",
+-                   "-L", f"module-native-protocol-unix socket={root / 'native'} auth-cookie={root / 'cookie'}",
+-                   "-L", "module-coreaudio-detect record=no playback=yes",
+-                   "-L", "module-suspend-on-idle timeout=2"]
++                   "-L", f"module-native-protocol-unix socket={root / 'native'} auth-cookie={root / 'cookie'}"]
++        for object_id in object_ids:
++            command.extend(["-L", f"module-coreaudio-device object_id={object_id} record=no playback=yes"])
++        command.extend(["-L", "module-suspend-on-idle timeout=2"])
+         with subprocess.Popen(command, env=environment, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL) as audio:
+             environment.process = audio
+diff --git a/scripts/observe.py b/scripts/observe.py
+index 4e93b03..dced299 100644
+--- a/scripts/observe.py
++++ b/scripts/observe.py
+@@ -4,7 +4,7 @@ import asyncio
+ import json
+ import math
+ import time
+-import websockets
++import private_api
+ from client_api import FIELDS
+ from paths import STATE
+ 
+@@ -45,12 +45,7 @@ def safe_event(event):
+ 
+ 
+ async def observe(seconds):
+-    if (STATE / "ws.addr").read_text().strip() != "127.0.0.1":
+-        raise SystemExit("Refusing non-loopback API")
+-    port = int((STATE / "ws.port").read_text().strip())
+-    if not 1 <= port <= 65535:
+-        raise SystemExit("Invalid API port")
+-    async with websockets.connect(f"ws://127.0.0.1:{port}", open_timeout=5,
++    async with private_api.connect(STATE, open_timeout=5,
+                                   close_timeout=2, max_size=1024 * 1024) as ws:
+         for command in ("get_auth_state", "get_state"):
+             await ws.send(json.dumps({"type": "command", "command": command}))
+diff --git a/scripts/paths.py b/scripts/paths.py
+index 79e6df0..b49293c 100644
+--- a/scripts/paths.py
++++ b/scripts/paths.py
+@@ -8,11 +8,11 @@ ROOT = Path(__file__).resolve().parents[1]
+ BUNDLED = bool(getattr(sys, "frozen", False))
+ BUNDLE_CONTENTS = Path(getattr(sys, "_MEIPASS", ROOT)).parent
+ PAYLOAD = BUNDLE_CONTENTS / "Resources/payload"
+-DEFAULT_DATA = Path.home() / "Library/Application Support/Soloist Runtime" if BUNDLED else ROOT
+-DATA = Path(os.environ.get("SOLOIST_RUNTIME_HOME", DEFAULT_DATA)).expanduser()
+-if not DATA.is_absolute():
++DEFAULT_DATA = Path.home() / "Library/Application Support/Spotifast Soloist" if BUNDLED else ROOT / "runtime-home"
++RAW_DATA = Path(os.environ.get("SOLOIST_RUNTIME_HOME", DEFAULT_DATA)).expanduser()
++if not RAW_DATA.is_absolute():
+     raise ValueError("SOLOIST_RUNTIME_HOME must be an absolute directory")
+-DATA = DATA.resolve()
++DATA = RAW_DATA.resolve()
+ STATE = DATA / "state"
+ CACHE = DATA / "cache"
+ VENDOR = ROOT / "vendor/elfuse"
+diff --git a/scripts/private_api.py b/scripts/private_api.py
+new file mode 100644
+index 0000000..1def51c
+--- /dev/null
++++ b/scripts/private_api.py
+@@ -0,0 +1,57 @@
++"""Owner-only Unix transport for the unchanged guest's local WebSocket API.
++
++The Linux syscall layer replaces the explicit loopback bind with this inherited
++socket. No TCP control listener is created. Same-user software and root remain
++inside this trust boundary; browser pages cannot open an AF_UNIX socket.
++"""
++from contextlib import contextmanager
++import os
++from pathlib import Path
++import socket
++import stat
++import tempfile
++import websockets
++
++PORT = 65534  # A guest-visible selector only; the host never binds this port.
++
++
++def endpoint(state):
++    hint = state / "ws.socket"
++    info = hint.lstat()
++    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
++        raise ValueError("Private API discovery must be an owner-only regular file")
++    raw = hint.read_text().strip()
++    path = Path(raw)
++    if not path.is_absolute() or len(os.fsencode(raw)) >= 104 or path.is_symlink():
++        raise ValueError("Invalid private API socket path")
++    node, parent = path.lstat(), path.parent.lstat()
++    if not stat.S_ISSOCK(node.st_mode) or node.st_uid != os.getuid() or node.st_mode & 0o777 != 0o600:
++        raise ValueError("Private API requires an owner-only Unix socket")
++    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or parent.st_mode & 0o777 != 0o700:
++        raise ValueError("Private API requires an owner-only directory")
++    return raw
++
++
++def connect(state, **options):
++    return websockets.unix_connect(endpoint(state), uri="ws://localhost/", **options)
++
++
++@contextmanager
++def listener(state, publish):
++    with tempfile.TemporaryDirectory(prefix="soloist-control-", dir="/private/tmp") as directory:
++        root = Path(directory)
++        root.chmod(0o700)
++        path = root / "api.sock"
++        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
++            control.bind(str(path))
++            path.chmod(0o600)
++            publish(state / "ws.socket", str(path) + "\n")
++            try:
++                yield control
++            finally:
++                # The receiver lock excludes another receiver; do not remove
++                # a replacement discovery file if an external owner changed it.
++                if (state / "ws.socket").exists() and (state / "ws.socket").read_text().strip() == str(path):
++                    (state / "ws.socket").unlink()
++                for name in ("ws.addr", "ws.port"):
++                    (state / name).unlink(missing_ok=True)
+diff --git a/scripts/private_profile.py b/scripts/private_profile.py
+new file mode 100644
+index 0000000..bcf3040
+--- /dev/null
++++ b/scripts/private_profile.py
+@@ -0,0 +1,93 @@
++"""Explicitly enrolled private profile; reset never initializes a directory."""
++import json
++import os
++from pathlib import Path
++import stat
++
++from paths import ROOT
++
++MARKER = ".soloist-runtime-profile.json"
++IDENTITY = "spotifast-soloist-private-profile"
++
++
++class ProfileError(ValueError):
++    """Fixed credential-safe validation messages only."""
++
++
++def private_directory(path):
++    info = path.lstat()
++    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o777 != 0o700:
++        raise ProfileError("Private profile directories must be owned by you with mode 700")
++    if path != path.resolve(strict=True):
++        raise ProfileError("Private profile directories must be canonical and contain no symlinks")
++    return info
++
++
++def root_check(data, raw_data):
++    if not data.is_absolute() or raw_data != data or data != data.resolve():
++        raise ProfileError("Private profile root must be an absolute canonical path without symlinks")
++    home = Path.home().resolve()
++    forbidden = {home / name for name in ("Documents", "Downloads", "Desktop", "Library")}
++    forbidden.update({home / "Library/Application Support", Path("/private/tmp"), ROOT, ROOT.parent})
++    if data == home or data in home.parents or data in forbidden or len(data.parts) < 4:
++        raise ProfileError("Choose a dedicated private runtime profile directory")
++
++
++def validate(data, raw_data, state, cache):
++    root_check(data, raw_data)
++    info = private_directory(data)
++    if state != data / "state" or cache != data / "cache":
++        raise ProfileError("Profile state and cache must be direct children of the private root")
++    directories = {path: private_directory(path) for path in (data, state, cache)}
++    marker = data / MARKER
++    descriptor = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW)
++    with os.fdopen(descriptor, "rb") as stream:
++        entry = os.fstat(stream.fileno())
++        if not stat.S_ISREG(entry.st_mode) or entry.st_uid != os.getuid() or entry.st_mode & 0o777 != 0o600:
++            raise ProfileError("Private profile marker must be an owner-only regular file")
++        raw = stream.read(4097)
++    if len(raw) > 4096:
++        raise ProfileError("Private profile marker is invalid")
++    try:
++        record = json.loads(raw)
++    except (ValueError, UnicodeError) as error:
++        raise ProfileError("Private profile marker is invalid") from error
++    if record != {"identity": IDENTITY, "schema": 1, "uid": os.getuid(),
++                  "root": str(data), "device": info.st_dev, "inode": info.st_ino}:
++        raise ProfileError("Private profile marker does not match this initialized directory")
++    return directories
++
++
++def initialize(data, raw_data, state, cache):
++    """Enroll a fresh dedicated root.
++
++    Custom environment paths do not authorize deletion by themselves. Existing
++    unrelated top-level files prevent enrollment; the marker binds the concrete
++    directory identity and reset only accepts already enrolled profiles.
++    """
++    root_check(data, raw_data)
++    if data.exists():
++        private_directory(data)
++    else:
++        data.mkdir(parents=True, mode=0o700)
++    if (data / MARKER).exists() or (data / MARKER).is_symlink():
++        validate(data, raw_data, state, cache)
++        return
++    if any(path.name not in {"state", "cache", "engine"} for path in data.iterdir()):
++        raise ProfileError("Refusing to initialize a profile containing unrelated files")
++    if state != data / "state" or cache != data / "cache":
++        raise ProfileError("Profile state and cache must be direct children of the private root")
++    for path in (state, cache):
++        if not path.exists():
++            path.mkdir(mode=0o700)
++        private_directory(path)
++    info = data.stat()
++    record = {"identity": IDENTITY, "schema": 1, "uid": os.getuid(),
++              "root": str(data), "device": info.st_dev, "inode": info.st_ino}
++    descriptor = os.open(data / MARKER, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
++    with os.fdopen(descriptor, "w") as stream:
++        json.dump(record, stream)
++        stream.write("\n")
++        stream.flush()
++        os.fsync(stream.fileno())
++    validate(data, raw_data, state, cache)
+diff --git a/scripts/receiver.py b/scripts/receiver.py
+index b8630d4..6ca1f13 100644
+--- a/scripts/receiver.py
++++ b/scripts/receiver.py
+@@ -9,21 +9,27 @@ from pathlib import Path
+ import re
+ import shutil
+ import signal
++import stat
+ import tempfile
+ import threading
+ import time
+ import websockets
+ 
+ import credentials
+-from paths import BUNDLED, STATE, CACHE, RUNTIME, SYSROOT, CERTIFICATES, configured_path
++import current_diagnostics
++import private_api
++import private_profile
++from paths import BUNDLED, DATA, RAW_DATA, STATE, CACHE, RUNTIME, SYSROOT, CERTIFICATES, configured_path
+ from paths import CONFIG
+ from lifecycle import Exit, retry_delay, run_child
+ PUBLIC_ERRORS = set()
+ from native_audio import native_audio
+ 
+ 
+-def report(raw, secret):
++def report(raw, secret, diagnostics=None):
+     line = re.sub(r"\x1b\[[0-9;]*m", "", raw.replace(secret, b"[redacted]").decode(errors="replace"))
++    if diagnostics is not None:
++        diagnostics.observe_line(line)
+     if re.fullmatch(r"INTEGRITY: executable-byte (preflight|exit comparison) passed \(\d+ bytes\)", line):
+         print(line, flush=True)
+     for phrase, label in (
+@@ -101,15 +107,10 @@ def private_text(path, value):
+             os.unlink(temporary)
+ 
+ 
+-async def api_health(state):
++async def api_health(state, diagnostics=None):
+     # Local responsiveness is independent of Internet availability. An offline
+     # account is not a reason to repeatedly restart or steal active playback.
+-    if (state / "ws.addr").read_text().strip() != "127.0.0.1":
+-        return False
+-    port = int((state / "ws.port").read_text().strip())
+-    if not 1 <= port <= 65535:
+-        return False
+-    async with websockets.connect(f"ws://127.0.0.1:{port}", open_timeout=2,
++    async with private_api.connect(state, open_timeout=2,
+                                   close_timeout=1, max_size=1024 * 1024) as ws:
+         async with asyncio.timeout(2):
+             # Discard the automatic connect snapshot. Require a response to a
+@@ -122,10 +123,12 @@ async def api_health(state):
+             while True:
+                 event = json.loads(await ws.recv())
+                 if isinstance(event, dict) and event.get("type") == "auth_state":
++                    if diagnostics is not None:
++                        diagnostics.auth(event)
+                     return True
+ 
+ 
+-def soloist_command(args, state, cache, engine, key_path, pulse_root):
++def soloist_command(args, state, cache, engine, key_path, pulse_root, private_fd=None):
+     command = [str(RUNTIME), "--no-rosetta", "--clear-env", "--timeout", "10",
+                "--sysroot", str(SYSROOT), "--append-arg-file", str(key_path),
+                "--env", "PULSE_SERVER=unix:" + str(pulse_root / "native"),
+@@ -134,14 +137,20 @@ def soloist_command(args, state, cache, engine, key_path, pulse_root):
+                "--", str(engine), "-n", args.device_name, "-D", str(state),
+                "-C", str(cache), "-z", "100", "-i", "5", "-v", "-k"]
+     if args.websocket == "on":
+-        command[-1:-1] = ["-w", "127.0.0.1:0"]
++        if private_fd is None:
++            raise ValueError("An inherited private API socket is required")
++        command[command.index("--"):command.index("--")] = [
++            "--private-tcp-listener", str(private_api.PORT), str(private_fd)]
++        command[-1:-1] = ["-w", "127.0.0.1:" + str(private_api.PORT)]
+     if args.audio_latency_ms:
+         command[command.index("--"):command.index("--")] = [
+             "--env", "PULSE_LATENCY_MSEC=" + str(args.audio_latency_ms)]
+     return command
+ 
+ 
+-def run_session(args, state, cache, engine, key_path, secret, stop, deadline, attempt):
++def run_session(args, state, cache, engine, key_path, secret, stop, deadline, attempt, diagnostics=None):
++    if diagnostics is not None:
++        diagnostics.phase("starting")
+     with contextlib.ExitStack() as stack, native_audio(args.audio_output_uid) as audio_env:
+         inherited = ()
+         if key_path is None:
+@@ -158,7 +167,11 @@ def run_session(args, state, cache, engine, key_path, secret, stop, deadline, at
+         pulse_hint = state / "audio.path"
+         pid_file = state / "receiver.pid"
+         private_text(pulse_hint, str(pulse_root) + "\n")
+-        command = soloist_command(args, state, cache, engine, key_path, pulse_root)
++        control = stack.enter_context(private_api.listener(state, private_text)) if args.websocket == "on" else None
++        if control is not None:
++            inherited += (control.fileno(),)
++        command = soloist_command(args, state, cache, engine, key_path, pulse_root,
++                                  control.fileno() if control is not None else None)
+         environment = {"PATH": os.defpath, "ELFUSE_VERIFY_TEXT": "1", "ELFUSE_FORWARD_TERMINATION": "1"}
+         integrity = {"preflight": False, "exit": False}
+         def consume(raw):
+@@ -166,27 +179,38 @@ def run_session(args, state, cache, engine, key_path, secret, stop, deadline, at
+                 integrity["preflight"] = True
+             if re.fullmatch(rb"INTEGRITY: executable-byte exit comparison passed \(\d+ bytes\)", raw):
+                 integrity["exit"] = True
+-            report(raw, secret)
++            report(raw, secret, diagnostics)
+         child_pid = None
+         def started(pid):
+             nonlocal child_pid
+             child_pid = pid
+             private_text(pid_file, str(pid) + "\n")
++            if diagnostics is not None:
++                diagnostics.record("session_started")
+             print("RECEIVER: started; recovery attempt", attempt, flush=True)
+         def health():
+-            if not audio_env.alive():
+-                return False
+             try:
+-                audio_env.refresh_route()
++                if not audio_env.alive():
++                    raise RuntimeError("Private audio stopped")
++                try:
++                    audio_env.refresh_route()
++                except Exception:
++                    print("AUDIO: output routing check failed; retaining current output", flush=True)
++                return args.websocket == "off" or asyncio.run(api_health(state, diagnostics))
+             except Exception:
+-                print("AUDIO: output routing check failed; retaining current output", flush=True)
+-            return args.websocket == "off" or asyncio.run(api_health(state))
++                if diagnostics is not None:
++                    diagnostics.record("health_failed")
++                    diagnostics.phase("unresponsive")
++                return False
+         try:
+             result = run_child(command, environment, stop, deadline, consume, started=started,
+                                pass_fds=inherited, health=health)
+             summary = dict(exit_code=result.code, reason=result.reason, forced=result.forced,
+                            integrity=integrity, recovery_attempt=attempt)
+             private_text(state / "last-exit.json", json.dumps(summary) + "\n")
++            if diagnostics is not None:
++                diagnostics.record("run_stopped")
++                diagnostics.phase("error" if result.code or result.forced or result.reason == "health" else "stopped")
+             print("LIFECYCLE:", json.dumps(summary), flush=True)
+             return result
+         finally:
+@@ -207,7 +231,7 @@ def main(argv=None):
+     parser.add_argument("--audio-latency-ms", type=int, default=0,
+                         help="PulseAudio buffer target, 20..2000 ms; 0 uses the engine default")
+     parser.add_argument("--websocket", choices=("on", "off"), default="off" if BUNDLED else "on",
+-                        help="Local unauthenticated API; packaged default is off, always loopback-only")
++                        help="Owner-only local Unix WebSocket API; packaged default is off")
+     args = parser.parse_args(argv)
+     if not 1 <= len(args.device_name) <= 64 or any(ord(char) < 32 for char in args.device_name):
+         parser.error("device name must be 1..64 printable characters")
+@@ -220,13 +244,15 @@ def main(argv=None):
+     if args.audio_latency_ms != 0 and not 20 <= args.audio_latency_ms <= 2000:
+         parser.error("audio latency must be 0 or 20..2000 ms")
+     state, cache = STATE, CACHE
+-    for path in (state, cache):
+-        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+-        path.chmod(0o700)
+-    lock = (state / "receiver.lock").open("a")
++    private_profile.initialize(DATA, RAW_DATA, state, cache)
++    descriptor = os.open(state / "receiver.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
++    lock = os.fdopen(descriptor, "a")
++    info = os.fstat(lock.fileno())
++    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o777 != 0o600:
++        raise RuntimeError("Private receiver lock must be an owner-only regular file")
+     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+     if args.websocket == "off":
+-        for name in ("ws.addr", "ws.port"):
++        for name in ("ws.addr", "ws.port", "ws.socket"):
+             (state / name).unlink(missing_ok=True)
+     engine = configured_path("soloist", args.soloist)
+     settings = json.loads(CONFIG.read_text()) if CONFIG.is_file() else {}
+@@ -245,6 +271,7 @@ def main(argv=None):
+         shutil.copyfile("/opt/homebrew/etc/ca-certificates/cert.pem", CERTIFICATES)
+     if not CERTIFICATES.is_file():
+         raise RuntimeError("Missing bundled certificate store")
++    diagnostics = current_diagnostics.Session(state)
+     stop = threading.Event()
+     original_handlers = {number: signal.signal(number, lambda *_: stop.set())
+                          for number in (signal.SIGINT, signal.SIGTERM)}
+@@ -255,8 +282,10 @@ def main(argv=None):
+         attempt = 0
+         while not stop.is_set():
+             try:
+-                result = run_session(args, state, cache, engine, key_path, secret, stop, deadline, attempt)
++                result = run_session(args, state, cache, engine, key_path, secret, stop, deadline, attempt, diagnostics)
+             except (OSError, RuntimeError):
++                diagnostics.record("startup_failed")
++                diagnostics.phase("error")
+                 print("RECOVERY: receiver/audio startup failed; details withheld", flush=True)
+                 result = Exit(1, "startup", False)
+             delay = retry_delay(result, attempt, args.restart_limit, stop.is_set())
+@@ -275,6 +304,7 @@ def main(argv=None):
+             attempt += 1
+         return 0
+     finally:
++        diagnostics.close()
+         for number, handler in original_handlers.items():
+             signal.signal(number, handler)
+ 
+diff --git a/scripts/runtime_cli.py b/scripts/runtime_cli.py
+index 03a7f84..177c7f1 100644
+--- a/scripts/runtime_cli.py
++++ b/scripts/runtime_cli.py
+@@ -9,17 +9,21 @@ from pathlib import Path
+ import platform
+ import re
+ import shutil
++import stat
+ import subprocess
+ import sys
+ import tempfile
++import fcntl
+ 
+ import client_api
+ import audio_routing
+ import credentials
++import current_diagnostics
++import private_profile
+ import receiver
+ from native_audio import native_audio
+ from observe import safe_event
+-from paths import BUNDLED, CONFIG, DATA, ENGINE, PACTL, RUNTIME, STATE, SYSROOT, VERSION
++from paths import BUNDLED, CACHE, CONFIG, DATA, RAW_DATA, ENGINE, PACTL, RUNTIME, STATE, SYSROOT, VERSION
+ 
+ 
+ class ConfigurationError(ValueError):
+@@ -87,10 +91,7 @@ def configure(engine, key=None, keychain=False):
+         secret = raw.strip()
+         if len(raw) > 4097 or not secret or len(secret) > 4096 or b"\0" in secret or b"\n" in secret or b"\r" in secret:
+             raise ConfigurationError("API-key file must contain one nonempty key")
+-    DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
+-    DATA.chmod(0o700)
+-    STATE.mkdir(exist_ok=True, mode=0o700)
+-    STATE.chmod(0o700)
++    private_profile.initialize(DATA, RAW_DATA, STATE, CACHE)
+     ENGINE.parent.mkdir(exist_ok=True, mode=0o700)
+     if ENGINE.parent.is_symlink() or ENGINE.is_symlink():
+         raise ConfigurationError("Private installation location must not be a symlink")
+@@ -153,6 +154,56 @@ def doctor(engine=None, audio=False):
+     return 0 if result["passed"] else 1
+ 
+ 
++def reset_pairing():
++    """Forget local receiver credentials and media cache while it is stopped.
++
++    Keeps the official executable, API-key store and setup preferences. This
++    does not revoke a Spotify cloud session or sign out a frontend's Web API.
++    """
++    expected = private_profile.validate(DATA, RAW_DATA, STATE, CACHE)
++    with contextlib.ExitStack() as stack:
++        root_descriptor = os.open(DATA, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++        stack.callback(os.close, root_descriptor)
++        directories = {DATA: root_descriptor}
++        for path in (STATE, CACHE):
++            descriptor = os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_descriptor)
++            stack.callback(os.close, descriptor)
++            directories[path] = descriptor
++        for path, descriptor in directories.items():
++            info = os.fstat(descriptor)
++            previous = expected[path]
++            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o777 != 0o700 \
++                    or (info.st_dev, info.st_ino) != (previous.st_dev, previous.st_ino):
++                raise ConfigurationError("Private profile directory changed during reset")
++        descriptor = os.open("receiver.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
++                             0o600, dir_fd=directories[STATE])
++        lock = stack.enter_context(os.fdopen(descriptor, "a"))
++        info = os.fstat(lock.fileno())
++        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o777 != 0o600:
++            raise ConfigurationError("Private receiver lock must be an owner-only regular file")
++        try:
++            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        except BlockingIOError as error:
++            raise ConfigurationError("Stop the receiver before resetting its local pairing") from error
++        keep = {"installation.json", "audio-output.uid", "receiver.lock"}
++        private_profile.validate(DATA, RAW_DATA, STATE, CACHE)
++        if not shutil.rmtree.avoids_symlink_attacks:
++            raise ConfigurationError("Safe profile cleanup is unavailable on this platform")
++        for root in (STATE, CACHE):
++            directory = directories[root]
++            for name in os.listdir(directory):
++                if root == STATE and name in keep:
++                    continue
++                entry = os.stat(name, dir_fd=directory, follow_symlinks=False)
++                if stat.S_ISDIR(entry.st_mode):
++                    shutil.rmtree(name, dir_fd=directory)
++                else:
++                    os.unlink(name, dir_fd=directory)
++    print(json.dumps({"local_pairing_reset": True, "local_cache_cleared": True,
++                      "api_key_retained": True, "web_api_signout": False,
++                      "cloud_session_revoked": False}))
++
++
+ def main(argv=None):
+     argv = list(sys.argv[1:] if argv is None else argv)
+     if argv and argv[0] == "run":
+@@ -161,9 +212,11 @@ def main(argv=None):
+     sub = parser.add_subparsers(dest="operation", required=True)
+     sub.add_parser("run", help="Start receiver; run --help shows receiver options")
+     sub.add_parser("describe", help="Machine-readable integration capabilities, no credentials")
+-    sub.add_parser("endpoint", help="Local endpoint for a same-user client; preview has no API authentication")
++    sub.add_parser("endpoint", help="Owner-only Unix WebSocket endpoint for a same-user client")
+     sub.add_parser("status", help="Safe current state, no song/account metadata")
++    sub.add_parser("diagnostics", help="Bounded current-run pairing/codec evidence; no raw logs or metadata")
+     sub.add_parser("installation", help="Show installed build and expected expiry; no account data")
++    sub.add_parser("reset-pairing", help="Stopped receiver only: clear local Connect pairing and media cache")
+     setup = sub.add_parser("configure", help="Copy selected official executable into private app data")
+     setup.add_argument("--soloist", type=Path, required=True)
+     secret_source = setup.add_mutually_exclusive_group(required=True)
+@@ -212,20 +265,27 @@ def main(argv=None):
+             print(json.dumps({key: selected[key] for key in ("uid", "name", "fallback_to_default")}))
+     elif args.operation == "installation":
+         print(json.dumps(installation()))
++    elif args.operation == "reset-pairing":
++        reset_pairing()
+     elif args.operation == "describe":
+         print(json.dumps({"runtime_version": VERSION, "integration_version": 1,
+                           "host_platforms": ["macos-arm64"], "packaged": BUNDLED,
+                           "execution_backend": "elfuse-hvf", "guest_kernel": False,
+                           "soloist_included": False, "configured": CONFIG.is_file(),
+-                          "local_api": "soloist-websocket", "local_api_security": "unauthenticated-loopback-preview",
++                          "local_api": "soloist-websocket-unix", "local_api_security": "owner-only-unix-socket",
+                           "audio_output": "macos-default-or-coreaudio-uid",
+                           "control_commands": sorted(client_api.FIELDS)}))
+     elif args.operation == "endpoint":
+-        print(json.dumps({"integration_version": 1, "url": client_api.endpoint(),
+-                          "security": "unauthenticated-loopback-preview"}))
++        print(json.dumps({"integration_version": 1, "unix_socket": client_api.endpoint(),
++                          "handshake_url": "ws://localhost/", "security": "owner-only-unix-socket"}))
+     elif args.operation == "status":
+-        print(json.dumps(safe_event(asyncio.run(client_api.request("get_auth_state")))))
+-        print(json.dumps(safe_event(asyncio.run(client_api.request("get_state")))))
++        auth = safe_event(asyncio.run(client_api.request("get_auth_state")))
++        print(json.dumps(auth))
++        if auth and auth.get("logged_in") is True:
++            print(json.dumps(safe_event(asyncio.run(client_api.request("get_state")))))
++    elif args.operation == "diagnostics":
++        expected = private_profile.validate(DATA, RAW_DATA, STATE, CACHE)
++        print(json.dumps(current_diagnostics.read(STATE, expected[STATE])))
+     elif args.operation == "control":
+         fields = {key: value for key, value in vars(args).items()
+                   if key not in ("operation", "command") and value is not None}
+@@ -241,7 +301,7 @@ if __name__ == "__main__":
+         raise SystemExit(main())
+     except Exception as error:
+         # Fixed validation messages are safe; arbitrary I/O/server text isn't.
+-        message = str(error) if type(error) in (ConfigurationError, credentials.CredentialError,
+-                                                audio_routing.AudioRoutingError) else "Operation failed; private details withheld"
++        message = str(error) if type(error) in (ConfigurationError, private_profile.ProfileError, credentials.CredentialError,
++                                                audio_routing.AudioRoutingError, current_diagnostics.DiagnosticError) else "Operation failed; private details withheld"
+         print(json.dumps({"error_type": type(error).__name__, "message": message}), file=sys.stderr)
+         raise SystemExit(1)
+diff --git a/scripts/setup.py b/scripts/setup.py
+index 8b1269c..687dbaa 100644
+--- a/scripts/setup.py
++++ b/scripts/setup.py
+@@ -8,7 +8,8 @@ import platform
+ import shutil
+ import subprocess
+ import sys
+-from paths import ROOT, VENDOR, CONFIG
++from paths import ROOT, VENDOR, CONFIG, DATA, RAW_DATA, STATE, CACHE
++import private_profile
+ 
+ UPSTREAM = "https://github.com/sysprog21/elfuse.git"
+ REVISION = "4023647491db64adc43de76284206d8ab81ff6e3"
+@@ -73,7 +74,7 @@ def main():
+         run("git", "-C", str(VENDOR), "apply", "--check", str(patch))
+         run("git", "-C", str(VENDOR), "apply", str(patch))
+         stamp.write_text(fingerprint + "\n")
+-    run("make", "-C", str(VENDOR), "-j6", "elfuse")
++    run("make", "-C", str(VENDOR), "-j1", "elfuse")
+     run(sys.executable, str(ROOT / "scripts/prepare-sysroot.py"), "--audio")
+     if args.build_only:
+         print("Public runtime build ready. Run: python3 scripts/build-package.py")
+@@ -86,8 +87,7 @@ def main():
+         if not key.is_file() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+             parser.error("API-key file must be owned by you and have owner-only permissions")
+         settings["api_key_file"] = str(key)
+-    CONFIG.parent.mkdir(mode=0o700, exist_ok=True)
+-    CONFIG.parent.chmod(0o700)
++    private_profile.initialize(DATA, RAW_DATA, STATE, CACHE)
+     CONFIG.write_text(json.dumps(settings, indent=2) + "\n")
+     CONFIG.chmod(0o600)
+     run(sys.executable, str(ROOT / "scripts/verify-startup.py"))
+diff --git a/scripts/test-audio-routing.py b/scripts/test-audio-routing.py
+index aa6255e..8488c62 100644
+--- a/scripts/test-audio-routing.py
++++ b/scripts/test-audio-routing.py
+@@ -6,7 +6,8 @@ from unittest import TestCase, main
+ from unittest.mock import patch
+ 
+ import audio_routing
+-from native_audio import AudioEnvironment
++from native_audio import AudioEnvironment, native_audio
++import native_audio as native_audio_module
+ 
+ 
+ DEVICES = [
+@@ -16,6 +17,26 @@ DEVICES = [
+ 
+ 
+ class Tests(TestCase):
++    def test_missing_output_fails_before_starting_audio_process(self):
++        with patch.object(audio_routing, "available_outputs", return_value=[]), \
++                patch.object(native_audio_module.subprocess, "Popen") as process:
++            with self.assertRaises(audio_routing.AudioRoutingError):
++                with native_audio():
++                    self.fail("No audio devices must never start an audio server")
++        process.assert_not_called()
++
++    def test_startup_loads_explicit_playback_devices_without_detector(self):
++        with patch.object(audio_routing, "available_outputs", return_value=DEVICES), \
++                patch.object(native_audio_module.private_profile, "initialize"), \
++                patch.object(audio_routing, "save_preference"), \
++                patch.object(native_audio_module.subprocess, "Popen", side_effect=RuntimeError("captured")) as process:
++            with self.assertRaisesRegex(RuntimeError, "captured"):
++                with native_audio():
++                    self.fail("Fixture must not run a real audio server")
++        arguments = process.call_args.args[0]
++        self.assertNotIn("module-coreaudio-detect", " ".join(arguments))
++        self.assertIn("module-coreaudio-device object_id=203 record=no playback=yes", arguments)
++        self.assertIn("module-coreaudio-device object_id=246 record=no playback=yes", arguments)
+     def test_default_is_not_first_detected_device(self):
+         selected, fallback = audio_routing.choose_output(DEVICES, "")
+         self.assertEqual(selected["id"], 203)
+diff --git a/scripts/test-client-api.py b/scripts/test-client-api.py
+index 25237ea..738b666 100644
+--- a/scripts/test-client-api.py
++++ b/scripts/test-client-api.py
+@@ -46,7 +46,7 @@ class Tests(unittest.IsolatedAsyncioTestCase):
+                          {"type": "command_result", "command": "pause"},
+                          {"type": "command_result", "command": "play"}])
+         with patch.object(client_api, "endpoint", return_value="ws://127.0.0.1:1"), \
+-                patch.object(client_api.websockets, "connect", return_value=socket):
++                patch.object(client_api.websockets, "unix_connect", return_value=socket):
+             result = await client_api.request("play")
+         self.assertEqual(result["command"], "play")
+         self.assertEqual(socket.sent, [client_api.command("play")])
+@@ -54,7 +54,7 @@ class Tests(unittest.IsolatedAsyncioTestCase):
+     async def test_mutations_are_not_retried(self):
+         socket = Socket([{"type": "auth_state", "logged_in": True}, OSError("synthetic")])
+         with patch.object(client_api, "endpoint", return_value="ws://127.0.0.1:1"), \
+-                patch.object(client_api.websockets, "connect", return_value=socket) as connect:
++                patch.object(client_api.websockets, "unix_connect", return_value=socket) as connect:
+             with self.assertRaises(OSError):
+                 await client_api.request("skip_next")
+             self.assertEqual(connect.call_count, 1)
+diff --git a/scripts/test-current-diagnostics.py b/scripts/test-current-diagnostics.py
+new file mode 100644
+index 0000000..3c025a7
+--- /dev/null
++++ b/scripts/test-current-diagnostics.py
+@@ -0,0 +1,114 @@
++"""Synthetic current-run retention/privacy fixtures. No account, clipboard or audio use."""
++import contextlib
++import io
++import json
++from pathlib import Path
++import tempfile
++import unittest
++from unittest.mock import AsyncMock, patch
++
++import current_diagnostics as diagnostics
++import private_profile
++import receiver
++import runtime_cli
++
++
++class Tests(unittest.TestCase):
++    def setUp(self):
++        temporary = tempfile.TemporaryDirectory(prefix="soloist-diagnostics-test-", dir="/private/tmp")
++        self.addCleanup(temporary.cleanup)
++        self.root = Path(temporary.name).resolve() / "profile"
++        self.state, self.cache = self.root / "state", self.root / "cache"
++        private_profile.initialize(self.root, self.root, self.state, self.cache)
++        self.session = diagnostics.Session(self.state)
++        self.addCleanup(self.session.close)
++
++    def test_persists_only_allowlisted_pairing_and_audio_evidence(self):
++        with contextlib.redirect_stdout(io.StringIO()):
++            for line in (b"private song / user / token: synthetic-secret",
++                         b"zeroconf: received addUser account=sensitive-account",
++                         b"pairing complete, credentials stored sensitive-session",
++                         b"logged in as sensitive-account",
++                         b"codec: flac private-song",
++                         b"sample rate: 44100 Hz private-device",
++                         b"sample format: S24LE private-device",
++                         b"sample format: synthetic-secret",
++                         b"sample rate: 999999 Hz",
++                         b"client-token: network request error: synthetic-secret, value: 42"):
++                receiver.report(line, b"synthetic-secret", self.session)
++        value = diagnostics.read(self.state)
++        raw = json.dumps(value)
++        for private in ("synthetic", "sensitive", "private-song", "private-device", "value: 42"):
++            self.assertNotIn(private, raw)
++        self.assertTrue(any(item["event"] == "codec" and item["value"] == "flac" for item in value["events"]))
++        self.assertEqual([item["value"] for item in value["events"] if "value" in item], ["flac", 44100, "s24le"])
++        self.assertIsNone(value["logged_in"])
++        self.assertNotEqual(value["phase"], "authenticated")  # A log phrase is insufficient.
++        self.assertEqual((self.state / diagnostics.NAME).stat().st_mode & 0o777, 0o600)
++
++    def test_bounded_tail_and_new_run_resets_previous_evidence(self):
++        for _ in range(diagnostics.MAX_EVENTS + 20):
++            self.session.record("pairing_request")
++        value = diagnostics.read(self.state)
++        self.assertEqual(len(value["events"]), diagnostics.MAX_EVENTS)
++        self.assertEqual(value["dropped_events"], 21)
++        self.assertLess((self.state / diagnostics.NAME).stat().st_size, diagnostics.MAX_BYTES)
++        replacement = diagnostics.Session(self.state)
++        replacement.close()
++        self.assertEqual([item["event"] for item in diagnostics.read(self.state)["events"]], ["run_started"])
++        self.assertEqual(sorted(path.name for path in self.state.iterdir()), [diagnostics.NAME])
++
++    def test_authentication_uses_typed_booleans_only(self):
++        self.session.auth({"logged_in": "true", "is_active": True, "account": "synthetic-account"})
++        self.assertIsNone(diagnostics.read(self.state)["logged_in"])
++        self.session.auth({"logged_in": True, "is_active": True, "account": "synthetic-account"})
++        value = diagnostics.read(self.state)
++        self.assertEqual(value["phase"], "authenticated")
++        self.assertTrue(value["is_active"])
++        self.assertNotIn("synthetic-account", json.dumps(value))
++        self.session.auth({"logged_in": False, "is_active": False})
++        self.assertEqual(diagnostics.read(self.state)["phase"], "waiting_for_pairing")
++
++    def test_read_refuses_links_public_files_and_untrusted_fields(self):
++        path = self.state / diagnostics.NAME
++        outside = self.root.parent / "keep"
++        outside.write_text("synthetic-private-data")
++        path.unlink()
++        path.symlink_to(outside)
++        with self.assertRaises(OSError):
++            diagnostics.read(self.state)
++        self.session.record("pairing_request")  # Replace the link; never follow/write it.
++        self.assertEqual(outside.read_text(), "synthetic-private-data")
++        path.chmod(0o644)
++        with self.assertRaises(diagnostics.DiagnosticError):
++            diagnostics.read(self.state)
++        path.chmod(0o600)
++        value = diagnostics.read(self.state)
++        for invalid in ({**value, "account": "synthetic-private-data"},
++                        {**value, "events": [{"event": "codec", "value": "synthetic-secret", "elapsed_ms": 0}]},
++                        {**value, "phase": "synthetic-private-data"},
++                        {**value, "phase": "authenticated", "logged_in": False},
++                        {**value, "events": [{"event": "pairing_request", "elapsed_ms": 0, "extra": "secret"}]}):
++            path.write_text(json.dumps(invalid))
++            with self.assertRaises(diagnostics.DiagnosticError) as error:
++                diagnostics.read(self.state)
++            self.assertNotIn("synthetic", str(error.exception))
++        path.write_bytes(b"x" * (diagnostics.MAX_BYTES + 1))
++        with self.assertRaises(diagnostics.DiagnosticError):
++            diagnostics.read(self.state)
++
++    def test_safe_cli_reads_only_validated_snapshot_and_logged_out_status_returns_promptly(self):
++        with patch.multiple(runtime_cli, DATA=self.root, RAW_DATA=self.root, STATE=self.state, CACHE=self.cache), \
++                contextlib.redirect_stdout(io.StringIO()) as output:
++            self.assertEqual(runtime_cli.main(["diagnostics"]), 0)
++        self.assertEqual(json.loads(output.getvalue())["phase"], "starting")
++        with patch.object(runtime_cli.client_api, "request", new_callable=AsyncMock,
++                          return_value={"type": "auth_state", "logged_in": False, "is_active": False}) as request, \
++                contextlib.redirect_stdout(io.StringIO()) as output:
++            self.assertEqual(runtime_cli.main(["status"]), 0)
++        request.assert_awaited_once_with("get_auth_state")
++        self.assertFalse(json.loads(output.getvalue())["logged_in"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/scripts/test-launcher-menu.sh b/scripts/test-launcher-menu.sh
+new file mode 100755
+index 0000000..45203c7
+--- /dev/null
++++ b/scripts/test-launcher-menu.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++set -euo pipefail
++runtime_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++mkdir -p "$runtime_root/build"
++xcrun clang -fobjc-arc -Wall -Wextra -Werror -arch arm64 \
++  -mmacosx-version-min=27.0 -framework AppKit -framework ServiceManagement \
++  "$runtime_root/probes/launcher-menu-test.m" -o "$runtime_root/build/launcher-menu-test"
++"$runtime_root/build/launcher-menu-test"
+diff --git a/scripts/test-package.py b/scripts/test-package.py
+index 75a7e6f..6dd49ec 100644
+--- a/scripts/test-package.py
++++ b/scripts/test-package.py
+@@ -13,6 +13,8 @@ from unittest.mock import patch
+ 
+ import runtime_cli
+ import credentials
++import fcntl
++import private_profile
+ 
+ 
+ class Tests(unittest.TestCase):
+@@ -36,7 +38,7 @@ class Tests(unittest.TestCase):
+         installed = profile / "engine/soloist"
+         metadata = {"soloist_version": "1.2.3", "build_at": "2026-09-01T00:00:00Z",
+                     "expected_expiry_at": "2026-11-30T00:00:00Z"}
+-        with patch.multiple(runtime_cli, DATA=profile, STATE=state, CONFIG=config, ENGINE=installed), \
++        with patch.multiple(runtime_cli, DATA=profile, RAW_DATA=profile, STATE=state, CACHE=profile / "cache", CONFIG=config, ENGINE=installed), \
+                 patch.object(runtime_cli, "engine_metadata", return_value=metadata):
+             with contextlib.redirect_stdout(io.StringIO()) as output:
+                 runtime_cli.configure(self.engine, self.key)
+@@ -55,10 +57,11 @@ class Tests(unittest.TestCase):
+     def test_failed_inspection_does_not_replace_installed_build(self):
+         profile = self.root / "profile"
+         installed = profile / "engine/soloist"
+-        installed.parent.mkdir(parents=True)
++        profile.mkdir(mode=0o700)
++        installed.parent.mkdir(mode=0o700)
+         installed.write_bytes(b"previous")
+         config = profile / "state/installation.json"
+-        with patch.multiple(runtime_cli, DATA=profile, STATE=config.parent, CONFIG=config, ENGINE=installed), \
++        with patch.multiple(runtime_cli, DATA=profile, RAW_DATA=profile, STATE=config.parent, CACHE=profile / "cache", CONFIG=config, ENGINE=installed), \
+                 patch.object(runtime_cli, "engine_metadata", side_effect=runtime_cli.ConfigurationError("Version check failed")):
+             with self.assertRaises(runtime_cli.ConfigurationError):
+                 runtime_cli.configure(self.engine, self.key)
+@@ -72,7 +75,7 @@ class Tests(unittest.TestCase):
+         config = profile / "state/installation.json"
+         metadata = {"soloist_version": "1.2.3", "build_at": "2026-09-01T00:00:00Z",
+                     "expected_expiry_at": "2026-11-30T00:00:00Z"}
+-        with patch.multiple(runtime_cli, DATA=profile, STATE=config.parent, CONFIG=config, ENGINE=installed), \
++        with patch.multiple(runtime_cli, DATA=profile, RAW_DATA=profile, STATE=config.parent, CACHE=profile / "cache", CONFIG=config, ENGINE=installed), \
+                 patch.object(runtime_cli, "engine_metadata", return_value=metadata), \
+                 patch.object(credentials, "load", return_value="synthetic-test-key"):
+             with contextlib.redirect_stdout(io.StringIO()) as output:
+@@ -148,6 +151,100 @@ class Tests(unittest.TestCase):
+         self.assertNotEqual(result.returncode, 0)
+         self.assertIn("must be an absolute directory", result.stderr)
+ 
++    def test_reset_pairing_preserves_setup_and_clears_only_profile(self):
++        profile = self.root / "profile"
++        state, cache = profile / "state", profile / "cache"
++        private_profile.initialize(profile, profile, state, cache)
++        (state / "installation.json").write_text('{"credential_store":"keyring"}')
++        (state / "audio-output.uid").write_text("fixture-device")
++        (state / "receiver-credentials").write_text("synthetic-session")
++        (cache / "synthetic-payload").write_bytes(b"fixture")
++        outside = self.root / "outside"
++        outside.mkdir()
++        (outside / "keep").write_text("unrelated")
++        (cache / "linked-directory").symlink_to(outside)
++        with patch.multiple(runtime_cli, DATA=profile, RAW_DATA=profile, STATE=state, CACHE=cache), contextlib.redirect_stdout(io.StringIO()) as output:
++            runtime_cli.reset_pairing()
++        self.assertEqual(sorted(p.name for p in state.iterdir()), ["audio-output.uid", "installation.json", "receiver.lock"])
++        self.assertEqual(list(cache.iterdir()), [])
++        self.assertEqual((outside / "keep").read_text(), "unrelated")
++        self.assertFalse(json.loads(output.getvalue())["web_api_signout"])
++
++    def test_pairing_reset_refuses_a_running_receiver(self):
++        profile = self.root / "profile"
++        state, cache = profile / "state", profile / "cache"
++        private_profile.initialize(profile, profile, state, cache)
++        credential = state / "receiver-credentials"
++        credential.write_text("synthetic-session")
++        with (state / "receiver.lock").open("a") as lock:
++            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            with patch.multiple(runtime_cli, DATA=profile, RAW_DATA=profile, STATE=state, CACHE=cache):
++                with self.assertRaises(runtime_cli.ConfigurationError):
++                    runtime_cli.reset_pairing()
++        self.assertEqual(credential.read_text(), "synthetic-session")
++
++    def test_reset_never_enrolls_an_arbitrary_existing_directory(self):
++        profile = self.root / "uninitialized"
++        state, cache = profile / "state", profile / "cache"
++        state.mkdir(parents=True, mode=0o700)
++        cache.mkdir(mode=0o700)
++        unrelated = state / "keep"
++        unrelated.write_text("unrelated")
++        with patch.multiple(runtime_cli, DATA=profile, RAW_DATA=profile, STATE=state, CACHE=cache):
++            with self.assertRaises((private_profile.ProfileError, FileNotFoundError)):
++                runtime_cli.reset_pairing()
++        self.assertEqual(unrelated.read_text(), "unrelated")
++        self.assertFalse((profile / private_profile.MARKER).exists())
++
++    def test_profile_initialization_rejects_unrelated_files_and_symlinks(self):
++        profile = self.root / "profile"
++        profile.mkdir(mode=0o700)
++        (profile / "keep").write_text("unrelated")
++        with self.assertRaises(private_profile.ProfileError):
++            private_profile.initialize(profile, profile, profile / "state", profile / "cache")
++        linked = self.root / "linked-profile"
++        linked.symlink_to(profile)
++        with self.assertRaises(private_profile.ProfileError):
++            private_profile.initialize(profile, linked, profile / "state", profile / "cache")
++
++    def test_reset_rejects_changed_marker_or_public_cache_before_deletion(self):
++        profile = self.root / "profile"
++        state, cache = profile / "state", profile / "cache"
++        private_profile.initialize(profile, profile, state, cache)
++        keep = state / "keep"
++        keep.write_text("unrelated")
++        with patch.multiple(runtime_cli, DATA=profile, RAW_DATA=profile, STATE=state, CACHE=cache):
++            cache.chmod(0o755)
++            with self.assertRaises(private_profile.ProfileError):
++                runtime_cli.reset_pairing()
++            cache.chmod(0o700)
++            marker = profile / private_profile.MARKER
++            record = json.loads(marker.read_text())
++            record["inode"] += 1
++            marker.write_text(json.dumps(record))
++            with self.assertRaises(private_profile.ProfileError):
++                runtime_cli.reset_pairing()
++        self.assertEqual(keep.read_text(), "unrelated")
++
++    def test_reset_rejects_symlinked_state_and_lock(self):
++        profile = self.root / "profile"
++        state, cache = profile / "state", profile / "cache"
++        private_profile.initialize(profile, profile, state, cache)
++        outside = self.root / "outside"
++        outside.mkdir(mode=0o700)
++        (outside / "keep").write_text("unrelated")
++        with patch.multiple(runtime_cli, DATA=profile, RAW_DATA=profile, STATE=state, CACHE=cache):
++            state.rmdir()
++            state.symlink_to(outside)
++            with self.assertRaises(private_profile.ProfileError):
++                runtime_cli.reset_pairing()
++            state.unlink()
++            state.mkdir(mode=0o700)
++            (state / "receiver.lock").symlink_to(outside / "keep")
++            with self.assertRaises(OSError):
++                runtime_cli.reset_pairing()
++        self.assertEqual((outside / "keep").read_text(), "unrelated")
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/scripts/test-playback-cycles.py b/scripts/test-playback-cycles.py
+index 903bc64..c23c700 100644
+--- a/scripts/test-playback-cycles.py
++++ b/scripts/test-playback-cycles.py
+@@ -35,14 +35,14 @@ class Tests(unittest.IsolatedAsyncioTestCase):
+         socket = Socket([{"type": "auth_state"},
+                          {"type": "command_result", "command": "play"}])
+         with patch.object(cycles, "endpoint", return_value="ws://127.0.0.1:12345"), \
+-                patch.object(cycles.websockets, "connect", return_value=socket):
++                patch.object(cycles.private_api, "connect", return_value=socket):
+             self.assertIsNone(await cycles.request("play"))
+         self.assertEqual(socket.sent, [{"type": "command", "command": "play"}])
+ 
+     async def test_error_detail_is_not_exposed(self):
+         socket = Socket([{"type": "error", "message": "private synthetic detail"}])
+         with patch.object(cycles, "endpoint", return_value="ws://127.0.0.1:12345"), \
+-                patch.object(cycles.websockets, "connect", return_value=socket):
++                patch.object(cycles.private_api, "connect", return_value=socket):
+             with self.assertRaisesRegex(RuntimeError, "^Server error; detail withheld$"):
+                 await cycles.request("play")
+ 
+@@ -73,7 +73,7 @@ class Tests(unittest.IsolatedAsyncioTestCase):
+             state = Path(directory)
+             (state / "ws.addr").write_text("0.0.0.0")
+             with patch.object(cycles, "STATE", state):
+-                with self.assertRaises(ValueError):
++                with self.assertRaises((ValueError, FileNotFoundError)):
+                     cycles.endpoint()
+ 
+ 
+diff --git a/scripts/test-private-api.py b/scripts/test-private-api.py
+new file mode 100644
+index 0000000..00257b6
+--- /dev/null
++++ b/scripts/test-private-api.py
+@@ -0,0 +1,73 @@
++"""Account-free Unix transport, permissions and Linux ABI integration checks."""
++import os
++from pathlib import Path
++import selectors
++import socket
++import subprocess
++import tempfile
++import unittest
++import private_api
++from receiver import private_text
++from paths import ROOT, RUNTIME
++
++
++class Tests(unittest.TestCase):
++    def test_permission_validation_and_cleanup(self):
++        with tempfile.TemporaryDirectory() as directory:
++            state = Path(directory)
++            with private_api.listener(state, private_text) as control:
++                path = Path(private_api.endpoint(state))
++                self.assertLess(len(os.fsencode(path)), 104)
++                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
++                self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
++                path.chmod(0o666)
++                with self.assertRaises(ValueError):
++                    private_api.endpoint(state)
++                path.chmod(0o600)
++                path.parent.chmod(0o755)
++                with self.assertRaises(ValueError):
++                    private_api.endpoint(state)
++                path.parent.chmod(0o700)
++                (state / "ws.socket").chmod(0o644)
++                with self.assertRaises(ValueError):
++                    private_api.endpoint(state)
++                self.assertGreater(control.fileno(), 2)
++            self.assertFalse(path.exists())
++            self.assertFalse((state / "ws.socket").exists())
++
++    def test_no_tcp_fallback_and_guest_socket_abi(self):
++        # Avoid claiming a no-listener result if another service already uses
++        # the selected port. It is never reserved by our compatibility runtime.
++        with socket.socket() as probe:
++            self.assertNotEqual(probe.connect_ex(("127.0.0.1", private_api.PORT)), 0)
++        linker = Path(subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()) / "lib/rustlib/aarch64-apple-darwin/bin/gcc-ld/ld.lld"
++        obj, elf = ROOT / "build/private-listener.o", ROOT / "build/private-listener.elf"
++        subprocess.run(["xcrun", "clang", "--target=aarch64-linux-gnu", "-O1", "-ffreestanding", "-fno-stack-protector", "-Wall", "-Wextra", "-Werror", "-c", str(ROOT / "probes/private-listener.c"), "-o", str(obj)], check=True)
++        subprocess.run([str(linker), "-e", "_start", "-z", "max-page-size=65536", str(obj), "-o", str(elf)], check=True)
++        with tempfile.TemporaryDirectory() as directory:
++            state = Path(directory)
++            with private_api.listener(state, private_text) as control:
++                command = [str(RUNTIME), "--no-rosetta", "--clear-env", "--private-tcp-listener", str(private_api.PORT), str(control.fileno()), "--", str(elf)]
++                process = subprocess.Popen(command, pass_fds=(control.fileno(),), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++                try:
++                    with selectors.DefaultSelector() as selector:
++                        selector.register(process.stdout, selectors.EVENT_READ)
++                        self.assertTrue(selector.select(15), "guest fixture failed to become ready")
++                    self.assertEqual(process.stdout.readline(), b"private-listener-ready\n")
++                    with socket.socket() as tcp:
++                        self.assertNotEqual(tcp.connect_ex(("127.0.0.1", private_api.PORT)), 0)
++                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as unix:
++                        unix.settimeout(5)
++                        unix.connect(private_api.endpoint(state))
++                        unix.sendall(b"x")
++                        self.assertEqual(unix.recv(1), b"x")
++                    stdout, stderr = process.communicate(timeout=10)
++                    self.assertEqual(process.returncode, 0, "fixture failed; no private data involved: " + stderr.decode(errors="replace"))
++                finally:
++                    if process.poll() is None:
++                        process.kill()
++                        process.communicate()
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/scripts/test-receiver.py b/scripts/test-receiver.py
+index 78f8da0..fab37d4 100644
+--- a/scripts/test-receiver.py
++++ b/scripts/test-receiver.py
+@@ -8,6 +8,8 @@ import tempfile
+ import unittest
+ import websockets
+ import receiver
++import private_api
++import current_diagnostics
+ 
+ 
+ class Tests(unittest.IsolatedAsyncioTestCase):
+@@ -19,18 +21,23 @@ class Tests(unittest.IsolatedAsyncioTestCase):
+             await ws.send(json.dumps({"type": "auth_state", "logged_in": False}))
+             await ws.wait_closed()
+         with tempfile.TemporaryDirectory(prefix="soloist-health-test-") as directory:
+-            state = Path(directory)
+-            async with websockets.serve(serve, "127.0.0.1", 0) as server:
+-                (state / "ws.addr").write_text("127.0.0.1")
+-                (state / "ws.port").write_text(str(server.sockets[0].getsockname()[1]))
+-                self.assertTrue(await receiver.api_health(state))
++            state = Path(directory).resolve()
++            with contextlib.closing(current_diagnostics.Session(state)) as diagnostics:
++                with private_api.listener(state, receiver.private_text) as control:
++                    async with websockets.unix_serve(serve, sock=control):
++                        self.assertTrue(await receiver.api_health(state, diagnostics))
++                snapshot = current_diagnostics.read(state)
++                self.assertFalse(snapshot["logged_in"])
++                self.assertEqual(snapshot["phase"], "waiting_for_pairing")
+         self.assertEqual(received, [{"type": "command", "command": "get_auth_state"}])
+ 
+     async def test_non_loopback_rejected(self):
+         with tempfile.TemporaryDirectory(prefix="soloist-health-test-") as directory:
+             state = Path(directory)
+-            (state / "ws.addr").write_text("0.0.0.0")
+-            self.assertFalse(await receiver.api_health(state))
++            (state / "ws.addr").write_text("127.0.0.1")
++            (state / "ws.port").write_text("12345")
++            with self.assertRaises(FileNotFoundError):
++                await receiver.api_health(state)
+ 
+     def test_arbitrary_integrity_line_is_withheld(self):
+         output = io.StringIO()
+@@ -56,8 +63,11 @@ class Tests(unittest.IsolatedAsyncioTestCase):
+         self.assertEqual(connect_only[-1], "-k")
+         self.assertIn("PULSE_LATENCY_MSEC=100", connect_only)
+         args.websocket = "on"
+-        enabled = receiver.soloist_command(args, *fields)
+-        self.assertEqual(enabled[enabled.index("-w") + 1], "127.0.0.1:0")
++        with self.assertRaises(ValueError):
++            receiver.soloist_command(args, *fields)
++        enabled = receiver.soloist_command(args, *fields, private_fd=9)
++        self.assertEqual(enabled[enabled.index("-w") + 1], "127.0.0.1:65534")
++        self.assertEqual(enabled[enabled.index("--private-tcp-listener") + 1:][:2], ["65534", "9"])
+         self.assertEqual(enabled[-1], "-k")
+ 
+ 
+diff --git a/scripts/test.sh b/scripts/test.sh
+index 1bcef7a..09cf081 100644
+--- a/scripts/test.sh
++++ b/scripts/test.sh
+@@ -12,6 +12,8 @@ python3 "$runtime_root/scripts/test-pi-mutex.py"
+ python3 "$runtime_root/scripts/test-host-termination.py"
+ python3 "$runtime_root/scripts/test-lifecycle.py"
+ python3 "$runtime_root/scripts/test-receiver.py"
++python3 "$runtime_root/scripts/test-current-diagnostics.py"
++python3 "$runtime_root/scripts/test-private-api.py"
+ python3 "$runtime_root/scripts/test-audio-routing.py"
+ python3 "$runtime_root/scripts/test-client-api.py"
+ python3 "$runtime_root/scripts/test-playback-cycles.py"
+diff --git a/scripts/verify-control-latency.py b/scripts/verify-control-latency.py
+index 2ea7044..974276c 100644
+--- a/scripts/verify-control-latency.py
++++ b/scripts/verify-control-latency.py
+@@ -8,17 +8,12 @@ import os
+ from pathlib import Path
+ import subprocess
+ import time
+-import websockets
++import private_api
+ from observe import STATE
+ 
+ 
+ async def api(command, wanted):
+-    if (STATE / "ws.addr").read_text().strip() != "127.0.0.1":
+-        raise ValueError("Non-loopback endpoint")
+-    port = int((STATE / "ws.port").read_text().strip())
+-    if not 1 <= port <= 65535:
+-        raise ValueError("Invalid port")
+-    async with websockets.connect(f"ws://127.0.0.1:{port}", open_timeout=3,
++    async with private_api.connect(STATE, open_timeout=3,
+                                   close_timeout=1, max_size=1024 * 1024) as ws:
+         await ws.send(json.dumps(dict(type="command", **command)))
+         while True:
+diff --git a/scripts/verify-package.py b/scripts/verify-package.py
+index 03502d2..4a59cf3 100644
+--- a/scripts/verify-package.py
++++ b/scripts/verify-package.py
+@@ -35,7 +35,9 @@ def audit(app, engine=None, key=None):
+             raise ValueError("Private input exclusion check failed; details withheld")
+         if path.is_relative_to(helper) and "_CodeSignature" not in path.parts:
+             hashes[str(path.relative_to(helper))] = digest
+-        if path.name in ("installation.json", "last-exit.json", "ws.port", "ws.addr", "soloist"):
++        if path.name in ("installation.json", "last-exit.json", "ws.port", "ws.addr", "ws.socket", "soloist",
++                         "receiver-diagnostics.json", "receiver.pid", "receiver.lock", "audio.path",
++                         "audio-output.uid", ".soloist-runtime-profile.json"):
+             raise ValueError("Unexpected installation or engine payload")
+         if data[:4] in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
+             native_count += 1
+diff --git a/scripts/verify-playback-cycles.py b/scripts/verify-playback-cycles.py
+index 337d7ee..5d37f37 100644
+--- a/scripts/verify-playback-cycles.py
++++ b/scripts/verify-playback-cycles.py
+@@ -3,22 +3,17 @@ import argparse
+ import asyncio
+ import json
+ import time
+-import websockets
++import private_api
+ from observe import STATE
+ from paths import ROOT
+ 
+ 
+ def endpoint():
+-    if (STATE / "ws.addr").read_text().strip() != "127.0.0.1":
+-        raise ValueError("Non-loopback endpoint")
+-    port = int((STATE / "ws.port").read_text().strip())
+-    if not 1 <= port <= 65535:
+-        raise ValueError("Invalid port")
+-    return f"ws://127.0.0.1:{port}"
++    return private_api.endpoint(STATE)
+ 
+ 
+ async def exchange(command):
+-    async with websockets.connect(endpoint(), open_timeout=3, close_timeout=1,
++    async with private_api.connect(STATE, open_timeout=3, close_timeout=1,
+                                   max_size=1024 * 1024) as ws:
+         await ws.send(json.dumps({"type": "command", "command": command}))
+         while True:
+diff --git a/scripts/verify-stability.py b/scripts/verify-stability.py
+index 336390a..998190f 100644
+--- a/scripts/verify-stability.py
++++ b/scripts/verify-stability.py
+@@ -7,7 +7,7 @@ from pathlib import Path
+ import subprocess
+ import re
+ import time
+-import websockets
++import private_api
+ from observe import STATE, safe_event
+ 
+ 
+@@ -44,13 +44,8 @@ def audio_state():
+ 
+ 
+ async def sample():
+-    if (STATE / "ws.addr").read_text().strip() != "127.0.0.1":
+-        raise ValueError("Non-loopback endpoint")
+-    port = int((STATE / "ws.port").read_text().strip())
+-    if not 1 <= port <= 65535:
+-        raise ValueError("Invalid port")
+     start = time.monotonic()
+-    async with websockets.connect(f"ws://127.0.0.1:{port}", open_timeout=3,
++    async with private_api.connect(STATE, open_timeout=3,
+                                   close_timeout=1, max_size=1024 * 1024) as ws:
+         await ws.send(json.dumps({"type": "command", "command": "get_auth_state"}))
+         await ws.send(json.dumps({"type": "command", "command": "get_state"}))

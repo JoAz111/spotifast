@@ -2088,6 +2088,7 @@ mod tests {
     #[test]
     fn the_home_podcast_shelf_shows_saved_podcasts_only() {
         let (ctx, mut app) = accessible_app("home-podcasts");
+        app.settings.music_only = false;
         let view = crate::ui::home::show;
         view_frame(&ctx, &mut app, vec![], view);
         let painted = view_frame(&ctx, &mut app, vec![], view);
@@ -2120,6 +2121,7 @@ mod tests {
     #[test]
     fn a_home_podcast_card_resumes_from_the_place_it_shows() {
         let (ctx, mut app) = accessible_app("home-podcast-resume");
+        app.settings.music_only = false;
         let card = app.home.podcasts[0].1[0].clone();
         assert_eq!(card.resume_ms(), Some(1_200_000));
         let mut stale = card.clone();
@@ -2208,6 +2210,7 @@ mod tests {
     #[test]
     fn the_podcasts_shelf_leaves_out_audiobooks() {
         let (ctx, mut app) = accessible_app("library-podcasts-audiobooks");
+        app.settings.music_only = false;
         let view = crate::ui::sidebar::show;
         view_frame(&ctx, &mut app, vec![], view);
         let painted = view_frame(&ctx, &mut app, vec![], view);
@@ -2659,6 +2662,7 @@ mod tests {
             (LibraryShelf::Podcasts, "Podcasts", Page::Podcasts),
         ] {
             let (ctx, mut app) = accessible_app(&format!("library-sort-paging-{shelf:?}"));
+            app.settings.music_only = false;
             let view = crate::ui::sidebar::show;
             app.settings.library_sort.insert(shelf, LibrarySort::Name);
             app.library.albums.next_offset = Some(50);
@@ -5122,6 +5126,7 @@ mod tests {
     fn search_top_result_opens_the_menu_for_its_item() {
         for kind in ["track", "artist", "album", "playlist", "show"] {
             let (ctx, mut app) = accessible_app(&format!("top-result-{kind}"));
+            app.settings.music_only = false;
             let (results, title, uri) = match kind {
                 "track" => {
                     let item = track(0);
@@ -5438,6 +5443,7 @@ mod tests {
             for selected in [SearchFilter::All, filter] {
                 let (ctx, mut app) =
                     accessible_app(&format!("search-card-{selected:?}-{filter:?}"));
+                app.settings.music_only = false;
                 app.saved.clear();
                 app.search.filter = selected;
                 // Keep matching artist subtitles in song rows out of the card lookup.

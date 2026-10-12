@@ -308,10 +308,10 @@ pub enum EngineEvent {
 pub type Notify = Arc<dyn Fn(EngineEvent) + Send + Sync>;
 
 pub struct Engine {
-    player: Arc<Player>,
-    spirc: Arc<Spirc>,
+    player: Option<Arc<Player>>,
+    spirc: Option<Arc<Spirc>>,
     session: Session,
-    mixer: Arc<dyn Mixer>,
+    mixer: Option<Arc<dyn Mixer>>,
     device_id: String,
     state: Arc<Mutex<LocalState>>,
     /// What was playing when the session ended on its own.
@@ -323,6 +323,54 @@ pub struct Engine {
 impl Engine {
     pub(crate) fn credentials(&self) -> Option<Credentials> {
         self.session.cache().and_then(|cache| cache.credentials())
+    }
+
+    /// Keep Spotify metadata access without registering another playback
+    /// receiver or constructing any audio player or output device.
+    pub async fn connect_metadata(
+        config: &EngineConfig,
+        proxy: Option<reqwest::Url>,
+        credentials: Credentials,
+        cache: Cache,
+        notify: Notify,
+    ) -> Result<Self> {
+        let session = Session::new(
+            SessionConfig {
+                device_id: config.device_id(),
+                proxy,
+                ..SessionConfig::default()
+            },
+            Some(cache),
+        );
+        session
+            .connect(credentials, true)
+            .await
+            .context("unable to connect metadata session")?;
+        let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended_flag = Arc::clone(&shutting_down);
+        let watched_session = session.clone();
+        tokio::spawn(async move {
+            while !ended_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if watched_session.is_invalid() {
+                    if !ended_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        notify(EngineEvent::SessionEnded);
+                    }
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            player: None,
+            spirc: None,
+            mixer: None,
+            device_id: config.device_id(),
+            state: Arc::new(Mutex::new(LocalState::default())),
+            interrupted: Arc::default(),
+            shutting_down,
+            audio: AudioControl::new(config.buffer_ms),
+            session,
+        })
     }
     /// Connects to Spotify and announces this device on Spotify Connect.
     pub async fn connect(
@@ -438,10 +486,10 @@ impl Engine {
         });
 
         Ok(Self {
-            player,
-            spirc: Arc::new(spirc),
+            player: Some(player),
+            spirc: Some(Arc::new(spirc)),
             session,
-            mixer,
+            mixer: Some(mixer),
             device_id,
             state,
             interrupted,
@@ -481,10 +529,18 @@ impl Engine {
     /// engine is heard at it from now on. Connect is told on release, not
     /// while the slider is still moving.
     fn note_volume(&self, volume: u16, preview: bool) -> Result<()> {
-        self.mixer.set_volume(volume);
+        let mixer = self
+            .mixer
+            .as_ref()
+            .context("metadata session has no audio mixer")?;
+        let spirc = self
+            .spirc
+            .as_ref()
+            .context("metadata session has no playback receiver")?;
+        mixer.set_volume(volume);
         self.state.lock().unwrap_or_else(|p| p.into_inner()).volume = volume;
         if !preview {
-            self.spirc.set_volume(volume)?;
+            spirc.set_volume(volume)?;
         }
         Ok(())
     }
@@ -559,12 +615,21 @@ impl Engine {
     pub fn shutdown(&self) {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = self.spirc.shutdown();
-        self.player.stop();
+        if let Some(spirc) = &self.spirc {
+            let _ = spirc.shutdown();
+        }
+        if let Some(player) = &self.player {
+            player.stop();
+        }
+        self.session.shutdown();
     }
 
     pub fn resume_point(&self) -> Option<PlaybackResume> {
-        if let Some(snapshot) = self.spirc.disconnected_playback() {
+        if let Some(snapshot) = self
+            .spirc
+            .as_ref()
+            .and_then(|spirc| spirc.disconnected_playback())
+        {
             return Some(PlaybackResume::Session(snapshot));
         }
         self.interrupted().map(|interrupted| {
@@ -579,9 +644,12 @@ impl Engine {
 
     pub fn resume(&self, resume: PlaybackResume) -> Result<()> {
         match resume {
-            PlaybackResume::Session(snapshot) => {
-                self.spirc.restore_playback(snapshot).map_err(Into::into)
-            }
+            PlaybackResume::Session(snapshot) => self
+                .spirc
+                .as_ref()
+                .context("metadata session has no playback receiver")?
+                .restore_playback(snapshot)
+                .map_err(Into::into),
             PlaybackResume::Track(spec) => self.command(PlayerCommand::Load(spec)),
         }
     }
@@ -602,7 +670,10 @@ impl Engine {
     }
 
     fn send_command(&self, command: PlayerCommand) -> Result<()> {
-        let spirc = &self.spirc;
+        let spirc = self
+            .spirc
+            .as_ref()
+            .context("metadata session cannot play audio")?;
         match command {
             PlayerCommand::Toggle => spirc.play_pause()?,
             PlayerCommand::Next => spirc.next()?,
@@ -656,6 +727,12 @@ impl Engine {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

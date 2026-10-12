@@ -230,6 +230,10 @@ struct Listening {
 pub struct App {
     pub dirs: AppDirs,
     pub settings: Settings,
+    /// The private runtime owns audio; librespot supplies music metadata only.
+    pub soloist_mode: bool,
+    pub music_session_ready: bool,
+    pub music_session_busy: bool,
     /// Proxy policy actually handed to network workers. Manual form edits are
     /// drafts until Apply (or Sign in), so unrelated downloads and engine
     /// restarts must not observe them early.
@@ -770,6 +774,9 @@ impl App {
             custom_themes: theme::Catalog::default(),
             dirs,
             settings,
+            soloist_mode: std::env::var_os("SPOTIFAST_SOLOIST_SOCKET").is_some(),
+            music_session_ready: false,
+            music_session_busy: false,
             applied_proxy,
             applied_proxy_preferences,
             pending_proxy_preferences: HashMap::new(),
@@ -1883,7 +1890,24 @@ impl App {
                     self.cover_chosen(&id, request, result);
                 }
                 Event::Auth(status) => self.handle_auth(status),
-                Event::Playback(status) => self.handle_playback(status),
+                Event::Playback(status) if self.soloist_mode => {
+                    self.music_session_busy = matches!(
+                        status,
+                        LocalPlayback::Authorizing
+                            | LocalPlayback::Connecting
+                            | LocalPlayback::WaitingForNetwork
+                    );
+                    if let LocalPlayback::Failed(message) = status {
+                        self.toast_error(format!("Music metadata access: {message}"));
+                    }
+                }
+                Event::Playback(status) | Event::SoloistPlayback(status) => {
+                    self.handle_playback(status)
+                }
+                Event::MusicSession(ready) => {
+                    self.music_session_ready = ready;
+                    self.music_session_busy = false;
+                }
                 Event::NetworkStatus(reachable) => {
                     let became_reachable = !self.network_reachable && reachable;
                     self.network_reachable = reachable;
@@ -4034,6 +4058,9 @@ impl App {
         }
         // The podcast shelf reads from the saved shows. The first page of
         // them is the one the Podcasts shelf of the library asks for.
+        if self.settings.music_only {
+            return;
+        }
         if self.library.shows.loaded_once {
             self.request_home_episodes();
         } else if !self.library.shows.loading && self.library.shows.error.is_none() {
@@ -4045,7 +4072,7 @@ impl App {
     /// once per Home refresh. Known audiobooks are skipped: librespot cannot
     /// play them.
     fn request_home_episodes(&mut self) {
-        if self.home.podcasts_generation == self.home.generation {
+        if self.settings.music_only || self.home.podcasts_generation == self.home.generation {
             return;
         }
         self.home.podcasts_generation = self.home.generation;
@@ -4566,7 +4593,7 @@ impl App {
     /// and re-add its songs in the new order, which only reaches the
     /// engine actually playing them.
     pub fn queue_locally_reorderable(&self) -> bool {
-        self.local.is_active() && matches!(self.target(), Target::Local)
+        !self.soloist_mode && self.local.is_active() && matches!(self.target(), Target::Local)
     }
 
     /// Whether the active local queue has rows that can be cleared.
@@ -4576,7 +4603,7 @@ impl App {
 
     /// Clears manually queued tracks while keeping the context's upcoming rows.
     fn clear_queue(&mut self) {
-        if !matches!(self.target(), Target::Local) {
+        if self.soloist_mode || !matches!(self.target(), Target::Local) {
             return;
         }
         self.pending_album_queues.clear();
@@ -9499,7 +9526,8 @@ impl App {
                     .is_some_and(|product| product != "premium");
                 if free {
                     self.toast_error(gettext(self.locale, "Local playback needs Spotify Premium"));
-                } else if !self.local_ready
+                } else if (!self.local_ready || (self.soloist_mode && !self.music_session_ready))
+                    && (!self.soloist_mode || !self.music_session_busy)
                     && !matches!(
                         self.local_playback,
                         LocalPlayback::Authorizing
@@ -10899,6 +10927,52 @@ mod tests {
     use crate::api::models::{
         Episode, Image, Page as ApiPage, ResumePoint, SavedEpisode, SavedTrack, SearchResults,
     };
+
+    #[test]
+    fn soloist_metadata_authorization_does_not_replace_audio_readiness() {
+        let mut app = headless_app();
+        app.soloist_mode = true;
+        app.handle_backend_events(vec![Event::SoloistPlayback(LocalPlayback::Ready {
+            device_id: "soloist-local".into(),
+        })]);
+        app.handle_backend_events(vec![Event::Playback(LocalPlayback::Authorizing)]);
+        assert!(app.local_ready);
+        assert!(app.music_session_busy);
+        app.handle_backend_events(vec![Event::Playback(LocalPlayback::Failed(
+            "metadata fixture".into(),
+        ))]);
+        assert!(
+            app.local_ready,
+            "metadata failure cannot disable the independent receiver"
+        );
+        assert!(!app.music_session_busy);
+        app.handle_backend_events(vec![Event::SoloistPlayback(LocalPlayback::Unavailable)]);
+        assert!(
+            !app.local_ready,
+            "a real receiver disconnect must disable playback"
+        );
+    }
+
+    #[test]
+    fn soloist_queue_cannot_clear_or_reorder_an_unsupported_remote_queue() {
+        let mut app = headless_app();
+        app.soloist_mode = true;
+        app.local.track = Some(crate::player::LocalTrack {
+            uri: "spotify:track:a".into(),
+            ..Default::default()
+        });
+        app.local.playback = Playback::Playing;
+        app.manual_queue = vec!["spotify:track:b".into()];
+        app.queue = loaded_queue("spotify:track:a", &["spotify:track:b", "spotify:track:c"]);
+        assert!(!app.can_clear_queue());
+        assert!(!app.queue_locally_reorderable());
+        app.clear_queue();
+        assert_eq!(app.manual_queue, vec!["spotify:track:b"]);
+        assert_eq!(
+            queue_uris(&app).1,
+            vec!["spotify:track:b", "spotify:track:c"]
+        );
+    }
 
     /// #623: the missing-output message the sink reports is the one the
     /// catalogues translate.
@@ -16820,6 +16894,7 @@ mod tests {
     fn home_reads_a_few_saved_podcasts_once_per_refresh() {
         use crate::api::models::{Episode, Page as ApiPage, SavedShow};
         let mut app = test_app("home-podcasts");
+        app.settings.music_only = false;
         let show = |index: usize| Show {
             id: format!("s{index}"),
             uri: format!("spotify:show:s{index}"),

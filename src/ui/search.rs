@@ -14,6 +14,11 @@ use super::widgets::{self, TrackRow};
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
+    let music_only = app.settings.music_only;
+    let filter = visible_filter(app.search.filter, music_only);
+    if filter != app.search.filter {
+        app.actions.push(Action::SetSearchFilter(filter));
+    }
     if app.search.committed.is_empty() && app.search.typed_at.is_none() {
         recent(app, ui);
         return;
@@ -21,13 +26,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     let labels: Vec<_> = SearchFilter::ALL
         .iter()
+        .filter(|&&filter| visible_filter(filter, music_only) == filter)
         .map(|f| (*f, f.label(app.locale)))
         .collect();
     let options: Vec<(SearchFilter, &str)> = labels
         .iter()
         .map(|(filter, label)| (*filter, label.as_ref()))
         .collect();
-    if let Some(filter) = widgets::chips(ui, &palette, &options, app.search.filter) {
+    if let Some(filter) = widgets::chips(ui, &palette, &options, filter) {
         app.actions.push(Action::SetSearchFilter(filter));
     }
     ui.add_space(12.0);
@@ -39,7 +45,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         widgets::error_row(ui, app, &error, None);
     }
     let results = match &app.search.results {
-        Loadable::Loaded(results) => results.clone(),
+        Loadable::Loaded(results) => visible_results(results.clone(), music_only),
         Loadable::Loading | Loadable::NotLoaded => {
             if !pending {
                 widgets::loading_row(ui, &palette, app.locale);
@@ -69,7 +75,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         );
         return;
     }
-    match app.search.filter {
+    match filter {
         SearchFilter::All => all(app, ui, &results),
         SearchFilter::Songs => songs(app, ui, &results, usize::MAX),
         SearchFilter::Artists => artists_grid(app, ui, &results),
@@ -78,6 +84,25 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         SearchFilter::Podcasts => shows_grid(app, ui, &results),
         SearchFilter::Episodes => episodes(app, ui, &results, usize::MAX),
     }
+}
+
+/// A stale podcast selection must not leave music search on a hidden tab.
+fn visible_filter(filter: SearchFilter, music_only: bool) -> SearchFilter {
+    if music_only && matches!(filter, SearchFilter::Podcasts | SearchFilter::Episodes) {
+        SearchFilter::All
+    } else {
+        filter
+    }
+}
+
+/// Project the cached response before rendering or checking for empty results.
+/// Keeping the response intact lets an opt-out restore all result types.
+fn visible_results(mut results: SearchResults, music_only: bool) -> SearchResults {
+    if music_only {
+        results.shows = None;
+        results.episodes = None;
+    }
+    results
 }
 
 fn recent(app: &mut App, ui: &mut egui::Ui) {
@@ -97,15 +122,20 @@ fn recent(app: &mut App, ui: &mut egui::Ui) {
         return;
     }
     if app.settings.search_history.is_empty() {
+        let body = if app.settings.music_only {
+            gettext(app.locale, "Find songs, artists, albums, and playlists.")
+        } else {
+            gettext(
+                app.locale,
+                "Find songs, artists, albums, playlists, and podcasts.",
+            )
+        };
         widgets::empty_state(
             ui,
             &palette,
             Icon::Search,
             &gettext(app.locale, "Search Spotify"),
-            &gettext(
-                app.locale,
-                "Find songs, artists, albums, playlists, and podcasts.",
-            ),
+            &body,
         );
         return;
     }
@@ -737,4 +767,158 @@ fn episodes(app: &mut App, ui: &mut egui::Ui, results: &SearchResults, limit: us
 #[allow(dead_code)]
 fn align_right(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     ui.with_layout(Layout::right_to_left(Align::Center), add);
+}
+
+#[cfg(test)]
+mod music_tests {
+    use super::*;
+    use crate::api::models::{Episode, Page as ResultPage, Show, Track};
+
+    #[test]
+    fn music_search_excludes_spoken_audio_before_checking_for_empty_results() {
+        let cached = SearchResults {
+            shows: Some(ResultPage {
+                items: vec![Show::default()],
+                ..Default::default()
+            }),
+            episodes: Some(ResultPage {
+                items: vec![Episode::default()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(visible_results(cached.clone(), true).is_empty());
+        assert_eq!(visible_results(cached.clone(), false), cached);
+
+        let mixed = SearchResults {
+            tracks: Some(ResultPage {
+                items: vec![Track::default()],
+                ..Default::default()
+            }),
+            ..cached
+        };
+        let music = visible_results(mixed.clone(), true);
+        assert!(!music.is_empty());
+        assert_eq!(music.tracks, mixed.tracks);
+        assert!(music.shows.is_none() && music.episodes.is_none());
+        assert!(mixed.shows.is_some() && mixed.episodes.is_some());
+    }
+
+    #[test]
+    fn music_search_recovers_from_a_hidden_selected_filter() {
+        for filter in SearchFilter::ALL {
+            let visible = visible_filter(filter, true);
+            match filter {
+                SearchFilter::Podcasts | SearchFilter::Episodes => {
+                    assert_eq!(visible, SearchFilter::All);
+                }
+                _ => assert_eq!(visible, filter),
+            }
+            assert_eq!(visible_filter(filter, false), filter);
+        }
+    }
+
+    #[cfg(feature = "demo")]
+    fn painted_text(
+        ctx: &egui::Context,
+        app: &mut App,
+        view: fn(&mut App, &mut egui::Ui),
+    ) -> Vec<String> {
+        fn collect(shape: &egui::epaint::Shape, labels: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => labels.push(text.galley.job.text.clone()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, labels);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    vec2(1280.0, 4000.0),
+                )),
+                ..Default::default()
+            },
+            |ui| view(app, ui),
+        );
+        output.textures_delta.clear();
+        let mut labels = Vec::new();
+        for shape in &output.shapes {
+            collect(&shape.shape, &mut labels);
+        }
+        labels
+    }
+
+    #[cfg(feature = "demo")]
+    #[test]
+    fn music_views_hide_spoken_audio_and_keep_music_navigation() {
+        let root =
+            std::env::temp_dir().join(format!("spotifast-music-views-{}", std::process::id()));
+        let ctx = egui::Context::default();
+        let mut app = App::new(
+            &crate::backend::Waker::default(),
+            crate::paths::AppDirs {
+                config: root.join("config"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+            },
+            crate::settings::Settings::default(),
+            crate::app::AppOptions {
+                media_controls: false,
+                restore_sign_in: false,
+                tray: false,
+            },
+        );
+        app.attach(&ctx);
+        crate::demo::populate(&mut app);
+        app.locale = crate::i18n::Locale::English;
+        assert!(app.settings.music_only);
+        type View = fn(&mut App, &mut egui::Ui);
+        for (view, spoken, music) in [
+            (
+                super::super::home::show as View,
+                "Your podcasts",
+                "Liked Songs",
+            ),
+            (super::super::sidebar::show as View, "Podcasts", "Albums"),
+            (show as View, "Podcasts", "Songs"),
+        ] {
+            for music_only in [false, true] {
+                app.settings.music_only = music_only;
+                painted_text(&ctx, &mut app, view);
+                let labels = painted_text(&ctx, &mut app, view);
+                assert_eq!(labels.iter().any(|label| label == spoken), !music_only);
+                assert!(labels.iter().any(|label| label == music));
+            }
+        }
+        let sidebar_filter = egui::Id::new("sidebar-filter");
+        ctx.data_mut(|data| {
+            data.insert_temp(sidebar_filter, crate::settings::LibraryShelf::Podcasts);
+        });
+        painted_text(&ctx, &mut app, super::super::sidebar::show);
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<crate::settings::LibraryShelf>(sidebar_filter)),
+            Some(crate::settings::LibraryShelf::Playlists)
+        );
+        let results = app.search.results.get_mut().unwrap();
+        results.tracks = None;
+        results.artists = None;
+        results.albums = None;
+        results.playlists = None;
+        app.search.filter = SearchFilter::Episodes;
+        app.actions.clear();
+        painted_text(&ctx, &mut app, show);
+        let labels = painted_text(&ctx, &mut app, show);
+        assert!(labels.iter().any(|label| label.starts_with("No results")));
+        assert!(
+            app.actions
+                .iter()
+                .any(|action| matches!(action, Action::SetSearchFilter(SearchFilter::All)))
+        );
+        app.backend.shutdown();
+    }
 }

@@ -50,7 +50,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         made_for_you(app, ui);
     }
     recently_played(app, ui);
-    podcasts(app, ui);
+    if !app.settings.music_only {
+        podcasts(app, ui);
+    }
     top_artists(app, ui);
     top_tracks(app, ui);
     if app.settings.home.recommendations.visible {

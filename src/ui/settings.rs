@@ -285,6 +285,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     if section_matches(&needle, &account, &account_rows) {
         any_visible = true;
         section(ui, &palette, &account, |ui| {
+            if app.soloist_mode {
+                ui.label("Sign out requests a pause. Soloist pairing stays saved. To change Spotify accounts, reset pairing in the receiver window first.");
+            }
             if row_matches(&needle, &format!("{sign_out} {account}"), "") {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 14.0;
@@ -407,7 +410,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         });
     }
 
-    let (status, detail, action) = match &app.local_playback {
+    let (status, mut detail, mut action) = match &app.local_playback {
         crate::backend::LocalPlayback::Ready { .. } => (
             pgettext(locale, "playback status", "Ready"),
             gettext(locale, "This computer is a Spotify Connect device."),
@@ -445,6 +448,20 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             Some(gettext(locale, "Enable playback here")),
         ),
     };
+    if app.soloist_mode {
+        detail = if app.local_ready {
+            gettext(
+                locale,
+                "Soloist is connected. Audio quality is controlled by the receiver.",
+            )
+        } else {
+            gettext(
+                locale,
+                "Finish Soloist setup and pairing in the receiver window.",
+            )
+        };
+        action = None;
+    }
     let playback = gettext(locale, "Playback on this computer");
     let normalize_volume = gettext(locale, "Normalize volume");
     let autoplay = gettext(locale, "Autoplay");
@@ -464,23 +481,23 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         RowText::new(
             gettext(locale, "Device name"),
             gettext(locale, "How this computer appears in Spotify Connect."),
-        ),
+        ).when(!app.soloist_mode),
         RowText::new(
             gettext(locale, "Audio quality"),
             gettext(locale, "Higher bitrates use more data and cache space."),
-        ),
+        ).when(!app.soloist_mode),
         RowText::new(
             normalize_volume.clone(),
             gettext(locale, "Keep loud and quiet tracks at a similar level."),
-        ),
+        ).when(!app.soloist_mode),
         RowText::new(
             autoplay.clone(),
             gettext(locale, "Keep playing similar songs when your music ends."),
-        ),
+        ).when(!app.soloist_mode),
         RowText::new(
             gapless.clone(),
             gettext(locale, "Play tracks without silence between them."),
-        ),
+        ).when(!app.soloist_mode),
         RowText::new(
             keep_playing.clone(),
             super::keys::platform_shortcut(
@@ -506,7 +523,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 "PulseAudio also covers PipeWire. Rodio talks to ALSA directly.",
             ),
         )
-        .when(cfg!(target_os = "linux")),
+        .when(cfg!(target_os = "linux") && !app.soloist_mode),
         RowText::new(
             gettext(locale, "Output buffer"),
             gettext(
@@ -514,13 +531,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 "More buffering can prevent clicks on busy computers. Less buffering makes controls respond sooner.",
             ),
         )
-        .when(cfg!(windows)),
+        .when(cfg!(windows) && !app.soloist_mode),
         RowText::new(
             audio_cache.clone(),
             gettext(locale, "Save downloaded audio for later playback."),
-        ),
-        RowText::new(apply_playback.clone(), apply_playback_note.clone()).when(playback_dirty),
-        RowText::new(gettext(locale, "Playback settings applied"), "").when(!playback_dirty),
+        ).when(!app.soloist_mode),
+        RowText::new(apply_playback.clone(), apply_playback_note.clone()).when(playback_dirty && !app.soloist_mode),
+        RowText::new(gettext(locale, "Playback settings applied"), "").when(!playback_dirty && !app.soloist_mode),
         RowText::new(
             download_updates.clone(),
             gettext(
@@ -540,6 +557,23 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     if section_matches(&needle, &playback, &playback_rows) {
         any_visible = true;
         section(ui, &palette, &playback, |ui| {
+            if app.soloist_mode {
+                widgets::setting_row(
+                    ui,
+                    &palette,
+                    "Playlist and lyrics access",
+                    "An optional Spotify browser approval enables playlist folders, lyrics and radio.",
+                    |ui| {
+                        if app.music_session_ready {
+                            ui.label("Connected");
+                        } else if app.music_session_busy {
+                            ui.label("Connecting…");
+                        } else if theme::pill_button(ui, &palette, "Enable", true).clicked() {
+                            app.actions.push(Action::EnablePlayback);
+                        }
+                    },
+                );
+            }
             filtered_row(ui, &palette, &needle, &playback, &playback_rows[0], |ui| {
                 if let Some(label) = action {
                     if theme::pill_button(ui, &palette, &label, true).clicked() {
@@ -891,11 +925,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 locale,
                 "Show the song moving behind the player bar's controls while it plays here.",
             ),
-        ),
+        ).when(!app.soloist_mode),
         RowText::new(
             player_bar_vis_click.clone(),
             gettext(locale, "Allow clicks on empty player bar space to cycle the visualizer."),
-        ),
+        ).when(!app.soloist_mode),
     ];
     if section_matches(&needle, &appearance, &appearance_rows) {
         any_visible = true;
@@ -1580,7 +1614,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 .join(" "),
         ),
     ];
-    if section_matches(&needle, "MilkDrop", &milkdrop_rows) {
+    if !app.soloist_mode && section_matches(&needle, "MilkDrop", &milkdrop_rows) {
         any_visible = true;
         section(ui, &palette, "MilkDrop", |ui| {
             filtered_row(ui, &palette, &needle, "MilkDrop", &milkdrop_rows[0], |ui| {
@@ -1754,7 +1788,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 .join(" "),
         ),
     ];
-    if section_matches(&needle, &equalizer, &equalizer_rows) {
+    if !app.soloist_mode && section_matches(&needle, &equalizer, &equalizer_rows) {
         any_visible = true;
         section(ui, &palette, &equalizer, |ui| {
             filtered_row(
