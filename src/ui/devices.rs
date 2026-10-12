@@ -227,7 +227,11 @@ pub fn popup(app: &mut App, ctx: &egui::Context) {
                         Device {
                             id: Some(local_id.clone()),
                             // Named without its suffix; the row below adds it.
-                            name: app.settings.device_name.clone(),
+                            name: if app.soloist_mode {
+                                "Spotifast Soloist".into()
+                            } else {
+                                app.settings.device_name.clone()
+                            },
                             is_active: app.local.is_active(),
                             is_restricted: false,
                             volume_percent: Some(crate::app::volume_to_percent(app.local.volume)),
@@ -322,7 +326,7 @@ pub fn popup(app: &mut App, ctx: &egui::Context) {
                                 pos2(rect.left() + 24.0, rect.center().y),
                                 egui::Vec2::splat(22.0),
                             );
-                            device_icon(&device.kind)
+                            device_icon(if is_local { "computer" } else { &device.kind })
                                 .image(color, 22.0)
                                 .paint_at(ui, icon_rect);
                             let painter = ui.painter().with_clip_rect(rect);

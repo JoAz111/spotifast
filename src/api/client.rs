@@ -1170,23 +1170,6 @@ impl ApiClient {
     pub async fn episode(&self, id: &str) -> Result<Episode> {
         self.get(&format!("/episodes/{id}"), &[]).await
     }
-
-    pub async fn recommendations(
-        &self,
-        seed_tracks: &[String],
-        seed_artists: &[String],
-        limit: u32,
-    ) -> Result<Vec<Track>> {
-        let mut query = vec![("limit", limit.to_string())];
-        if !seed_tracks.is_empty() {
-            query.push(("seed_tracks", seed_tracks.join(",")));
-        }
-        if !seed_artists.is_empty() {
-            query.push(("seed_artists", seed_artists.join(",")));
-        }
-        let recommendations: Recommendations = self.get("/recommendations", &query).await?;
-        Ok(recommendations.tracks)
-    }
 }
 
 #[cfg(test)]

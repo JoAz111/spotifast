@@ -155,8 +155,22 @@ fn page(items: Vec<PlaylistItem>, total: u32, offset: u32, limit: u32) -> Page<P
 /// details from one batched request. Spotify mixes a station afresh each
 /// time it is resolved, so the list returned here is the one to play.
 pub async fn station(session: &Session, station: &str) -> anyhow::Result<Vec<Track>> {
+    read_station(session, station, usize::MAX).await
+}
+
+/// A Home preview asks for details of at most 20 songs from one station.
+pub async fn station_preview(session: &Session, station: &str) -> anyhow::Result<Vec<Track>> {
+    read_station(session, station, 20).await
+}
+
+async fn read_station(
+    session: &Session,
+    station: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<Track>> {
     let context = session.spclient().get_context(station).await?;
-    let uris = station_songs(&context);
+    let mut uris = station_songs(&context);
+    uris.truncate(limit);
     anyhow::ensure!(!uris.is_empty(), "Spotify has no songs for this radio");
     let found = metadata(session, uris.iter())
         .await

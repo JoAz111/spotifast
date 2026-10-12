@@ -309,6 +309,13 @@ pub struct App {
     pub local_ready: bool,
     pub local_playback: LocalPlayback,
     pub local: LocalState,
+    /// Current decoder quality is optional and never inferred from preferences.
+    playback_quality: Option<crate::playback_quality::QualitySnapshot>,
+    quality_track_sequence: u64,
+    quality_after: Instant,
+    previous_quality_occurrence: Option<String>,
+    observed_quality_occurrence: Option<String>,
+    quality_unanchored_repeat: bool,
     pub remote: Option<RemoteSnapshot>,
     remote_polled_at: Instant,
     remote_poll_pending: bool,
@@ -768,6 +775,12 @@ impl App {
             local_ready: false,
             local_playback: LocalPlayback::Unavailable,
             local: LocalState::default(),
+            playback_quality: None,
+            quality_track_sequence: 0,
+            quality_after: Instant::now(),
+            previous_quality_occurrence: None,
+            observed_quality_occurrence: None,
+            quality_unanchored_repeat: false,
             remote: None,
             remote_polled_at: Instant::now() - REMOTE_POLL_UNSEEN,
             remote_poll_pending: false,
@@ -1350,6 +1363,72 @@ impl App {
         (!name.is_empty()).then(|| (name.to_owned(), device.kind.clone()))
     }
 
+    /// The destination strip is only for playback away from this computer.
+    pub fn external_playback_device(&self) -> Option<(String, String)> {
+        if self.local.is_active() && self.local_transfer_sequence != Some(self.local.track_sequence)
+        {
+            return None;
+        }
+        if self
+            .remote_fresh()
+            .and_then(|remote| remote.state.device.as_ref())
+            .is_some_and(|device| device.id.is_some() && device.id == self.local_device_id)
+        {
+            return None;
+        }
+        self.playback_device()
+    }
+
+    fn clear_playback_quality(&mut self) {
+        self.playback_quality = None;
+        self.quality_after = Instant::now();
+    }
+
+    fn receive_playback_quality(
+        &mut self,
+        snapshot: Option<crate::playback_quality::QualitySnapshot>,
+    ) {
+        let Some(snapshot) = snapshot else {
+            self.clear_playback_quality();
+            return;
+        };
+        if self.quality_unanchored_repeat
+            || !self.soloist_mode
+            || !self.local_ready
+            || !self.local.connected
+            || !self.local.is_active()
+            || self.local.loading
+            || snapshot.received_at < self.quality_after
+            || self.previous_quality_occurrence.as_deref() == Some(snapshot.playback_id.as_str())
+            || !snapshot.is_fresh(Instant::now())
+            || self.local_device_id.as_deref() != Some(snapshot.active_device_id.as_str())
+            || self.local.track.as_ref().map(|track| track.uri.as_str())
+                != Some(snapshot.track_uri.as_str())
+        {
+            return;
+        }
+        self.observed_quality_occurrence = Some(snapshot.playback_id.clone());
+        self.quality_track_sequence = self.local.track_sequence;
+        self.playback_quality = Some(snapshot);
+    }
+
+    pub fn playing_lossless(&self, now: &NowPlaying) -> bool {
+        self.soloist_mode
+            && now.local
+            && !now.loading
+            && !now.resuming
+            && self.local_ready
+            && self.local.connected
+            && self.local.is_active()
+            && !self.local.loading
+            && self.quality_track_sequence == self.local.track_sequence
+            && self.playback_quality.as_ref().is_some_and(|snapshot| {
+                snapshot.is_fresh(Instant::now())
+                    && self.local_device_id.as_deref() == Some(snapshot.active_device_id.as_str())
+                    && now.uri == snapshot.track_uri
+            })
+    }
+
     pub fn now_playing(&self) -> Option<NowPlaying> {
         if let Some(now) = &self.frame_now {
             return Some(now.clone());
@@ -1862,9 +1941,14 @@ impl App {
                 Event::Playback(status) | Event::SoloistPlayback(status) => {
                     self.handle_playback(status)
                 }
+                Event::PlaybackQuality(snapshot) => self.receive_playback_quality(snapshot),
                 Event::MusicSession(ready) => {
+                    if !ready {
+                        self.clear_playback_quality();
+                    }
                     self.music_session_ready = ready;
                     self.music_session_busy = false;
+                    self.home_music_session_changed();
                 }
                 Event::NetworkStatus(reachable) => {
                     let became_reachable = !self.network_reachable && reachable;
@@ -1989,6 +2073,9 @@ impl App {
                     self.playlist_headers.insert(header.id.clone(), header);
                     self.fill_blank_playlists();
                 }
+                Event::HomeRecommendations { generation, result } => {
+                    self.receive_home_recommendations(generation, result);
+                }
                 Event::Radio {
                     seed,
                     generation,
@@ -2088,6 +2175,10 @@ impl App {
                 self.web_app = None;
                 self.user = None;
                 self.premium_notice_shown = false;
+                self.clear_playback_quality();
+                self.previous_quality_occurrence = None;
+                self.observed_quality_occurrence = None;
+                self.quality_unanchored_repeat = false;
                 self.local = LocalState::default();
                 self.local_ready = false;
                 self.local_device_id = None;
@@ -2118,10 +2209,12 @@ impl App {
                 }
             }
             LocalPlayback::Unavailable => {
+                self.clear_playback_quality();
                 self.local_ready = false;
                 self.local_device_id = None;
             }
             LocalPlayback::Failed(message) => {
+                self.clear_playback_quality();
                 self.local_ready = false;
                 if self.queued_play.take().is_some() {
                     self.clear_play_pending();
@@ -2398,6 +2491,27 @@ impl App {
         let track_changed =
             state.track != self.local.track || state.track_sequence != self.local.track_sequence;
         let reconnected = state.connected && !self.local.connected;
+        let quality_occurrence_changed = state.track_sequence != self.local.track_sequence
+            || state.track.as_ref().map(|track| &track.uri)
+                != self.local.track.as_ref().map(|track| &track.uri);
+        if quality_occurrence_changed {
+            let repeated = state.track.as_ref().is_some_and(|track| {
+                self.local
+                    .track
+                    .as_ref()
+                    .is_some_and(|previous| previous.uri == track.uri)
+            });
+            self.previous_quality_occurrence = if repeated {
+                self.observed_quality_occurrence.take()
+            } else {
+                None
+            };
+            self.quality_unanchored_repeat = repeated && self.previous_quality_occurrence.is_none();
+            self.observed_quality_occurrence = None;
+        }
+        if quality_occurrence_changed || !state.connected || !state.is_active() || state.loading {
+            self.clear_playback_quality();
+        }
         if state.shuffle != self.local.shuffle
             && self
                 .shuffle_set_at
@@ -2406,11 +2520,27 @@ impl App {
             // Accept shuffle changes made by another client.
             self.shuffle_wanted = state.shuffle;
         }
-        if state.playback != self.local.playback {
+        // A delayed pause echo must not erase a newer play intent (or vice
+        // versa). Keep the latest intent until its matching state arrives.
+        if !state.connected
+            || track_changed
+            || state.playback == Playback::Stopped
+            || self.optimistic_playing.is_some_and(|(wanted, _)| {
+                state.playback != self.local.playback
+                    && state.playback
+                        == if wanted {
+                            Playback::Playing
+                        } else {
+                            Playback::Paused
+                        }
+            })
+        {
             self.optimistic_playing = None;
-            if matches!(state.playback, Playback::Playing | Playback::Loading) {
-                self.clear_play_pending();
-            }
+        }
+        if state.playback != self.local.playback
+            && matches!(state.playback, Playback::Playing | Playback::Loading)
+        {
+            self.clear_play_pending();
         }
         if state.track != self.local.track {
             self.clear_play_pending();
@@ -3658,6 +3788,13 @@ impl App {
             generation,
         });
         self.load_home_discover();
+        if self.settings.home.recommendations.visible && self.home.recommendations.get().is_none() {
+            self.home.recommendations = if self.music_session_ready {
+                Loadable::Loading
+            } else {
+                Loadable::NotLoaded
+            };
+        }
         // The podcast shelf reads from the saved shows. The first page of
         // them is the one the Podcasts shelf of the library asks for.
         if self.settings.music_only {
@@ -3691,34 +3828,6 @@ impl App {
                 generation: self.home.generation,
             });
         }
-    }
-
-    fn load_home_recommendations(&mut self) {
-        if !self.settings.home.recommendations.visible
-            || self.home.recommendations_generation == self.home.generation
-        {
-            return;
-        }
-        let Some(tracks) = self.home.top_tracks.get() else {
-            return;
-        };
-        let seeds: Vec<String> = tracks
-            .iter()
-            .filter_map(|track| track.id.clone())
-            .take(5)
-            .collect();
-        self.home.recommendations_generation = self.home.generation;
-        if seeds.is_empty() {
-            return;
-        }
-        if self.home.recommendations.get().is_none() {
-            self.home.recommendations = Loadable::Loading;
-        }
-        self.backend.api(ApiRequest::Recommendations {
-            seed_tracks: seeds,
-            seed_artists: Vec::new(),
-            generation: self.home.generation,
-        });
     }
 
     /// Asks for the newest episodes of the most recently saved podcasts,
@@ -5084,20 +5193,18 @@ impl App {
                             self.home.top_songs_loading = false;
                         }
                     }
-                } else if generation == self.home.generation
-                    && let Ok(page) = result
-                {
-                    let tracks = page.items;
-                    let uris: Vec<String> = tracks.iter().map(|track| track.uri.clone()).collect();
-                    self.request_contains(uris);
-                    self.home.top_tracks = Loadable::Loaded(tracks);
+                } else if generation == self.home.generation {
+                    match result {
+                        Ok(page) => {
+                            let tracks = page.items;
+                            let uris: Vec<String> =
+                                tracks.iter().map(|track| track.uri.clone()).collect();
+                            self.request_contains(uris);
+                            self.home.top_tracks = Loadable::Loaded(tracks);
+                        }
+                        Err(error) => self.home.top_tracks.refresh(Err::<Vec<Track>, _>(error)),
+                    }
                     self.load_home_recommendations();
-                } else if generation == self.home.generation
-                    && offset == 0
-                    && let Err(error) = result
-                    && self.home.top_tracks.get().is_none()
-                {
-                    self.home.top_tracks = Loadable::Failed(error.to_string());
                 }
             }
             ApiResponse::TopArtists { generation, result } => {
@@ -5105,16 +5212,6 @@ impl App {
                     return;
                 }
                 self.home.top_artists.refresh(result);
-            }
-            ApiResponse::Recommendations { generation, result } => {
-                if generation != self.home.generation {
-                    return;
-                }
-                if let Ok(tracks) = &result {
-                    let uris: Vec<String> = tracks.iter().map(|track| track.uri.clone()).collect();
-                    self.request_contains(uris);
-                }
-                self.home.recommendations.refresh(result);
             }
             ApiResponse::Discover {
                 term,
@@ -7193,7 +7290,8 @@ impl App {
         match self.target() {
             Target::Local => {
                 if self.local.is_active() {
-                    self.backend.player(PlayerCommand::Toggle);
+                    self.backend
+                        .player(PlayerCommand::SetPlaying(playing != Some(true)));
                 } else if let Some(remote) = self.remote_fresh() {
                     // Nothing is playing locally: resume on this computer.
                     let uri = remote
@@ -8892,6 +8990,7 @@ impl App {
                 }
             }
             Action::Reload(page) => self.reload(page),
+            Action::RetryHomeRecommendations => self.retry_home_recommendations(),
             Action::SignIn => self.request_proxy(true),
             Action::ApplyProxy => self.request_proxy(false),
             Action::ProxyEdited => self.proxy_form_edited = true,
@@ -10243,6 +10342,7 @@ fn cover_error(locale: Locale, error: &crate::api::client::ApiError) -> String {
     }
 }
 
+mod home_recommendations;
 mod radio;
 
 #[cfg(test)]
@@ -10319,6 +10419,128 @@ mod tests {
             !app.local_ready,
             "a real receiver disconnect must disable playback"
         );
+    }
+
+    #[test]
+    fn soloist_lossless_badge_requires_current_device_track_and_fresh_actual_quality() {
+        use crate::playback_quality::{
+            ActualBitrateLevel, ActualHiFiStatus, QUALITY_MAX_AGE, QualitySnapshot,
+        };
+        let mut app = headless_app();
+        app.soloist_mode = true;
+        app.local_ready = true;
+        app.local_device_id = Some("owned-receiver".into());
+        let state = LocalState {
+            connected: true,
+            playback: Playback::Playing,
+            track_sequence: 1,
+            track: Some(crate::player::LocalTrack {
+                uri: "spotify:track:current".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        app.handle_local(state.clone());
+        let snapshot = |device: &str, uri: &str, occurrence: &str| QualitySnapshot {
+            active_device_id: device.into(),
+            track_uri: uri.into(),
+            playback_id: occurrence.into(),
+            bitrate_level: ActualBitrateLevel::HiFi24,
+            hifi_status: ActualHiFiStatus::On,
+            ordering_timestamp_ms: 1,
+            received_at: Instant::now(),
+        };
+        let now = app.now_playing().unwrap();
+        assert!(!app.playing_lossless(&now));
+        app.receive_playback_quality(Some(snapshot("another-receiver", &now.uri, "first")));
+        assert!(!app.playing_lossless(&now));
+        app.receive_playback_quality(Some(snapshot(
+            "owned-receiver",
+            "spotify:track:prefetched",
+            "first",
+        )));
+        assert!(!app.playing_lossless(&now));
+        app.receive_playback_quality(Some(snapshot("owned-receiver", &now.uri, "first")));
+        assert!(app.playing_lossless(&now));
+        let mut optimistic = now.clone();
+        optimistic.loading = true;
+        assert!(!app.playing_lossless(&optimistic));
+        let mut external = now.clone();
+        external.local = false;
+        assert!(!app.playing_lossless(&external));
+        app.receive_playback_quality(None);
+        assert!(!app.playing_lossless(&now));
+        // A new actual observation can restore quality on the same occurrence.
+        app.receive_playback_quality(Some(snapshot("owned-receiver", &now.uri, "first")));
+        assert!(app.playing_lossless(&now));
+        app.playback_quality.as_mut().unwrap().received_at = Instant::now() - QUALITY_MAX_AGE;
+        assert!(!app.playing_lossless(&now));
+        app.receive_playback_quality(Some(snapshot("owned-receiver", &now.uri, "first")));
+        let mut repeated = state;
+        repeated.track_sequence += 1;
+        app.handle_local(repeated.clone());
+        assert!(!app.playing_lossless(&app.now_playing().unwrap()));
+        app.receive_playback_quality(Some(snapshot("owned-receiver", &now.uri, "first")));
+        assert!(
+            !app.playing_lossless(&app.now_playing().unwrap()),
+            "an old same-URI occurrence cannot label its repeat"
+        );
+        app.receive_playback_quality(Some(snapshot("owned-receiver", &now.uri, "second")));
+        assert!(app.playing_lossless(&app.now_playing().unwrap()));
+        // Metadata-only edits do not invent a new playback occurrence.
+        repeated.track.as_mut().unwrap().title = "enriched title".into();
+        app.handle_local(repeated.clone());
+        assert!(app.playing_lossless(&app.now_playing().unwrap()));
+        repeated.connected = false;
+        app.handle_local(repeated);
+        assert!(!app.playing_lossless(&app.now_playing().unwrap()));
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn soloist_same_uri_repeat_before_first_quality_never_accepts_delayed_old_occurrence() {
+        use crate::playback_quality::{ActualBitrateLevel, ActualHiFiStatus, QualitySnapshot};
+        let mut app = headless_app();
+        app.soloist_mode = true;
+        app.local_ready = true;
+        app.local_device_id = Some("owned-receiver".into());
+        let mut state = LocalState {
+            connected: true,
+            playback: Playback::Playing,
+            track_sequence: 1,
+            track: Some(crate::player::LocalTrack {
+                uri: "spotify:track:repeated".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        app.handle_local(state.clone());
+        state.track_sequence += 1;
+        app.handle_local(state.clone());
+        let snapshot = QualitySnapshot {
+            active_device_id: "owned-receiver".into(),
+            track_uri: "spotify:track:repeated".into(),
+            playback_id: "delayed-old-occurrence".into(),
+            bitrate_level: ActualBitrateLevel::HiFi,
+            hifi_status: ActualHiFiStatus::On,
+            ordering_timestamp_ms: 1,
+            received_at: Instant::now(),
+        };
+        app.receive_playback_quality(Some(snapshot.clone()));
+        assert!(
+            !app.playing_lossless(&app.now_playing().unwrap()),
+            "receipt time cannot establish the playback occurrence"
+        );
+        state.track.as_mut().unwrap().uri = "spotify:track:different".into();
+        state.track_sequence += 1;
+        app.handle_local(state);
+        let mut current = snapshot;
+        current.track_uri = "spotify:track:different".into();
+        current.playback_id = "current-occurrence".into();
+        current.received_at = Instant::now();
+        app.receive_playback_quality(Some(current));
+        assert!(app.playing_lossless(&app.now_playing().unwrap()));
+        app.backend.shutdown();
     }
 
     #[test]
@@ -15628,10 +15850,155 @@ mod tests {
         let _ = std::fs::remove_dir_all(app.dirs.config.parent().unwrap());
     }
 
+    fn home_mix_app(name: &str) -> App {
+        let mut app = test_app(name);
+        app.backend.set_offline(true);
+        app.home.requested = true;
+        app.home.generation = 1;
+        app.music_session_ready = true;
+        app.home.top_tracks = Loadable::Loaded(vec![Track {
+            uri: "spotify:track:seed".into(),
+            name: "Seed song".into(),
+            ..Default::default()
+        }]);
+        app
+    }
+
+    #[test]
+    fn home_mix_requires_music_access_and_never_requests_when_hidden() {
+        let mut app = home_mix_app("home-mix-access");
+        app.settings.home.recommendations.visible = false;
+        app.load_home_recommendations();
+        assert!(app.backend.take_home_recommendations_requests().is_empty());
+        app.settings.home.recommendations.visible = true;
+        app.music_session_ready = false;
+        app.load_home_recommendations();
+        assert!(matches!(app.home.recommendations, Loadable::NotLoaded));
+        assert!(app.backend.take_home_recommendations_requests().is_empty());
+        app.music_session_ready = true;
+        app.home_music_session_changed();
+        let requests = app.backend.take_home_recommendations_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "spotify:track:seed");
+        assert!(
+            app.backend.take_api_requests().is_empty(),
+            "the shelf uses no Web API Recommendations request"
+        );
+        app.home_music_session_changed();
+        app.load_home_recommendations();
+        assert!(app.backend.take_home_recommendations_requests().is_empty());
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn home_mix_settles_empty_history_and_failed_history_without_spinning() {
+        let mut app = home_mix_app("home-mix-seeds");
+        app.home.top_tracks = Loadable::Loaded(Vec::new());
+        app.load_home_recommendations();
+        assert!(matches!(&app.home.recommendations, Loadable::Loaded(tracks) if tracks.is_empty()));
+        assert!(!app.home.recommendations_loading);
+        assert!(app.backend.take_home_recommendations_requests().is_empty());
+        app.retry_home_recommendations();
+        assert!(matches!(
+            app.backend.take_api_requests().as_slice(),
+            [ApiRequest::TopTracks { full: false, .. }]
+        ));
+        app.handle_api(ApiResponse::TopTracks {
+            offset: 0,
+            full: false,
+            generation: 1,
+            result: Err(crate::api::ApiError::Status {
+                status: 403,
+                message: "fixture refused".into(),
+            }),
+        });
+        assert!(
+            matches!(&app.home.recommendations, Loadable::Loaded(tracks) if tracks.is_empty()),
+            "a failed refresh retains the previously loaded empty shelf"
+        );
+        assert!(matches!(&app.home.top_tracks, Loadable::Failed(_)));
+        assert_eq!(
+            app.home.recommendations_error.as_deref(),
+            Some("Couldn't load your listening history. Try again."),
+            "the shelf exposes the failed refresh for its inline error and Retry"
+        );
+        assert!(!app.home.recommendations_loading);
+        assert!(app.backend.take_home_recommendations_requests().is_empty());
+        app.apply(Action::RetryHomeRecommendations, &egui::Context::default());
+        assert_eq!(app.home.generation, 1, "Retry does not reload Home");
+        assert!(matches!(
+            app.backend.take_api_requests().as_slice(),
+            [ApiRequest::TopTracks { full: false, .. }]
+        ));
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn home_mix_retry_is_isolated_and_stale_answers_never_replace_current_songs() {
+        let mut app = home_mix_app("home-mix-retry");
+        app.load_home_recommendations();
+        let first = app.backend.take_home_recommendations_requests()[0].1;
+        app.receive_home_recommendations(
+            first,
+            Ok(vec![Track {
+                uri: "spotify:track:first".into(),
+                ..Default::default()
+            }]),
+        );
+        app.backend.take_api_requests(); // Saved-state lookup is separate from this shelf.
+        assert_eq!(app.home.recommendations_seed.as_deref(), Some("Seed song"));
+        app.retry_home_recommendations();
+        let second = app.backend.take_home_recommendations_requests()[0].1;
+        assert_ne!(first, second);
+        assert!(app.backend.take_api_requests().is_empty());
+        app.receive_home_recommendations(first, Ok(Vec::new()));
+        assert!(
+            app.home.recommendations_loading,
+            "an older response cannot complete the newer retry"
+        );
+        app.receive_home_recommendations(second, Err("fixture timeout".into()));
+        assert!(!app.home.recommendations_loading);
+        assert_eq!(
+            app.home.recommendations.get().unwrap()[0].uri,
+            "spotify:track:first"
+        );
+        assert_eq!(
+            app.home.recommendations_error.as_deref(),
+            Some("fixture timeout")
+        );
+        app.load_home_recommendations();
+        assert!(
+            app.backend.take_home_recommendations_requests().is_empty(),
+            "failure waits for explicit Retry"
+        );
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn home_mix_reconnect_replaces_interrupted_read_and_signout_discards_its_result() {
+        let mut app = home_mix_app("home-mix-reconnect");
+        app.load_home_recommendations();
+        let first = app.backend.take_home_recommendations_requests()[0].1;
+        app.music_session_ready = false;
+        app.home_music_session_changed();
+        assert!(!app.home.recommendations_loading);
+        app.music_session_ready = true;
+        app.home_music_session_changed();
+        let second = app.backend.take_home_recommendations_requests()[0].1;
+        assert_ne!(first, second);
+        app.receive_home_recommendations(first, Ok(Vec::new()));
+        assert!(app.home.recommendations_loading);
+        app.reset_data();
+        app.receive_home_recommendations(second, Ok(vec![Track::default()]));
+        assert!(matches!(app.home.recommendations, Loadable::NotLoaded));
+        app.backend.shutdown();
+    }
+
     #[test]
     fn hidden_home_shelves_do_not_request_then_enable_without_reloading_home() {
         let mut app = test_app("home-lazy-shelves");
         app.settings.music_only = true;
+        app.music_session_ready = true;
         app.settings.home.made_for_you.visible = false;
         app.settings.home.recommendations.visible = false;
         app.load_home(false);
@@ -15641,10 +16008,11 @@ mod tests {
             3,
             "only recents and the two visible top shelves load"
         );
-        assert!(!initial.iter().any(|request| matches!(
-            request,
-            ApiRequest::Discover { .. } | ApiRequest::Recommendations { .. }
-        )));
+        assert!(
+            !initial
+                .iter()
+                .any(|request| matches!(request, ApiRequest::Discover { .. }))
+        );
         let generation = app.home.generation;
         app.handle_api(ApiResponse::TopTracks {
             offset: 0,
@@ -15659,21 +16027,19 @@ mod tests {
                 ..Default::default()
             }),
         });
-        assert!(
-            !app.backend
-                .take_api_requests()
-                .iter()
-                .any(|request| matches!(request, ApiRequest::Recommendations { .. }))
-        );
+        app.backend.take_api_requests();
+        assert!(app.backend.take_home_recommendations_requests().is_empty());
         app.settings.home.made_for_you.visible = true;
         app.settings.home.recommendations.visible = true;
         app.load_home(false);
         let enabled = app.backend.take_api_requests();
-        assert_eq!(enabled.len(), DISCOVER_TERMS.len() + 1);
-        assert!(enabled.iter().all(|request| matches!(
-            request,
-            ApiRequest::Discover { .. } | ApiRequest::Recommendations { .. }
-        )));
+        assert_eq!(enabled.len(), DISCOVER_TERMS.len());
+        assert_eq!(app.backend.take_home_recommendations_requests().len(), 1);
+        assert!(
+            enabled
+                .iter()
+                .all(|request| matches!(request, ApiRequest::Discover { .. }))
+        );
         assert_eq!(
             app.home.generation, generation,
             "existing shelves are retained"
@@ -17053,6 +17419,27 @@ mod tests {
         assert!(
             app.now_playing().expect("playing").playing,
             "the second toggle must see the first pause, not the drawing snapshot"
+        );
+        assert_eq!(
+            app.backend.take_player_commands(),
+            vec![
+                PlayerCommand::SetPlaying(false),
+                PlayerCommand::SetPlaying(true)
+            ],
+            "wire intent must preserve both clicks before Spotify echoes state"
+        );
+        app.local.connected = true;
+        app.handle_local(app.local.clone()); // Repeated old Playing state is not confirmation.
+        let mut delayed_pause = app.local.clone();
+        delayed_pause.playback = Playback::Paused;
+        app.handle_local(delayed_pause);
+        app.refresh_frame_now();
+        assert!(app.now_playing().expect("latest play intent").playing);
+        app.toggle_play();
+        assert_eq!(
+            app.backend.take_player_commands(),
+            vec![PlayerCommand::SetPlaying(false)],
+            "a delayed earlier echo must not change the third click's intent"
         );
     }
 

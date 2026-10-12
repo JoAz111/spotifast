@@ -7,7 +7,10 @@ nav_order: 3
 Spotifast uses Spotify's
 [Web API](https://developer.spotify.com/documentation/web-api) for account and
 catalogue data. It uses [librespot](https://github.com/librespot-org/librespot)
-for a few extra details and for audio playback.
+for extra metadata. On this Mac, the official, unmodified
+[Soloist](https://developer.spotify.com/documentation/soloist) engine owns audio
+playback through an experimental Apple Silicon compatibility runtime. Other
+platforms retain the existing librespot player.
 
 Features missing from both cannot be added to Spotifast. They may become
 possible if Spotify adds an API or librespot adds lawful support.
@@ -24,22 +27,29 @@ Spotifast uses the Web API for:
 - **Playlists:** reading, creating, renaming, changing the description and
   visibility, adding and removing songs, reordering songs, and following and
   unfollowing. Custom playlist cover uploads are available since 0.9.0.
-- **Catalogue:** albums, artists, tracks, shows, episodes, search, and
-  recommendations. Artist pages include top tracks, releases, and related
-  artists.
+- **Catalogue:** albums, artists, tracks, shows, episodes and search, where
+  permitted for the user's development-mode registration. Some artist endpoints
+  remain restricted.
 - **Playback control:** listing devices, transferring playback, play, pause,
   next, previous, seek, shuffle, repeat, volume, and reading or adding to the
   queue.
 
-Users of the default app share Spotify's quota. Spotifast limits heavy
-requests and pauses a session when Spotify sends a `Retry-After` response.
+This fork uses only the user's private Web API registration. Spotify's
+[July 2026 quota policy](https://developer.spotify.com/blog/2026-07-23-web-api-quota-updates)
+counts development-mode quota per developer account across all its Client IDs.
+Spotifast paces requests and preserves the full `Retry-After` cooldown.
 
-Spotify also limits apps created since November 2024. These apps cannot access
-Spotify-owned playlists, related artists, recommendations, or audio features.
-This is why a personal app cannot handle every request. Complete playlist
-library views stay on the shared app. Playlists other people own, and every
-playlist when there is no personal app, are read over the librespot session
-while local playback is signed in. See [How It Connects](/how-it-connects/).
+Spotify's [development-mode restrictions](https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api)
+exclude the Recommendations endpoint, related artists, audio features and some
+Spotify-owned playlists. The Home listening mix instead uses a bounded Spotify
+song-radio preview through the metadata session. It is labelled "Inspired by
+your listening" and identifies its seed. It is not Spotify's complete Home
+recommendation algorithm. Unavailable music access, empty history and failures
+settle visibly, with a retry limited to the affected shelf.
+
+Supported library, search and playback surfaces include podcasts and episodes.
+Legacy saved `music_only` settings are ignored, so the interface does not hide
+them. Audiobooks remain excluded from the Podcasts shelf.
 
 ## librespot session
 
@@ -51,9 +61,8 @@ clients. Spotifast uses its session for:
 - **Playlist permissions.** The rootlist shows when a playlist shared by
   invitation can be edited. The Web API's `collaborative` flag does not cover
   these playlists. Spotifast cannot manage collaborators.
-- **Playlists the shared app would otherwise serve.** Title, cover, and
-  songs of other people's playlists, and of the account's own when there is
-  no personal app, so they open without the shared app's quota. Whether a
+- **Playlist metadata and songs.** The session can read playlists the
+  development-mode Web API cannot serve, without a shared app registration. Whether a
   playlist is public, the owner's name when the session gives none, and the
   mosaic of a playlist without a cover of its own, come from the Web API's
   library list. These rows carry
@@ -66,8 +75,8 @@ clients. Spotifast uses its session for:
 - **Library playlists the Web API lists blank.** The library list gives
   some of Spotify's own playlists, "This Is" ones among them, no name,
   cover, description, or songs. Spotifast reads each one's header over the
-  session once per sign-in to fill its row. Without local playback those
-  rows stay blank.
+  session once per sign-in to fill its row. Without music metadata access those
+  rows may remain incomplete.
 - **Lyrics** when Spotify has them.
 - **Display names** for the user IDs attached to songs in a playlist.
 - **Precise EP types** for releases that the Web API groups with singles.
@@ -93,7 +102,8 @@ librespot provides:
 Spotify Premium is required. librespot cannot play audio with a free account.
 
 Spotifast uses a small librespot fork. Its patches add queue controls,
-normalisation data for the visualisers, and an event for rejected audio keys.
+an event for rejected audio keys and metadata integration. The removed visualizer
+surfaces are not part of this fork.
 They are listed in `Cargo.toml`. Larger changes go upstream first.
 
 ## Not available
@@ -109,9 +119,12 @@ The Web API and librespot do not provide these features:
   generates these for its own clients. Spotifast only has plain shuffle.
   A Blend that a Spotify app already made opens like any playlist, with
   who added each song, but Spotifast cannot start or manage one.
-- **Lossless audio.** librespot does not receive lossless streams. Spotifast
-  will reconsider this if librespot gains lawful support, but it will not
-  bypass Spotify's DRM.
+- **Lossless through librespot.** librespot does not receive lossless streams.
+  This Mac integration instead uses Spotify's official Soloist engine, which
+  has decoded FLAC at 44.1 kHz during authenticated playback. That result does
+  not establish source bit depth or bit-perfect hardware output. Soloist's local
+  WebSocket state does not report current-track codec or quality; a preference
+  for lossless alone is insufficient evidence for a current-track badge.
 - **Local files.** librespot only streams Spotify's catalogue. It cannot fetch
   audio for a `spotify:local:` entry. Playing files from disk would require a
   separate player. See [issue #3](https://github.com/crmne/spotifast/issues/3).

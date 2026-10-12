@@ -827,12 +827,6 @@ pub struct RelatedArtists {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct Recommendations {
-    #[serde(default, deserialize_with = "skip_nulls")]
-    pub tracks: Vec<Track>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct SnapshotId {
     #[serde(default)]
     pub snapshot_id: Option<String>,

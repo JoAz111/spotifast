@@ -26,7 +26,7 @@ pub(crate) const DEVICE_BAR_HEIGHT: f32 = 24.0;
 pub(crate) const DEVICE_BAR_COLOR: Color32 = Color32::from_rgb(0x1e, 0xd7, 0x60);
 
 pub fn device_bar(app: &mut App, ui: &mut egui::Ui) {
-    let Some((name, kind)) = app.playback_device() else {
+    let Some((name, kind)) = app.external_playback_device() else {
         return;
     };
     // Translators: {device} is the name of the device playing the music.
@@ -239,7 +239,12 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
     let heart_width = if now.is_episode { 0.0 } else { 42.0 };
     let text_left = cover_rect.right() + 12.0;
     let text_width = (region.right() - text_left - heart_width).max(40.0);
-    let text_rect = Rect::from_min_size(pos2(text_left, cy - 18.0), vec2(text_width, 36.0));
+    let lossless = app.playing_lossless(now);
+    let text_height = if lossless { 52.0 } else { 36.0 };
+    let text_rect = Rect::from_min_size(
+        pos2(text_left, cy - text_height / 2.0),
+        vec2(text_width, text_height),
+    );
     let info_response = ui.interact(text_rect, egui::Id::new("now-playing-info"), drag_sense);
     let mut text_ui = ui.new_child(
         UiBuilder::new()
@@ -273,6 +278,16 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
             );
         }
     });
+    if lossless {
+        theme::text(
+            &mut text_ui,
+            "Lossless",
+            theme::medium(11.0),
+            palette.accent,
+        )
+        .on_hover_text("Spotify reports lossless playback for this track on this Mac.");
+    }
+
     if (cover_response.drag_started_by(egui::PointerButton::Primary)
         || info_response.drag_started_by(egui::PointerButton::Primary))
         && let Some(item) = &song

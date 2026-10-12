@@ -590,6 +590,12 @@ pub struct HomeData {
     pub recommendations: Loadable<Vec<Track>>,
     /// Optional shelves are requested only while enabled, once per Home refresh.
     pub recommendations_generation: u64,
+    /// A separate nonce rejects answers from an earlier shelf retry.
+    pub recommendations_request: u64,
+    pub recommendations_loading: bool,
+    pub recommendations_error: Option<String>,
+    pub recommendations_seed: Option<String>,
+    pub recommendations_pending_seed: Option<String>,
     pub discover_generation: u64,
     pub discover: HashMap<String, Loadable<Vec<Playlist>>>,
     pub discover_pending: HashMap<String, Loadable<Vec<Playlist>>>,
@@ -1096,6 +1102,7 @@ pub enum Action {
     },
     ToggleShowAllTop(String),
     Reload(Page),
+    RetryHomeRecommendations,
     SignIn,
     CancelSignIn,
     SignOut,

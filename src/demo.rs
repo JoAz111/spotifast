@@ -1333,6 +1333,175 @@ mod tests {
     }
 
     #[test]
+    fn own_soloist_playback_has_no_external_device_strip() {
+        for width in [760.0, 1240.0] {
+            for web_snapshot_only in [false, true] {
+                let (ctx, mut app) =
+                    accessible_app(&format!("own-soloist-strip-{width}-{web_snapshot_only}"));
+                app.soloist_mode = true;
+                let mut own = app.devices[0].clone();
+                own.id = Some("actual-soloist-id".into());
+                own.name = "Spotifast Soloist".into();
+                own.kind = "speaker".into();
+                own.is_active = true;
+                app.local_device_id = own.id.clone();
+                app.local_playback = crate::backend::LocalPlayback::Ready {
+                    device_id: own.id.clone().unwrap(),
+                };
+                app.devices = vec![own.clone()];
+                app.receivers.clear();
+                if web_snapshot_only {
+                    // The Web API can report our receiver before the local
+                    // playback event arrives. Its actual ID still makes it ours.
+                    app.local.playback = crate::player::Playback::Stopped;
+                    app.local.track = None;
+                    app.remote.as_mut().unwrap().state.device = Some(own);
+                } else {
+                    app.local.playback = crate::player::Playback::Playing;
+                    app.local.track = Some(crate::player::LocalTrack {
+                        uri: "spotify:track:current".into(),
+                        title: "Current song".into(),
+                        ..Default::default()
+                    });
+                    app.remote = None;
+                }
+                assert_eq!(app.playback_device().unwrap().0, "Spotifast Soloist");
+                let draw = |app: &mut App| {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 800.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| app.frame_ui(ui),
+                    );
+                    output.textures_delta.clear();
+                    output
+                };
+                draw(&mut app);
+                let output = draw(&mut app);
+                let player =
+                    egui::containers::panel::PanelState::load(&ctx, egui::Id::new("player-bar"))
+                        .unwrap()
+                        .outer_rect;
+                assert_eq!(player.bottom(), 800.0, "no space reserved for a strip");
+                assert!(
+                    egui::containers::panel::PanelState::load(
+                        &ctx,
+                        egui::Id::new("playback-device-bar")
+                    )
+                    .is_none()
+                );
+                assert!(
+                    ctx.read_response(egui::Id::new("playback-device-bar-button"))
+                        .is_none()
+                );
+                fn check_shape(shape: &egui::Shape, width: f32) {
+                    match shape {
+                        egui::Shape::Rect(shape) => assert!(
+                            shape.fill != crate::ui::player_bar::DEVICE_BAR_COLOR
+                                || shape.rect.width() < width - 1.0,
+                            "our own receiver must not paint a full-width green strip"
+                        ),
+                        egui::Shape::Text(shape) => assert!(
+                            !shape.galley.job.text.starts_with("Playing on "),
+                            "our own receiver must not be labelled as external playback"
+                        ),
+                        egui::Shape::Vec(shapes) => {
+                            for shape in shapes {
+                                check_shape(shape, width);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for shape in &output.shapes {
+                    check_shape(&shape.shape, width);
+                }
+                let tree = output.platform_output.accesskit_update.unwrap();
+                assert!(!tree.nodes.iter().any(|(_, node)| {
+                    node.label()
+                        .is_some_and(|label| label.starts_with("Playing on "))
+                }));
+                app.backend.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn soloist_device_picker_lists_its_actual_id_once() {
+        for listed in [false, true] {
+            let (ctx, mut app) = accessible_app(&format!("soloist-picker-id-{listed}"));
+            app.soloist_mode = true;
+            app.show_devices = true;
+            app.local.playback = crate::player::Playback::Playing;
+            app.local.track = Some(crate::player::LocalTrack {
+                uri: "spotify:track:current".into(),
+                ..Default::default()
+            });
+            app.remote = None;
+            let mut own = app.devices[0].clone();
+            own.id = Some("actual-soloist-id".into());
+            own.name = "Spotifast Soloist".into();
+            own.kind = "speaker".into();
+            own.is_active = true;
+            app.local_device_id = own.id.clone();
+            app.local_playback = crate::backend::LocalPlayback::Ready {
+                device_id: own.id.clone().unwrap(),
+            };
+            // Account and network discovery can describe the same actual ID.
+            app.receivers.truncate(1);
+            app.receivers[0].device_id = own.id.clone();
+            app.receivers[0].name = own.name.clone();
+            app.devices = if listed {
+                vec![own.clone(), own]
+            } else {
+                vec![]
+            };
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new(crate::ui::devices::BUTTON_RECT_ID),
+                    egui::Rect::from_min_size(egui::pos2(680.0, 580.0), egui::vec2(32.0, 32.0)),
+                );
+            });
+            let draw = |app: &mut App| {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(760.0, 620.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |_| crate::ui::devices::popup(app, &ctx),
+                );
+                output.textures_delta.clear();
+                output
+            };
+            draw(&mut app);
+            let output = draw(&mut app);
+            let labels = menu_text(&output);
+            assert_eq!(
+                labels
+                    .iter()
+                    .filter(|(text, _)| text == "Spotifast Soloist (this computer)")
+                    .count(),
+                1,
+                "the synthetic or discovered own receiver appears once: {labels:?}"
+            );
+            assert!(!labels.iter().any(|(text, _)| text == "Spotifast Soloist"));
+            assert!(
+                labels
+                    .iter()
+                    .any(|(text, _)| text == "Listening on this device")
+            );
+            app.backend.shutdown();
+        }
+    }
+
+    #[test]
     fn local_soloist_destination_has_a_real_name_and_no_inactive_banner() {
         let (ctx, mut app) = accessible_app("soloist-device-name");
         app.soloist_mode = true;
@@ -1344,10 +1513,13 @@ mod tests {
         app.remote = None;
         app.devices[0].name = "Spotifast Soloist".into();
         assert_eq!(app.playback_device().unwrap().0, "Spotifast Soloist");
+        assert!(app.external_playback_device().is_none());
         app.devices[0].name = "My Mac speakers".into();
         assert_eq!(app.playback_device().unwrap().0, "My Mac speakers");
+        assert!(app.external_playback_device().is_none());
         app.devices.clear();
         assert_eq!(app.playback_device().unwrap().0, "Spotifast Soloist");
+        assert!(app.external_playback_device().is_none());
         app.local.playback = crate::player::Playback::Stopped;
         assert!(app.playback_device().is_none());
         frame(&ctx, &mut app);
@@ -5007,7 +5179,7 @@ mod tests {
             let text = view_frame(&ctx, &mut app, vec![], view);
             for (label, expected) in [
                 ("Made for you", made_for_you),
-                ("Recommended for you", recommendations),
+                ("Inspired by your listening", recommendations),
                 ("Liked Songs", true),
                 ("Recently played", true),
                 ("Your top artists", true),

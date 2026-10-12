@@ -35,6 +35,9 @@ Initial Spotify sign-in and Connect pairing still require the user's account.
 The client connects to an owner-only Unix socket (0700 directory, 0600 socket),
 checks ownership/type/peer identity, bounds messages and commands, and rejects
 stale connection/authentication generations. No TCP WebSocket listener is exposed.
+The launcher passes the receiver identity from its owned private state file to the
+frontend. That exact identity marks Soloist as this computer and deduplicates its
+Connect row; names alone do not establish a local device.
 Spotify Connect discovery and initial pairing still use the LAN and can trigger
 macOS firewall consent for elfuse. Same-user processes and root remain trusted.
 
@@ -45,6 +48,12 @@ explicit refreshes remain available. Queue operations preserve their ordering an
 do not replay after a connection changes.
 
 ## Rate limits
+
+Since [23 July 2026](https://developer.spotify.com/blog/2026-07-23-web-api-quota-updates),
+Spotify counts development-mode quota per developer account across all its Client
+IDs. Using this user's registration removes the upstream developer's shared quota
+dependency; it does not remove Spotify's own limits. A 429 can indicate either rate
+limiting or an exhausted quota (`QUOTA_EXCEEDED`).
 
 API requests are paced at most once per 500 ms per authorization. Every queued
 request rechecks the shared cooldown after acquiring an in-flight slot. A Spotify

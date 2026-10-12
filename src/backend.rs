@@ -130,11 +130,6 @@ pub enum ApiRequest {
     TopArtists {
         generation: u64,
     },
-    Recommendations {
-        seed_tracks: Vec<String>,
-        seed_artists: Vec<String>,
-        generation: u64,
-    },
     Discover {
         term: String,
         generation: u64,
@@ -327,7 +322,6 @@ impl ApiRequest {
                 | Self::RecentlyPlayed { .. }
                 | Self::TopTracks { .. }
                 | Self::TopArtists { .. }
-                | Self::Recommendations { .. }
                 | Self::Discover { .. }
                 | Self::MyPlaylists { .. }
                 | Self::PlaylistSample { .. }
@@ -363,10 +357,6 @@ pub enum ApiResponse {
     TopArtists {
         generation: u64,
         result: ApiResult<Vec<Artist>>,
-    },
-    Recommendations {
-        generation: u64,
-        result: ApiResult<Vec<Track>>,
     },
     Discover {
         term: String,
@@ -730,6 +720,24 @@ pub enum Command {
     /// Read the headers of library playlists the Web API listed blank
     /// through the streaming session.
     PlaylistHeaders(Vec<String>),
+    /// Quality from the current metadata engine, checked before reaching the UI.
+    PlaybackQuality {
+        session_generation: u64,
+        engine_attempt: u64,
+        snapshot: Option<crate::playback_quality::QualitySnapshot>,
+    },
+    /// One bounded Spotify radio preview for the optional Home shelf.
+    HomeRecommendations {
+        seed: String,
+        generation: u64,
+    },
+    HomeRecommendationsResolved {
+        account: AccountId,
+        session_generation: u64,
+        engine_attempt: u64,
+        generation: u64,
+        result: Result<Vec<Track>, String>,
+    },
     /// Resolve Spotify's radio seeded by `seed` through the streaming session.
     Radio {
         seed: String,
@@ -771,6 +779,7 @@ pub struct LyricsRequest {
 
 pub enum Event {
     MusicSession(bool),
+    PlaybackQuality(Option<crate::playback_quality::QualitySnapshot>),
     SoloistPlayback(LocalPlayback),
     ProxyRestored {
         config: ProxyConfig,
@@ -856,6 +865,10 @@ pub enum Event {
     /// The header the streaming session read for a library playlist the
     /// Web API listed blank.
     PlaylistHeader(crate::api::models::Playlist),
+    HomeRecommendations {
+        generation: u64,
+        result: Result<Vec<Track>, String>,
+    },
     /// The songs of the radio seeded by `seed`, for the request `generation`.
     Radio {
         seed: String,
@@ -936,6 +949,8 @@ pub struct Backend {
     album_type_requests: std::sync::Mutex<Vec<Vec<String>>>,
     #[cfg(test)]
     home_episode_requests: std::sync::Mutex<Vec<(Vec<String>, u64)>>,
+    #[cfg(test)]
+    home_recommendations_requests: std::sync::Mutex<Vec<(String, u64)>>,
 }
 
 impl Backend {
@@ -1026,6 +1041,8 @@ impl Backend {
             album_type_requests: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             home_episode_requests: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            home_recommendations_requests: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1271,6 +1288,20 @@ impl Backend {
         )
     }
 
+    pub(crate) fn home_recommendations(&self, seed: String, generation: u64) {
+        #[cfg(test)]
+        self.home_recommendations_requests
+            .lock()
+            .unwrap()
+            .push((seed.clone(), generation));
+        self.send(Command::HomeRecommendations { seed, generation });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_home_recommendations_requests(&self) -> Vec<(String, u64)> {
+        std::mem::take(&mut *self.home_recommendations_requests.lock().unwrap())
+    }
+
     pub(crate) fn album_types(&self, uris: Vec<String>) {
         #[cfg(test)]
         self.album_type_requests
@@ -1483,6 +1514,7 @@ struct Worker {
     /// Playback is independent of the librespot session used for metadata.
     soloist: Option<crate::soloist::Handle>,
     soloist_ready: bool,
+    soloist_device_id: String,
     soloist_state: crate::player::LocalState,
     /// What the engine is heard at, so the engine that replaces it starts
     /// there. `engine_config` alone knows only the level the app launched
@@ -1500,6 +1532,9 @@ struct Worker {
     playlist_header_lookup: PlaylistHeaderLookup,
     /// Radios asked for before the streaming session was ready, by seed.
     radio_waiting: BTreeMap<String, u64>,
+    /// Home keeps at most one station read, replaced by a newer shelf request.
+    home_recommendations_task: Option<tokio::task::JoinHandle<()>>,
+    home_recommendations_request: Option<u64>,
     /// True while a playback grant or engine connection is in flight, so a
     /// second attempt does not pile up.
     engine_busy: bool,
@@ -1538,6 +1573,15 @@ impl Worker {
         waker: Waker,
     ) -> Self {
         let session = watch::channel(0).0;
+        let soloist_device_id = std::env::var("SPOTIFAST_SOLOIST_DEVICE_ID")
+            .ok()
+            .filter(|id| {
+                (8..=64).contains(&id.len())
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+            .unwrap_or_else(|| "soloist-local".into());
         let soloist = std::env::var_os("SPOTIFAST_SOLOIST_SOCKET").map(|path| {
             let commands = commands.clone();
             let session = session.clone();
@@ -1579,6 +1623,7 @@ impl Worker {
             engine: None,
             soloist,
             soloist_ready: false,
+            soloist_device_id,
             soloist_state: crate::player::LocalState::default(),
             heard: None,
             rootlist_pending: false,
@@ -1586,6 +1631,8 @@ impl Worker {
             audiobook_lookup: BTreeSet::new(),
             playlist_header_lookup: PlaylistHeaderLookup::default(),
             radio_waiting: BTreeMap::new(),
+            home_recommendations_task: None,
+            home_recommendations_request: None,
             engine_busy: false,
             search_tasks: Vec::new(),
             engine_restart_pending: false,
@@ -1826,7 +1873,10 @@ impl Worker {
                         waker.wake();
                     });
                 }
-                Command::Shutdown => break,
+                Command::Shutdown => {
+                    self.cancel_home_recommendations();
+                    break;
+                }
                 Command::SignIn { request, config } => self.change_proxy(request, config, true),
                 Command::CancelSignIn => {
                     self.authorization_attempt += 1;
@@ -1901,8 +1951,16 @@ impl Worker {
                         ));
                         continue;
                     }
-                    // The local protocol has no context-offset or track-list load.
-                    // Preserve these through the official Web API after activation.
+                    // Preserve context offsets through the Web API. Unchanged
+                    // options are already held by the active local receiver and
+                    // must not add a paced request before every selected song.
+                    let mut spec = spec;
+                    if spec.repeat == Some(self.soloist_state.repeat) {
+                        spec.repeat = None;
+                    }
+                    if spec.shuffle == Some(self.soloist_state.shuffle) {
+                        spec.shuffle = None;
+                    }
                     self.dispatch_web(ApiRequest::SoloistPlay(spec));
                 }
                 Command::Api(ApiRequest::Queue { seq })
@@ -2218,6 +2276,35 @@ impl Worker {
                     self.playlist_header_lookup.enqueue(ids);
                     self.start_playlist_header_lookup();
                 }
+                Command::PlaybackQuality {
+                    session_generation,
+                    engine_attempt,
+                    snapshot,
+                } => {
+                    if self.signed_in
+                        && self.soloist.is_some()
+                        && session_generation == self.album_type_lookup.session_generation
+                        && engine_attempt == self.engine_attempt
+                    {
+                        self.emit(Event::PlaybackQuality(snapshot));
+                    }
+                }
+                Command::HomeRecommendations { seed, generation } => {
+                    self.start_home_recommendations(seed, generation);
+                }
+                Command::HomeRecommendationsResolved {
+                    account,
+                    session_generation,
+                    engine_attempt,
+                    generation,
+                    result,
+                } => self.on_home_recommendations(
+                    account,
+                    session_generation,
+                    engine_attempt,
+                    generation,
+                    result,
+                ),
                 Command::Radio { seed, generation } => {
                     self.radio_waiting.insert(seed, generation);
                     self.start_radio();
@@ -2771,6 +2858,7 @@ impl Worker {
         self.audiobook_lookup.clear();
         self.playlist_header_lookup.clear_engine_work();
         self.radio_waiting.clear();
+        self.cancel_home_recommendations();
         self.carry_volume();
         if let Some(engine) = self.engine.take() {
             engine.shutdown();
@@ -2837,7 +2925,7 @@ impl Worker {
         }
         self.emit(Event::SoloistPlayback(if self.soloist_ready {
             LocalPlayback::Ready {
-                device_id: "soloist-local".into(),
+                device_id: self.soloist_device_id.clone(),
             }
         } else {
             LocalPlayback::Unavailable
@@ -2858,6 +2946,8 @@ impl Worker {
 
     fn engine_notify(&self) -> crate::player::Notify {
         let soloist_playback = self.soloist.is_some();
+        let session_generation = self.album_type_lookup.session_generation;
+        let engine_attempt = self.engine_attempt;
         let events = self.events.clone();
         let commands = self.commands.clone();
         let waker = self.waker.clone();
@@ -2871,6 +2961,15 @@ impl Worker {
                     if !soloist_playback {
                         let _ = events.send(Event::Local(Box::new(state)));
                         waker.wake();
+                    }
+                }
+                EngineEvent::Quality(snapshot) => {
+                    if soloist_playback {
+                        let _ = commands.send(Command::PlaybackQuality {
+                            session_generation,
+                            engine_attempt,
+                            snapshot,
+                        });
                     }
                 }
                 EngineEvent::SessionEnded => {
@@ -2977,6 +3076,7 @@ impl Worker {
     /// comes back at the level it was heard at, not at the level the app
     /// launched with.
     fn take_engine_for_resume(&mut self) {
+        self.emit(Event::PlaybackQuality(None));
         self.resume_verify = None;
         self.album_type_lookup.requeue_active_for_new_engine();
         self.playlist_header_lookup.requeue_active_for_new_engine();
@@ -3547,6 +3647,81 @@ impl Worker {
         self.start_playlist_header_lookup();
     }
 
+    fn cancel_home_recommendations(&mut self) {
+        if let Some(task) = self.home_recommendations_task.take() {
+            task.abort();
+        }
+        self.home_recommendations_request = None;
+    }
+
+    fn start_home_recommendations(&mut self, seed: String, generation: u64) {
+        self.cancel_home_recommendations();
+        let account = self.api.account();
+        let engine = self.engine.clone().filter(|engine| {
+            self.signed_in && same_account(&engine.session().username(), account.as_ref())
+        });
+        let (Some(account), Some(engine), Some(station)) =
+            (account, engine, crate::util::station_uri(&seed))
+        else {
+            self.emit(Event::HomeRecommendations {
+                generation,
+                result: Err("Connect Spotify music access to load your listening mix.".into()),
+            });
+            return;
+        };
+        self.start_home_recommendations_read(account, generation, async move {
+            session_reads::station_preview(engine.session(), &station).await
+        });
+    }
+
+    fn start_home_recommendations_read<F>(&mut self, account: AccountId, generation: u64, read: F)
+    where
+        F: std::future::Future<Output = anyhow::Result<Vec<Track>>> + Send + 'static,
+    {
+        self.cancel_home_recommendations();
+        self.home_recommendations_request = Some(generation);
+        let session_generation = *self.session.borrow();
+        let engine_attempt = self.engine_attempt;
+        let commands = self.commands.clone();
+        self.home_recommendations_task = Some(tokio::spawn(async move {
+            let result = home_recommendations_result(read).await;
+            let _ = commands.send(Command::HomeRecommendationsResolved {
+                account,
+                session_generation,
+                engine_attempt,
+                generation,
+                result,
+            });
+        }));
+    }
+
+    fn on_home_recommendations(
+        &mut self,
+        account: AccountId,
+        session_generation: u64,
+        engine_attempt: u64,
+        generation: u64,
+        result: Result<Vec<Track>, String>,
+    ) {
+        if self.home_recommendations_request != Some(generation) {
+            return;
+        }
+        self.home_recommendations_task.take();
+        self.home_recommendations_request = None;
+        if !self.signed_in
+            || session_generation != *self.session.borrow()
+            || self.api.account().as_ref() != Some(&account)
+        {
+            return;
+        }
+        let result = if engine_attempt == self.engine_attempt {
+            result
+        } else {
+            Err("Spotify music access changed. Retry your listening mix.".into())
+        };
+        self.emit(Event::HomeRecommendations { generation, result });
+    }
+
     /// Resolves the waiting radios once the streaming session is ready; the
     /// Web API has no stations.
     fn start_radio(&mut self) {
@@ -3872,9 +4047,9 @@ fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
         | ApiRequest::ReorderPlaylist { playlist_id, .. } => {
             Operation::PlaylistMutation(api.playlist_access(playlist_id))
         }
-        ApiRequest::Recommendations { .. }
-        | ApiRequest::ArtistTopTracks { .. }
-        | ApiRequest::RelatedArtists { .. } => Operation::UnsupportedDevelopmentMode,
+        ApiRequest::ArtistTopTracks { .. } | ApiRequest::RelatedArtists { .. } => {
+            Operation::UnsupportedDevelopmentMode
+        }
         ApiRequest::Artist { .. }
         | ApiRequest::ArtistAlbums { .. }
         | ApiRequest::Album { .. }
@@ -4024,14 +4199,6 @@ async fn handle(
         ApiRequest::TopArtists { generation } => ApiResponse::TopArtists {
             generation,
             result: routed!(top_artists("medium_term", 20)).map(|page| page.items),
-        },
-        ApiRequest::Recommendations {
-            seed_tracks,
-            seed_artists,
-            generation,
-        } => ApiResponse::Recommendations {
-            generation,
-            result: routed!(recommendations(&seed_tracks, &seed_artists, 20)),
         },
         ApiRequest::Discover { term, generation } => {
             let result = routed!(search(&term, &["playlist"]))
@@ -4489,6 +4656,30 @@ async fn over_connect(
         }
         _ => return None,
     })
+}
+
+/// Home consumes one existing Spotify station, with a strict deadline and row cap.
+async fn home_recommendations_result<F>(read: F) -> Result<Vec<Track>, String>
+where
+    F: std::future::Future<Output = anyhow::Result<Vec<Track>>>,
+{
+    let tracks = match tokio::time::timeout(RADIO_TIMEOUT, read).await {
+        Ok(Ok(tracks)) => tracks,
+        Ok(Err(_)) => return Err("Couldn't load your listening mix. Try again.".into()),
+        Err(_) => return Err("Spotify took too long to answer. Try again.".into()),
+    };
+    let mut seen = HashSet::new();
+    Ok(tracks
+        .into_iter()
+        .filter(|track| {
+            !track.is_local
+                && track.is_playable != Some(false)
+                && track.uri.starts_with("spotify:track:")
+                && crate::util::station_uri(&track.uri).is_some()
+                && seen.insert(track.uri.clone())
+        })
+        .take(20)
+        .collect())
 }
 
 /// Waits for shuffle to succeed before starting playback, preserving either error.
@@ -5657,6 +5848,139 @@ fn playback_credentials(account: Option<AccountId>, access_token: String) -> Opt
             librespot_protocol::authentication::AuthenticationType::AUTHENTICATION_SPOTIFY_TOKEN,
         auth_data: access_token.into_bytes(),
     })
+}
+
+#[cfg(test)]
+mod home_recommendations_tests {
+    use super::authorization_tests::worker;
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn home_mix_read_has_a_deadline_and_caps_unique_playable_rows() {
+        let tracks: Vec<Track> = (0..100)
+            .map(|index| Track {
+                uri: format!("spotify:track:{}", index / 2),
+                is_local: index < 4,
+                is_playable: if index == 4 || index == 5 {
+                    Some(false)
+                } else {
+                    None
+                },
+                ..Default::default()
+            })
+            .collect();
+        let preview = home_recommendations_result(async { Ok(tracks) })
+            .await
+            .unwrap();
+        assert_eq!(preview.len(), 20);
+        assert_eq!(preview[0].uri, "spotify:track:3");
+        assert_eq!(preview.last().unwrap().uri, "spotify:track:22");
+        let started = tokio::time::Instant::now();
+        let error = home_recommendations_result(std::future::pending())
+            .await
+            .unwrap_err();
+        assert!(error.contains("too long"));
+        assert_eq!(started.elapsed(), RADIO_TIMEOUT);
+    }
+
+    #[test]
+    fn home_mix_missing_session_fails_immediately_and_replacement_cancels_work() {
+        let (runtime, mut worker, events) = worker("home-mix-cancellation");
+        let _entered = runtime.enter();
+        worker.start_home_recommendations("spotify:track:seed".into(), 1);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::HomeRecommendations {
+                generation: 1,
+                result: Err(_)
+            })
+        ));
+        assert!(worker.home_recommendations_task.is_none());
+        worker.signed_in = true;
+        let account = AccountId::new("fixture-account");
+        worker
+            .api
+            .install(ApiSource::Shared, account.clone())
+            .unwrap();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        worker.commands = sender;
+        worker.start_home_recommendations_read(account.clone(), 2, std::future::pending());
+        let previous = worker
+            .home_recommendations_task
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        runtime.block_on(tokio::task::yield_now());
+        worker.start_home_recommendations_read(account.clone(), 3, async { Ok(Vec::new()) });
+        let command = runtime.block_on(receiver.recv()).unwrap();
+        assert!(previous.is_finished());
+        let Command::HomeRecommendationsResolved {
+            account,
+            session_generation,
+            engine_attempt,
+            generation,
+            result,
+        } = command
+        else {
+            panic!("expected Home station result");
+        };
+        assert_eq!(generation, 3);
+        worker.on_home_recommendations(
+            account.clone(),
+            session_generation,
+            engine_attempt,
+            generation,
+            result,
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::HomeRecommendations {
+                generation: 3,
+                result: Ok(_)
+            })
+        ));
+        worker.start_home_recommendations_read(account, 4, std::future::pending());
+        let pending = worker
+            .home_recommendations_task
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        worker.sign_out();
+        runtime.block_on(tokio::task::yield_now());
+        assert!(pending.is_finished());
+        assert!(worker.home_recommendations_request.is_none());
+    }
+
+    #[test]
+    fn home_mix_results_are_bound_to_account_session_engine_and_latest_request() {
+        let (_runtime, mut worker, events) = worker("home-mix-result-binding");
+        worker.signed_in = true;
+        let account = AccountId::new("fixture-account");
+        worker
+            .api
+            .install(ApiSource::Shared, account.clone())
+            .unwrap();
+        let epoch = *worker.session.borrow();
+        for (request, returned_account, session) in [
+            (6, account.clone(), epoch),
+            (7, AccountId::new("other-account"), epoch),
+            (7, account.clone(), epoch.wrapping_add(1)),
+        ] {
+            worker.home_recommendations_request = Some(7);
+            worker.on_home_recommendations(returned_account, session, 0, request, Ok(Vec::new()));
+            assert!(events.try_recv().is_err());
+        }
+        worker.home_recommendations_request = Some(7);
+        worker.engine_attempt = 1;
+        worker.on_home_recommendations(account, epoch, 0, 7, Ok(Vec::new()));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::HomeRecommendations {
+                generation: 7,
+                result: Err(_)
+            })
+        ));
+    }
 }
 
 #[cfg(test)]

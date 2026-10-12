@@ -80,7 +80,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     dialogs::show(app, ctx);
     update::show(app, ctx);
     widgets::drag_ghost(ctx, &app.palette, app.locale);
-    let device_height = if app.playback_device().is_some() {
+    let device_height = if app.external_playback_device().is_some() {
         player_bar::DEVICE_BAR_HEIGHT
     } else {
         0.0

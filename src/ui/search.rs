@@ -855,7 +855,7 @@ mod music_tests {
 
     #[cfg(feature = "demo")]
     #[test]
-    fn music_views_hide_spoken_audio_and_keep_music_navigation() {
+    fn restored_views_include_podcasts_and_keep_music_navigation() {
         let root =
             std::env::temp_dir().join(format!("spotifast-music-views-{}", std::process::id()));
         let ctx = egui::Context::default();
@@ -866,7 +866,7 @@ mod music_tests {
                 state: root.join("state"),
                 cache: root.join("cache"),
             },
-            crate::settings::Settings::default(),
+            serde_json::from_str(r#"{"music_only":true}"#).unwrap(),
             crate::app::AppOptions {
                 media_controls: false,
                 restore_sign_in: false,
@@ -876,7 +876,10 @@ mod music_tests {
         app.attach(&ctx);
         crate::demo::populate(&mut app);
         app.locale = crate::i18n::Locale::English;
-        assert!(app.settings.music_only);
+        assert!(
+            !app.settings.music_only,
+            "legacy settings restore every media type"
+        );
         type View = fn(&mut App, &mut egui::Ui);
         for (view, spoken, music) in [
             (
@@ -887,13 +890,13 @@ mod music_tests {
             (super::super::sidebar::show as View, "Podcasts", "Albums"),
             (show as View, "Podcasts", "Songs"),
         ] {
-            for music_only in [false, true] {
-                app.settings.music_only = music_only;
-                painted_text(&ctx, &mut app, view);
-                let labels = painted_text(&ctx, &mut app, view);
-                assert_eq!(labels.iter().any(|label| label == spoken), !music_only);
-                assert!(labels.iter().any(|label| label == music));
-            }
+            painted_text(&ctx, &mut app, view);
+            let labels = painted_text(&ctx, &mut app, view);
+            assert!(
+                labels.iter().any(|label| label == spoken),
+                "missing {spoken}"
+            );
+            assert!(labels.iter().any(|label| label == music), "missing {music}");
         }
         let sidebar_filter = egui::Id::new("sidebar-filter");
         ctx.data_mut(|data| {
@@ -902,20 +905,38 @@ mod music_tests {
         painted_text(&ctx, &mut app, super::super::sidebar::show);
         assert_eq!(
             ctx.data(|data| data.get_temp::<crate::settings::LibraryShelf>(sidebar_filter)),
-            Some(crate::settings::LibraryShelf::Playlists)
+            Some(crate::settings::LibraryShelf::Podcasts)
         );
+        let show_title = app
+            .search
+            .results
+            .get()
+            .unwrap()
+            .shows
+            .as_ref()
+            .unwrap()
+            .items[0]
+            .name
+            .clone();
+        app.search.filter = SearchFilter::Podcasts;
+        painted_text(&ctx, &mut app, show);
+        let labels = painted_text(&ctx, &mut app, show);
+        assert!(labels.iter().any(|label| label == &show_title));
         let results = app.search.results.get_mut().unwrap();
         results.tracks = None;
         results.artists = None;
         results.albums = None;
         results.playlists = None;
+        let episode_title = results.episodes.as_ref().unwrap().items[0].name.clone();
         app.search.filter = SearchFilter::Episodes;
         app.actions.clear();
         painted_text(&ctx, &mut app, show);
         let labels = painted_text(&ctx, &mut app, show);
-        assert!(labels.iter().any(|label| label.starts_with("No results")));
+        assert!(labels.iter().any(|label| label == &episode_title));
+        assert!(!labels.iter().any(|label| label.starts_with("No results")));
+        assert_eq!(app.search.filter, SearchFilter::Episodes);
         assert!(
-            app.actions
+            !app.actions
                 .iter()
                 .any(|action| matches!(action, Action::SetSearchFilter(SearchFilter::All)))
         );

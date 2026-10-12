@@ -261,10 +261,10 @@ index 3cf25c3..cfd04f4 100644
 -Developer ID signing/notarization need separate review before any public release.
 +`credential store` prompts without echo; `run --websocket on` uses the private Unix transport. A custom `SOLOIST_RUNTIME_HOME` must be a canonical dedicated private directory, explicitly initialized by configure/run. Reset never initializes a directory itself.
 diff --git a/packaging/launcher.m b/packaging/launcher.m
-index bd939f5..c255c3b 100644
+index bd939f5..d36d7eb 100644
 --- a/packaging/launcher.m
 +++ b/packaging/launcher.m
-@@ -1,11 +1,46 @@
+@@ -1,11 +1,74 @@
  #import <AppKit/AppKit.h>
  #import <ServiceManagement/ServiceManagement.h>
  #include <string.h>
@@ -273,9 +273,37 @@ index bd939f5..c255c3b 100644
 +#include <sys/stat.h>
 +#include <sys/un.h>
 +#include <unistd.h>
++#include <fcntl.h>
  
  static NSString *const KeyMask = @"••••••••";
  
++// The official engine persists its public Connect identifier in its private
++// state directory. Never infer local identity from a user-editable device name.
++static NSString *ReceiverDeviceID(NSURL *state) {
++    struct stat directory, node;
++    if (lstat(state.fileSystemRepresentation, &directory) != 0 ||
++        !S_ISDIR(directory.st_mode) || directory.st_uid != geteuid() ||
++        (directory.st_mode & 0777) != 0700) return nil;
++    NSURL *url = [state URLByAppendingPathComponent:@".device_id"];
++    int descriptor = open(url.fileSystemRepresentation, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
++    if (descriptor < 0) return nil;
++    char bytes[129];
++    ssize_t length = -1;
++    if (fstat(descriptor, &node) == 0 && S_ISREG(node.st_mode) &&
++        node.st_uid == geteuid() && !(node.st_mode & 0022) && node.st_size <= 128)
++        length = read(descriptor, bytes, sizeof(bytes));
++    close(descriptor);
++    if (length <= 0 || length >= (ssize_t)sizeof(bytes)) return nil;
++    NSString *identifier = [[[NSString alloc] initWithBytes:bytes length:(NSUInteger)length
++        encoding:NSASCIIStringEncoding] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
++    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:
++        @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-"];
++    if (identifier.length < 8 || identifier.length > 64 ||
++        [identifier rangeOfCharacterFromSet:allowed.invertedSet].location != NSNotFound) return nil;
++    return identifier;
++}
++
++
 +static NSMenu *StandardMainMenu(void) {
 +    NSMenu *menu = [NSMenu new];
 +    NSMenuItem *application = [NSMenuItem new];
@@ -311,7 +339,7 @@ index bd939f5..c255c3b 100644
  @property NSTextField *engine;
  @property NSTextField *deviceName;
  @property NSTextField *key;
-@@ -13,7 +48,6 @@ static NSString *const KeyMask = @"••••••••";
+@@ -13,7 +76,6 @@ static NSString *const KeyMask = @"••••••••";
  @property NSTextField *expiry;
  @property NSButton *websocket;
  @property NSButton *runOnLogin;
@@ -319,7 +347,7 @@ index bd939f5..c255c3b 100644
  @property NSPopUpButton *audioOutput;
  @property NSButton *start;
  @property NSButton *stop;
-@@ -24,13 +58,31 @@ static NSString *const KeyMask = @"••••••••";
+@@ -24,13 +86,31 @@ static NSString *const KeyMask = @"••••••••";
  @property BOOL pendingStart;
  @property BOOL autoStart;
  @property BOOL credentialEdited;
@@ -351,7 +379,7 @@ index bd939f5..c255c3b 100644
  - (NSTextField *)label:(NSString *)text size:(CGFloat)size {
      NSTextField *label = [NSTextField wrappingLabelWithString:text];
      label.font = [NSFont systemFontOfSize:size];
-@@ -38,120 +90,124 @@ static NSString *const KeyMask = @"••••••••";
+@@ -38,120 +118,124 @@ static NSString *const KeyMask = @"••••••••";
  }
  - (void)applicationDidFinishLaunching:(NSNotification *)notification {
      (void)notification;
@@ -491,12 +519,12 @@ index bd939f5..c255c3b 100644
      SMAppServiceStatus loginStatus = SMAppService.mainAppService.status;
 -    self.runOnLogin.state = (loginStatus == SMAppServiceStatusEnabled ||
 -                             loginStatus == SMAppServiceStatusRequiresApproval)
-+    self.runOnLogin.state = (loginStatus == SMAppServiceStatusEnabled || loginStatus == SMAppServiceStatusRequiresApproval)
-         ? NSControlStateValueOn : NSControlStateValueOff;
+-        ? NSControlStateValueOn : NSControlStateValueOff;
 -    [stack addArrangedSubview:self.runOnLogin];
 -    self.autoStartOnLaunch = [NSButton checkboxWithTitle:@"Auto start on launch" target:self action:@selector(autoStartChanged:)];
 -    self.autoStartOnLaunch.state = [[NSUserDefaults standardUserDefaults] boolForKey:@"autoStartOnLaunch"]
--        ? NSControlStateValueOn : NSControlStateValueOff;
++    self.runOnLogin.state = (loginStatus == SMAppServiceStatusEnabled || loginStatus == SMAppServiceStatusRequiresApproval)
+         ? NSControlStateValueOn : NSControlStateValueOff;
 -    [stack addArrangedSubview:self.autoStartOnLaunch];
 -    self.start = [NSButton buttonWithTitle:@"Start" target:self action:@selector(start:)];
 -    self.stop = [NSButton buttonWithTitle:@"Stop" target:self action:@selector(stop:)];
@@ -558,7 +586,7 @@ index bd939f5..c255c3b 100644
      NSData *data = [NSData dataWithContentsOfURL:config];
      NSDictionary *settings = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
      if ([settings[@"soloist"] isKindOfClass:NSString.class]) self.engine.stringValue = settings[@"soloist"];
-@@ -173,7 +229,9 @@ static NSString *const KeyMask = @"••••••••";
+@@ -173,7 +257,9 @@ static NSString *const KeyMask = @"••••••••";
          : [NSString stringWithFormat:@"Soloist %@ expected expiry: %@ (%ld days left).", version, date, (long)(remaining / 86400)];
  }
  - (void)refreshCredentialStatus {
@@ -568,7 +596,7 @@ index bd939f5..c255c3b 100644
      task.executableURL = self.helper;
      task.arguments = @[@"credential", @"status"];
      NSPipe *output = [NSPipe pipe];
-@@ -183,8 +241,16 @@ static NSString *const KeyMask = @"••••••••";
+@@ -183,8 +269,16 @@ static NSString *const KeyMask = @"••••••••";
          NSData *data = [output.fileHandleForReading readDataToEndOfFile];
          NSDictionary *reply = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
          dispatch_async(dispatch_get_main_queue(), ^{
@@ -586,7 +614,7 @@ index bd939f5..c255c3b 100644
              if (!self.key.currentEditor && !self.key.stringValue.length && self.hasSavedKey)
                  self.key.stringValue = KeyMask;
              if (self.autoStart && self.hasSavedKey && !self.task) {
-@@ -194,8 +260,22 @@ static NSString *const KeyMask = @"••••••••";
+@@ -194,8 +288,22 @@ static NSString *const KeyMask = @"••••••••";
          });
      };
      NSError *error = nil;
@@ -611,7 +639,7 @@ index bd939f5..c255c3b 100644
  }
  - (void)controlTextDidBeginEditing:(NSNotification *)notification {
      if (notification.object == self.key && [self.key.stringValue isEqualToString:KeyMask])
-@@ -212,6 +292,7 @@ static NSString *const KeyMask = @"••••••••";
+@@ -212,6 +320,7 @@ static NSString *const KeyMask = @"••••••••";
          if (self.hasSavedKey) self.key.stringValue = KeyMask;
          return;
      }
@@ -619,7 +647,7 @@ index bd939f5..c255c3b 100644
      [self saveKey:value];
  }
  - (BOOL)saveDeviceName {
-@@ -312,11 +393,14 @@ static NSString *const KeyMask = @"••••••••";
+@@ -312,11 +421,14 @@ static NSString *const KeyMask = @"••••••••";
          self.pendingStart = NO;
          self.status.stringValue = @"The API key must be one nonempty line of at most 4096 bytes.";
          self.key.stringValue = self.hasSavedKey ? KeyMask : @"";
@@ -634,7 +662,7 @@ index bd939f5..c255c3b 100644
      [self.window.undoManager removeAllActions];
      self.status.stringValue = @"Saving API key in macOS Keychain…";
      NSTask *task = [NSTask new];
-@@ -334,6 +418,7 @@ static NSString *const KeyMask = @"••••••••";
+@@ -334,6 +446,7 @@ static NSString *const KeyMask = @"••••••••";
              self.savingKey = NO;
              if (finished.terminationStatus == 0) {
                  self.hasSavedKey = YES;
@@ -642,7 +670,7 @@ index bd939f5..c255c3b 100644
                  if (self.pendingStart) {
                      self.pendingStart = NO;
                      [self start:nil];
-@@ -364,11 +449,6 @@ static NSString *const KeyMask = @"••••••••";
+@@ -364,11 +477,6 @@ static NSString *const KeyMask = @"••••••••";
      [[NSUserDefaults standardUserDefaults] setBool:self.websocket.state == NSControlStateValueOn forKey:@"enableWebSocket"];
      if (self.task) self.status.stringValue = @"WebSocket setting saved; restart the receiver to apply it.";
  }
@@ -654,7 +682,7 @@ index bd939f5..c255c3b 100644
  - (void)loginChanged:(id)sender {
      (void)sender;
      SMAppService *service = SMAppService.mainAppService;
-@@ -393,8 +473,11 @@ static NSString *const KeyMask = @"••••••••";
+@@ -393,8 +501,11 @@ static NSString *const KeyMask = @"••••••••";
      panel.canChooseDirectories = NO;
      panel.allowsMultipleSelection = NO;
      panel.message = @"Select the extracted official Linux ARM64 Soloist executable.";
@@ -668,7 +696,7 @@ index bd939f5..c255c3b 100644
      }];
  }
  - (void)download:(id)sender {
-@@ -407,6 +490,7 @@ static NSString *const KeyMask = @"••••••••";
+@@ -407,6 +518,7 @@ static NSString *const KeyMask = @"••••••••";
  }
  - (void)start:(id)sender {
      (void)sender;
@@ -676,7 +704,7 @@ index bd939f5..c255c3b 100644
      if (![self saveDeviceName]) return;
      if (self.savingKey) {
          self.pendingStart = YES;
-@@ -418,8 +502,14 @@ static NSString *const KeyMask = @"••••••••";
+@@ -418,8 +530,14 @@ static NSString *const KeyMask = @"••••••••";
          [self saveKey:self.key.stringValue];
          return;
      }
@@ -692,7 +720,7 @@ index bd939f5..c255c3b 100644
          return;
      }
      self.start.enabled = NO;
-@@ -467,17 +557,18 @@ static NSString *const KeyMask = @"••••••••";
+@@ -467,17 +585,18 @@ static NSString *const KeyMask = @"••••••••";
          self.stop.enabled = YES;
          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
              if (self.task == check && check.running) {
@@ -713,7 +741,7 @@ index bd939f5..c255c3b 100644
                         self.websocket.state == NSControlStateValueOn ? @"on" : @"off",
                         @"--device-name", self.deviceName.stringValue, @"--audio-output-uid", uid];
      task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
-@@ -488,7 +579,13 @@ static NSString *const KeyMask = @"••••••••";
+@@ -488,7 +607,13 @@ static NSString *const KeyMask = @"••••••••";
              self.receiverRunning = NO;
              self.start.enabled = YES;
              self.stop.enabled = NO;
@@ -728,7 +756,7 @@ index bd939f5..c255c3b 100644
              if (self.quitting && !self.savingKey) [NSApp replyToApplicationShouldTerminate:YES];
          });
      };
-@@ -502,13 +599,169 @@ static NSString *const KeyMask = @"••••••••";
+@@ -502,13 +627,174 @@ static NSString *const KeyMask = @"••••••••";
      }
      self.stop.enabled = YES;
      self.receiverRunning = YES;
@@ -810,6 +838,11 @@ index bd939f5..c255c3b 100644
 +        frontend.executableURL = self.frontendURL;
 +        NSMutableDictionary *environment = [NSProcessInfo.processInfo.environment mutableCopy];
 +        environment[@"SPOTIFAST_SOLOIST_SOCKET"] = path;
++        NSURL *state = [self.configurationURL URLByDeletingLastPathComponent];
++        NSString *deviceID = ReceiverDeviceID(state);
++        [environment removeObjectForKey:@"SPOTIFAST_SOLOIST_DEVICE_ID"];
++        if (deviceID) environment[@"SPOTIFAST_SOLOIST_DEVICE_ID"] = deviceID;
++
 +        frontend.environment = environment;
 +        frontend.standardOutput = [NSFileHandle fileHandleWithNullDevice];
 +        frontend.standardError = [NSFileHandle fileHandleWithNullDevice];
@@ -900,7 +933,7 @@ index bd939f5..c255c3b 100644
  }
  - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
      (void)sender;
-@@ -519,12 +772,15 @@ static NSString *const KeyMask = @"••••••••";
+@@ -519,12 +805,15 @@ static NSString *const KeyMask = @"••••••••";
  }
  - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
      (void)sender;
@@ -1900,10 +1933,10 @@ index 46d2f6d..5f8fb16 100644
 + }
 diff --git a/probes/launcher-menu-test.m b/probes/launcher-menu-test.m
 new file mode 100644
-index 0000000..311a1c4
+index 0000000..5566402
 --- /dev/null
 +++ b/probes/launcher-menu-test.m
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,78 @@
 +/* Offscreen native shortcut routing fixture. Never reads the system clipboard or Keychain. */
 +#define main launcher_application_main
 +#include "../packaging/launcher.m"
@@ -1933,8 +1966,35 @@ index 0000000..311a1c4
 +}
 +@end
 +
++static void TestReceiverDeviceID(void) {
++    char directory[] = "/private/tmp/spotifast-device-fixture-XXXXXX";
++    NSCAssert(mkdtemp(directory), @"temporary fixture directory");
++    NSURL *root = [NSURL fileURLWithFileSystemRepresentation:directory isDirectory:YES relativeToURL:nil];
++    NSURL *file = [root URLByAppendingPathComponent:@".device_id"];
++    NSString *identifier = @"00000000-0000-0000-0000-000000000000";
++    NSCAssert(!ReceiverDeviceID(root), @"missing identity is unknown");
++    NSCAssert([identifier writeToURL:file atomically:YES encoding:NSASCIIStringEncoding error:nil], @"write fixture");
++    NSCAssert([ReceiverDeviceID(root) isEqualToString:identifier], @"owned public Connect ID is accepted");
++    NSCAssert(chmod(file.fileSystemRepresentation, 0666) == 0, @"set insecure mode");
++    NSCAssert(!ReceiverDeviceID(root), @"writable identity cannot classify a remote device as local");
++    NSCAssert(chmod(file.fileSystemRepresentation, 0600) == 0, @"restore private mode");
++    NSCAssert(chmod(directory, 0755) == 0, @"set directory mode");
++    NSCAssert(!ReceiverDeviceID(root), @"public state directory is rejected");
++    NSCAssert(chmod(directory, 0700) == 0, @"restore private state mode");
++    NSCAssert([@"../other-device" writeToURL:file atomically:YES encoding:NSASCIIStringEncoding error:nil], @"write invalid fixture");
++    NSCAssert(!ReceiverDeviceID(root), @"only a bounded Connect identifier is accepted");
++    NSURL *target = [root URLByAppendingPathComponent:@"target"];
++    NSCAssert([identifier writeToURL:target atomically:YES encoding:NSASCIIStringEncoding error:nil], @"write link target");
++    NSCAssert(unlink(file.fileSystemRepresentation) == 0, @"remove old fixture");
++    NSCAssert(symlink(target.fileSystemRepresentation, file.fileSystemRepresentation) == 0, @"create link fixture");
++    NSCAssert(!ReceiverDeviceID(root), @"symlink identity is rejected");
++    NSCAssert([NSFileManager.defaultManager removeItemAtURL:root error:nil], @"remove only fixture directory");
++    puts("owned receiver identity fixture passed; no real account or receiver state read");
++}
++
 +int main(void) {
 +    @autoreleasepool {
++        TestReceiverDeviceID();
 +        FixtureApplication *app = [FixtureApplication sharedApplication];
 +        app.fixtureWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,200,100)
 +            styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:YES];
@@ -2491,6 +2551,149 @@ index 0000000..f8a5b23
 +        match = re.search(r"\bsample format:\s*([a-zA-Z0-9-]{1,32})\b", line, re.IGNORECASE)
 +        if match and match[1].lower() in FORMATS:
 +            self.record("sample_format", match[1].lower())
+diff --git a/scripts/lifecycle.py b/scripts/lifecycle.py
+index 52a45d9..51ed178 100644
+--- a/scripts/lifecycle.py
++++ b/scripts/lifecycle.py
+@@ -2,6 +2,7 @@
+ from dataclasses import dataclass
+ import os
+ import selectors
++import signal
+ import subprocess
+ import time
+ 
+@@ -13,9 +14,70 @@ class Exit:
+     forced: bool
+ 
+ 
++class HealthCheck:
++    """One owned, bounded subprocess; no polling threads or overlapping checks."""
++    MAX_OUTPUT = 4096
++
++    def __init__(self, command, environment, *, completed=None, timeout=8):
++        self.completed = completed
++        self.deadline = time.monotonic() + timeout
++        self.output = bytearray()
++        self.process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE,
++                                        stderr=subprocess.DEVNULL, start_new_session=True)
++        os.set_blocking(self.process.stdout.fileno(), False)
++        self.closed = False
++
++    def poll(self, now):
++        """None means pending; every terminal result also reaps the worker."""
++        valid = True
++        while len(self.output) <= self.MAX_OUTPUT:
++            try:
++                block = os.read(self.process.stdout.fileno(), self.MAX_OUTPUT + 1 - len(self.output))
++            except BlockingIOError:
++                break
++            except OSError:
++                valid = False
++                break
++            if not block:
++                break
++            self.output.extend(block)
++        if len(self.output) > self.MAX_OUTPUT:
++            valid = False
++        code = self.process.poll()
++        if valid and code is None and now < self.deadline:
++            return None
++        timed_out = valid and code is None and now >= self.deadline
++        succeeded = valid and code == 0
++        self.close()
++        if self.completed is not None:
++            try:
++                return bool(self.completed(succeeded, bytes(self.output[:self.MAX_OUTPUT]), timed_out))
++            except Exception:
++                return False
++        return succeeded
++
++    def close(self):
++        if self.closed:
++            return
++        self.closed = True
++        # This process group was created for this check. Also reap/stop pactl
++        # children if a check hangs during CoreAudio routing or shutdown.
++        try:
++            os.killpg(self.process.pid, signal.SIGKILL)
++        except ProcessLookupError:
++            pass
++        try:
++            self.process.wait(timeout=1)
++        finally:
++            self.process.stdout.close()
++
++
+ def run_child(command, environment, stop, deadline, consume, *, started=None,
+               health=None, pass_fds=(), startup_grace=30, health_interval=10, shutdown_grace=15):
+-    """Never restart here. Caller owns retry policy and scoped sidecar lifetime."""
++    """Never restart here. Health launches must return promptly, with a HealthCheck
++    or an immediate boolean. A pending check never blocks guest output draining.
++    Caller owns retry policy and scoped sidecar lifetime.
++    """
+     with subprocess.Popen(command, env=environment, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, start_new_session=True,
+                           pass_fds=pass_fds) as child:
+@@ -25,6 +87,7 @@ def run_child(command, environment, stop, deadline, consume, *, started=None,
+         exited_at = None
+         forced = False
+         health_failures = 0
++        health_check = None
+         next_health = time.monotonic() + startup_grace
+         try:
+             if started:
+@@ -44,18 +107,32 @@ def run_child(command, environment, stop, deadline, consume, *, started=None,
+                             reason = "requested"
+                         elif deadline is not None and now >= deadline:
+                             reason = "duration"
+-                        elif health and now >= next_health:
+-                            try:
+-                                healthy = health()
+-                            except Exception:
+-                                healthy = False
+-                            health_failures = 0 if healthy else health_failures + 1
+-                            next_health = time.monotonic() + health_interval
+-                            if health_failures >= 3:
+-                                reason = "health"
++                        elif health:
++                            healthy = None
++                            if health_check is not None:
++                                healthy = health_check.poll(now)
++                                if healthy is not None:
++                                    health_check = None
++                            elif now >= next_health:
++                                try:
++                                    launched = health()
++                                    if isinstance(launched, HealthCheck):
++                                        health_check = launched
++                                    else:
++                                        healthy = bool(launched)
++                                except Exception:
++                                    healthy = False
++                            if healthy is not None:
++                                health_failures = 0 if healthy else health_failures + 1
++                                next_health = time.monotonic() + health_interval
++                                if health_failures >= 3:
++                                    reason = "health"
+                         if reason != "exit":
+                             stopping_at = time.monotonic()
+                             child.terminate()
++                            if health_check is not None:
++                                health_check.close()
++                                health_check = None
+                     elif now - stopping_at >= shutdown_grace and not forced:
+                         forced = True
+                         child.kill()
+@@ -74,6 +151,8 @@ def run_child(command, environment, stop, deadline, consume, *, started=None,
+                 consume(pending)
+             return Exit(child.wait(timeout=shutdown_grace), reason, forced)
+         finally:
++            if health_check is not None:
++                health_check.close()
+             if child.poll() is None:
+                 child.terminate()
+                 try:
 diff --git a/scripts/native_audio.py b/scripts/native_audio.py
 index 7bef76f..5dcb522 100644
 --- a/scripts/native_audio.py
@@ -2745,14 +2948,15 @@ index 0000000..bcf3040
 +        os.fsync(stream.fileno())
 +    validate(data, raw_data, state, cache)
 diff --git a/scripts/receiver.py b/scripts/receiver.py
-index b8630d4..6ca1f13 100644
+index b8630d4..22d2681 100644
 --- a/scripts/receiver.py
 +++ b/scripts/receiver.py
-@@ -9,21 +9,27 @@ from pathlib import Path
+@@ -9,21 +9,29 @@ from pathlib import Path
  import re
  import shutil
  import signal
 +import stat
++import sys
  import tempfile
  import threading
  import time
@@ -2760,14 +2964,17 @@ index b8630d4..6ca1f13 100644
  
  import credentials
 -from paths import BUNDLED, STATE, CACHE, RUNTIME, SYSROOT, CERTIFICATES, configured_path
++import audio_routing
 +import current_diagnostics
 +import private_api
 +import private_profile
 +from paths import BUNDLED, DATA, RAW_DATA, STATE, CACHE, RUNTIME, SYSROOT, CERTIFICATES, configured_path
  from paths import CONFIG
- from lifecycle import Exit, retry_delay, run_child
+-from lifecycle import Exit, retry_delay, run_child
++from lifecycle import Exit, HealthCheck, retry_delay, run_child
  PUBLIC_ERRORS = set()
- from native_audio import native_audio
+-from native_audio import native_audio
++from native_audio import AudioEnvironment, native_audio
  
  
 -def report(raw, secret):
@@ -2778,12 +2985,12 @@ index b8630d4..6ca1f13 100644
      if re.fullmatch(r"INTEGRITY: executable-byte (preflight|exit comparison) passed \(\d+ bytes\)", line):
          print(line, flush=True)
      for phrase, label in (
-@@ -101,15 +107,10 @@ def private_text(path, value):
+@@ -101,15 +109,10 @@ def private_text(path, value):
              os.unlink(temporary)
  
  
 -async def api_health(state):
-+async def api_health(state, diagnostics=None):
++async def api_health(state, diagnostics=None, authentication=None):
      # Local responsiveness is independent of Internet availability. An offline
      # account is not a reason to repeatedly restart or steal active playback.
 -    if (state / "ws.addr").read_text().strip() != "127.0.0.1":
@@ -2796,21 +3003,95 @@ index b8630d4..6ca1f13 100644
                                    close_timeout=1, max_size=1024 * 1024) as ws:
          async with asyncio.timeout(2):
              # Discard the automatic connect snapshot. Require a response to a
-@@ -122,10 +123,12 @@ async def api_health(state):
+@@ -122,10 +125,86 @@ async def api_health(state):
              while True:
                  event = json.loads(await ws.recv())
                  if isinstance(event, dict) and event.get("type") == "auth_state":
++                    if type(event.get("logged_in")) is not bool:
++                        return False
++                    if authentication is not None:
++                        authentication["logged_in"] = event["logged_in"]
++                        authentication["is_active"] = event.get("is_active") if type(event.get("is_active")) is bool else None
 +                    if diagnostics is not None:
 +                        diagnostics.auth(event)
                      return True
  
  
 -def soloist_command(args, state, cache, engine, key_path, pulse_root):
++def health_snapshot(websocket, current_output_id, report=None):
++    """Isolated check: no key, engine, saved credentials or diagnostic writes."""
++    result = {"healthy": False, "logged_in": None, "is_active": None,
++              "output_id": current_output_id}
++    result["healthy"] = websocket == "off" or asyncio.run(api_health(STATE, authentication=result))
++    # Emit the fresh API result before touching CoreAudio or pactl. If routing
++    # hangs, this complete typed response is sufficient for engine health.
++    if report is not None:
++        report(result)
++    try:
++        environment = AudioEnvironment(audio_routing.private_environment())
++        environment.current_output_id = current_output_id
++        # Routing prints device names; the worker's stderr is discarded and its
++        # stdout contains only the strict result below.
++        with contextlib.redirect_stdout(sys.stderr):
++            environment.refresh_route()
++        result["output_id"] = environment.current_output_id
++    except Exception:
++        # Retain a usable current route when enumeration/preference fails.
++        pass
++    return result
++
++
++def apply_health_result(succeeded, raw, audio_env, diagnostics=None, timed_out=False):
++    """Apply one small typed worker result on the supervisor thread only."""
++    healthy = False
++    try:
++        if not succeeded and not timed_out:
++            raise ValueError("Health worker failed")
++        lines = raw.splitlines()
++        if not 1 <= len(lines) <= 2 or timed_out and not raw.endswith(b"\n"):
++            raise ValueError("Missing complete health result")
++        values = [json.loads(line) for line in lines]
++        for value in values:
++            if type(value) is not dict or set(value) != {"healthy", "logged_in", "is_active", "output_id"} \
++                    or type(value["healthy"]) is not bool \
++                    or any(value[key] is not None and type(value[key]) is not bool for key in ("logged_in", "is_active")) \
++                    or value["output_id"] is not None and (type(value["output_id"]) is not int or not 0 < value["output_id"] <= 0xffffffff):
++                raise ValueError("Invalid health result")
++        value = values[-1]
++        if timed_out and (not values[0]["healthy"] or any(
++                frame[key] != values[0][key] for frame in values for key in ("healthy", "logged_in", "is_active"))):
++            raise ValueError("Routing timeout without a healthy API response")
++        if value["output_id"] is not None:
++            audio_env.current_output_id = value["output_id"]
++        healthy = value["healthy"]
++        if healthy and diagnostics is not None and type(value["logged_in"]) is bool:
++            diagnostics.auth(value)
++    except Exception:
++        healthy = False
++    if not healthy and diagnostics is not None:
++        diagnostics.record("health_failed")
++        diagnostics.phase("unresponsive")
++    return healthy
++
++
++def launch_health_check(args, audio_env, diagnostics=None):
++    if not audio_env.alive():
++        apply_health_result(False, b"", audio_env, diagnostics)
++        return False
++    entry = [sys.executable, "run"] if BUNDLED else [sys.executable, str(Path(__file__).resolve())]
++    command = entry + ["--health-check", "--websocket", args.websocket]
++    if audio_env.current_output_id is not None:
++        command += ["--audio-output-current-id", str(audio_env.current_output_id)]
++    return HealthCheck(command, {"PATH": os.defpath, "SOLOIST_RUNTIME_HOME": str(DATA)},
++                       completed=lambda success, raw, timed_out: apply_health_result(success, raw, audio_env, diagnostics, timed_out),
++                       timeout=8)
++
++
 +def soloist_command(args, state, cache, engine, key_path, pulse_root, private_fd=None):
      command = [str(RUNTIME), "--no-rosetta", "--clear-env", "--timeout", "10",
                 "--sysroot", str(SYSROOT), "--append-arg-file", str(key_path),
                 "--env", "PULSE_SERVER=unix:" + str(pulse_root / "native"),
-@@ -134,14 +137,20 @@ def soloist_command(args, state, cache, engine, key_path, pulse_root):
+@@ -134,14 +213,20 @@ def soloist_command(args, state, cache, engine, key_path, pulse_root):
                 "--", str(engine), "-n", args.device_name, "-D", str(state),
                 "-C", str(cache), "-z", "100", "-i", "5", "-v", "-k"]
      if args.websocket == "on":
@@ -2833,7 +3114,7 @@ index b8630d4..6ca1f13 100644
      with contextlib.ExitStack() as stack, native_audio(args.audio_output_uid) as audio_env:
          inherited = ()
          if key_path is None:
-@@ -158,7 +167,11 @@ def run_session(args, state, cache, engine, key_path, secret, stop, deadline, at
+@@ -158,7 +243,11 @@ def run_session(args, state, cache, engine, key_path, secret, stop, deadline, at
          pulse_hint = state / "audio.path"
          pid_file = state / "receiver.pid"
          private_text(pulse_hint, str(pulse_root) + "\n")
@@ -2846,7 +3127,7 @@ index b8630d4..6ca1f13 100644
          environment = {"PATH": os.defpath, "ELFUSE_VERIFY_TEXT": "1", "ELFUSE_FORWARD_TERMINATION": "1"}
          integrity = {"preflight": False, "exit": False}
          def consume(raw):
-@@ -166,27 +179,38 @@ def run_session(args, state, cache, engine, key_path, secret, stop, deadline, at
+@@ -166,27 +255,32 @@ def run_session(args, state, cache, engine, key_path, secret, stop, deadline, at
                  integrity["preflight"] = True
              if re.fullmatch(rb"INTEGRITY: executable-byte exit comparison passed \(\d+ bytes\)", raw):
                  integrity["exit"] = True
@@ -2865,13 +3146,7 @@ index b8630d4..6ca1f13 100644
 -                return False
              try:
 -                audio_env.refresh_route()
-+                if not audio_env.alive():
-+                    raise RuntimeError("Private audio stopped")
-+                try:
-+                    audio_env.refresh_route()
-+                except Exception:
-+                    print("AUDIO: output routing check failed; retaining current output", flush=True)
-+                return args.websocket == "off" or asyncio.run(api_health(state, diagnostics))
++                return launch_health_check(args, audio_env, diagnostics)
              except Exception:
 -                print("AUDIO: output routing check failed; retaining current output", flush=True)
 -            return args.websocket == "off" or asyncio.run(api_health(state))
@@ -2891,16 +3166,30 @@ index b8630d4..6ca1f13 100644
              print("LIFECYCLE:", json.dumps(summary), flush=True)
              return result
          finally:
-@@ -207,7 +231,7 @@ def main(argv=None):
+@@ -207,8 +301,21 @@ def main(argv=None):
      parser.add_argument("--audio-latency-ms", type=int, default=0,
                          help="PulseAudio buffer target, 20..2000 ms; 0 uses the engine default")
      parser.add_argument("--websocket", choices=("on", "off"), default="off" if BUNDLED else "on",
 -                        help="Local unauthenticated API; packaged default is off, always loopback-only")
 +                        help="Owner-only local Unix WebSocket API; packaged default is off")
++    parser.add_argument("--health-check", action="store_true", help=argparse.SUPPRESS)
++    parser.add_argument("--audio-output-current-id", type=int, default=None, help=argparse.SUPPRESS)
      args = parser.parse_args(argv)
++    if args.health_check:
++        if args.audio_output_current_id is not None and not 0 < args.audio_output_current_id <= 0xffffffff:
++            parser.error("Invalid current audio output")
++        try:
++            result = health_snapshot(args.websocket, args.audio_output_current_id,
++                                     report=lambda value: print(json.dumps(value, separators=(",", ":")), flush=True))
++        except Exception:
++            result = {"healthy": False, "logged_in": None, "is_active": None,
++                      "output_id": args.audio_output_current_id}
++        print(json.dumps(result, separators=(",", ":")))
++        return 0
      if not 1 <= len(args.device_name) <= 64 or any(ord(char) < 32 for char in args.device_name):
          parser.error("device name must be 1..64 printable characters")
-@@ -220,13 +244,15 @@ def main(argv=None):
+     if len(args.audio_output_uid) > 512 or any(ord(char) < 32 for char in args.audio_output_uid):
+@@ -220,13 +327,15 @@ def main(argv=None):
      if args.audio_latency_ms != 0 and not 20 <= args.audio_latency_ms <= 2000:
          parser.error("audio latency must be 0 or 20..2000 ms")
      state, cache = STATE, CACHE
@@ -2921,7 +3210,7 @@ index b8630d4..6ca1f13 100644
              (state / name).unlink(missing_ok=True)
      engine = configured_path("soloist", args.soloist)
      settings = json.loads(CONFIG.read_text()) if CONFIG.is_file() else {}
-@@ -245,6 +271,7 @@ def main(argv=None):
+@@ -245,6 +354,7 @@ def main(argv=None):
          shutil.copyfile("/opt/homebrew/etc/ca-certificates/cert.pem", CERTIFICATES)
      if not CERTIFICATES.is_file():
          raise RuntimeError("Missing bundled certificate store")
@@ -2929,7 +3218,7 @@ index b8630d4..6ca1f13 100644
      stop = threading.Event()
      original_handlers = {number: signal.signal(number, lambda *_: stop.set())
                           for number in (signal.SIGINT, signal.SIGTERM)}
-@@ -255,8 +282,10 @@ def main(argv=None):
+@@ -255,8 +365,10 @@ def main(argv=None):
          attempt = 0
          while not stop.is_set():
              try:
@@ -2941,7 +3230,7 @@ index b8630d4..6ca1f13 100644
                  print("RECOVERY: receiver/audio startup failed; details withheld", flush=True)
                  result = Exit(1, "startup", False)
              delay = retry_delay(result, attempt, args.restart_limit, stop.is_set())
-@@ -275,6 +304,7 @@ def main(argv=None):
+@@ -275,6 +387,7 @@ def main(argv=None):
              attempt += 1
          return 0
      finally:
@@ -3496,6 +3785,113 @@ index 0000000..45203c7
 +  -mmacosx-version-min=27.0 -framework AppKit -framework ServiceManagement \
 +  "$runtime_root/probes/launcher-menu-test.m" -o "$runtime_root/build/launcher-menu-test"
 +"$runtime_root/build/launcher-menu-test"
+diff --git a/scripts/test-lifecycle.py b/scripts/test-lifecycle.py
+index b0951e6..9188212 100644
+--- a/scripts/test-lifecycle.py
++++ b/scripts/test-lifecycle.py
+@@ -1,11 +1,12 @@
+ """Offline supervisor tests. Only owned subprocess fixtures are terminated."""
+ import os
++import json
+ import signal
+ import sys
+ import threading
+ import time
+ import unittest
+-from lifecycle import Exit, retry_delay, run_child
++from lifecycle import Exit, HealthCheck, retry_delay, run_child
+ 
+ 
+ class LifecycleTests(unittest.TestCase):
+@@ -13,7 +14,7 @@ class LifecycleTests(unittest.TestCase):
+         output = []
+         result = run_child([sys.executable, "-u", "-c", source], {"PATH": os.defpath},
+                            kwargs.pop("stop", threading.Event()), kwargs.pop("deadline", None),
+-                           output.append, shutdown_grace=0.3, **kwargs)
++                           kwargs.pop("consume", output.append), shutdown_grace=0.3, **kwargs)
+         return result, output
+ 
+     def test_clean_exit(self):
+@@ -59,6 +60,79 @@ class LifecycleTests(unittest.TestCase):
+         self.assertEqual(len(calls), 6)
+         self.assertEqual(result.reason, "health")
+ 
++    def test_delayed_health_does_not_block_drain_or_requested_stop(self):
++        stop = threading.Event()
++        checks = []
++        seen = []
++        def health():
++            check = HealthCheck([sys.executable, "-c", "import time; time.sleep(20)"],
++                                {"PATH": os.defpath}, timeout=30)
++            checks.append(check)
++            return check
++        def consume(line):
++            if line == b"drained":
++                seen.append(line)
++                stop.set()
++        source = "import time; time.sleep(.3); [print('x'*4096) for _ in range(300)]; print('drained'); time.sleep(20)"
++        started = time.monotonic()
++        result, _ = self.run_fixture(source, stop=stop, consume=consume, health=health,
++                                     startup_grace=0.05, health_interval=0.05)
++        self.assertEqual(result.reason, "requested")
++        self.assertEqual(seen, [b"drained"])
++        self.assertEqual(len(checks), 1)
++        self.assertLess(time.monotonic() - started, 3)
++        self.assertIsNotNone(checks[0].process.poll())
++        self.assertTrue(checks[0].process.stdout.closed)
++
++    def test_health_timeouts_are_serial_and_keep_three_failure_rule(self):
++        checks = []
++        def health():
++            self.assertTrue(all(check.process.poll() is not None for check in checks))
++            check = HealthCheck([sys.executable, "-c", "import time; time.sleep(20)"],
++                                {"PATH": os.defpath}, timeout=0.1)
++            checks.append(check)
++            return check
++        result, _ = self.run_fixture("import time; time.sleep(20)", health=health,
++                                     startup_grace=0.05, health_interval=0.05)
++        self.assertEqual(result.reason, "health")
++        self.assertEqual(len(checks), 3)
++        self.assertTrue(all(check.process.poll() is not None for check in checks))
++
++    def test_health_worker_output_is_bounded(self):
++        check = HealthCheck([sys.executable, "-u", "-c", "import time; print('x'*10000); time.sleep(20)"],
++                            {"PATH": os.defpath}, timeout=3)
++        try:
++            result = None
++            deadline = time.monotonic() + 4
++            while result is None and time.monotonic() < deadline:
++                result = check.poll(time.monotonic())
++                time.sleep(0.01)
++            self.assertFalse(result)
++            self.assertIsNotNone(check.process.poll())
++            self.assertLessEqual(len(check.output), HealthCheck.MAX_OUTPUT + 1)
++        finally:
++            check.close()
++
++    def test_hung_route_after_healthy_api_does_not_restart_engine(self):
++        from types import SimpleNamespace
++        from receiver import apply_health_result
++        environment = SimpleNamespace(current_output_id=7)
++        payload = json.dumps({"healthy": True, "logged_in": True, "is_active": True, "output_id": 7})
++        checks = []
++        def health():
++            command = [sys.executable, "-u", "-c", "import time; print(" + repr(payload) + "); time.sleep(20)"]
++            check = HealthCheck(command, {"PATH": os.defpath}, timeout=0.3,
++                                completed=lambda success, raw, timed_out: apply_health_result(
++                                    success, raw, environment, timed_out=timed_out))
++            checks.append(check)
++            return check
++        result, _ = self.run_fixture("import time; time.sleep(20)", health=health,
++                                     startup_grace=0.05, health_interval=0.05,
++                                     deadline=time.monotonic() + 2)
++        self.assertEqual(result.reason, "duration")
++        self.assertGreaterEqual(len(checks), 3)
++        self.assertTrue(all(check.process.poll() is not None for check in checks))
++
+     def test_retry_policy(self):
+         for result in (Exit(0, "exit", False), Exit(10, "exit", False),
+                        Exit(143, "requested", False), Exit(0, "duration", False)):
 diff --git a/scripts/test-package.py b/scripts/test-package.py
 index 75a7e6f..6dd49ec 100644
 --- a/scripts/test-package.py
@@ -3752,11 +4148,14 @@ index 0000000..00257b6
 +if __name__ == "__main__":
 +    unittest.main()
 diff --git a/scripts/test-receiver.py b/scripts/test-receiver.py
-index 78f8da0..fab37d4 100644
+index 78f8da0..6401b66 100644
 --- a/scripts/test-receiver.py
 +++ b/scripts/test-receiver.py
-@@ -8,6 +8,8 @@ import tempfile
+@@ -6,8 +6,11 @@ from pathlib import Path
+ from types import SimpleNamespace
+ import tempfile
  import unittest
++from unittest import mock
  import websockets
  import receiver
 +import private_api
@@ -3764,7 +4163,7 @@ index 78f8da0..fab37d4 100644
  
  
  class Tests(unittest.IsolatedAsyncioTestCase):
-@@ -19,18 +21,23 @@ class Tests(unittest.IsolatedAsyncioTestCase):
+@@ -19,18 +22,23 @@ class Tests(unittest.IsolatedAsyncioTestCase):
              await ws.send(json.dumps({"type": "auth_state", "logged_in": False}))
              await ws.wait_closed()
          with tempfile.TemporaryDirectory(prefix="soloist-health-test-") as directory:
@@ -3795,7 +4194,7 @@ index 78f8da0..fab37d4 100644
  
      def test_arbitrary_integrity_line_is_withheld(self):
          output = io.StringIO()
-@@ -56,8 +63,11 @@ class Tests(unittest.IsolatedAsyncioTestCase):
+@@ -56,10 +64,86 @@ class Tests(unittest.IsolatedAsyncioTestCase):
          self.assertEqual(connect_only[-1], "-k")
          self.assertIn("PULSE_LATENCY_MSEC=100", connect_only)
          args.websocket = "on"
@@ -3808,7 +4207,82 @@ index 78f8da0..fab37d4 100644
 +        self.assertEqual(enabled[enabled.index("--private-tcp-listener") + 1:][:2], ["65534", "9"])
          self.assertEqual(enabled[-1], "-k")
  
++    def test_health_result_is_typed_and_applied_on_supervisor(self):
++        environment = SimpleNamespace(current_output_id=7)
++        diagnostics = mock.Mock()
++        good = {"healthy": True, "logged_in": False, "is_active": False, "output_id": 9}
++        self.assertTrue(receiver.apply_health_result(True, json.dumps(good).encode(), environment, diagnostics))
++        self.assertEqual(environment.current_output_id, 9)
++        diagnostics.auth.assert_called_once_with(good)
++        for value in ({**good, "unknown": "private"}, {**good, "logged_in": "private"},
++                      {**good, "output_id": True}, {**good, "healthy": 1}):
++            diagnostics.reset_mock()
++            self.assertFalse(receiver.apply_health_result(True, json.dumps(value).encode(), environment, diagnostics))
++            diagnostics.auth.assert_not_called()
++            diagnostics.record.assert_called_once_with("health_failed")
++            diagnostics.phase.assert_called_once_with("unresponsive")
++
++    def test_health_mode_never_initializes_or_reads_engine_credentials(self):
++        value = {"healthy": True, "logged_in": None, "is_active": None, "output_id": 7}
++        output = io.StringIO()
++        with mock.patch.object(receiver, "health_snapshot", return_value=value) as health, \
++             mock.patch.object(receiver.private_profile, "initialize", side_effect=AssertionError("profile write")), \
++             mock.patch.object(receiver, "configured_path", side_effect=AssertionError("engine or key read")), \
++             mock.patch.object(receiver.credentials, "load", side_effect=AssertionError("credential read")), \
++             contextlib.redirect_stdout(output):
++            self.assertEqual(receiver.main(["--health-check", "--websocket", "off", "--audio-output-current-id", "7"]), 0)
++        self.assertEqual(health.call_args.args, ("off", 7))
++        self.assertTrue(callable(health.call_args.kwargs["report"]))
++        self.assertEqual(json.loads(output.getvalue()), value)
++
++    def test_health_launch_does_not_enumerate_coreaudio_on_supervisor(self):
++        environment = SimpleNamespace(current_output_id=7, alive=lambda: True)
++        args = SimpleNamespace(websocket="on")
++        with mock.patch.object(receiver, "HealthCheck") as check, \
++             mock.patch.object(receiver.audio_routing, "available_outputs", side_effect=AssertionError("CoreAudio on supervisor")):
++            receiver.launch_health_check(args, environment)
++        arguments, options = check.call_args
++        self.assertIn("--health-check", arguments[0])
++        self.assertEqual(set(arguments[1]), {"PATH", "SOLOIST_RUNTIME_HOME"})
++        self.assertEqual(options["timeout"], 8)
++
++    def test_only_fresh_healthy_api_response_survives_route_timeout(self):
++        environment = SimpleNamespace(current_output_id=7)
++        diagnostics = mock.Mock()
++        healthy = {"healthy": True, "logged_in": True, "is_active": True, "output_id": 7}
++        complete = json.dumps(healthy).encode() + b"\n"
++        self.assertTrue(receiver.apply_health_result(False, complete, environment, diagnostics, timed_out=True))
++        diagnostics.auth.assert_called_once_with(healthy)
++        diagnostics.record.assert_not_called()
++        for raw, timed_out in ((b"", True), (complete, False), (complete[:-1], True),
++                               (json.dumps({**healthy, "healthy": False}).encode() + b"\n", True),
++                               (complete + b"private-invalid\n", True)):
++            diagnostics.reset_mock()
++            self.assertFalse(receiver.apply_health_result(False, raw, environment, diagnostics, timed_out=timed_out))
++            diagnostics.auth.assert_not_called()
++            diagnostics.record.assert_called_once_with("health_failed")
++
++    def test_api_response_is_emitted_before_any_route_work(self):
++        stages = []
++        async def healthy_api(_state, diagnostics=None, authentication=None):
++            stages.append("api")
++            authentication.update(logged_in=False, is_active=False)
++            return True
++        def environment():
++            stages.append("route")
++            raise RuntimeError("synthetic route failure")
++        with mock.patch.object(receiver, "api_health", side_effect=healthy_api), \
++             mock.patch.object(receiver.audio_routing, "private_environment", side_effect=environment):
++            result = receiver.health_snapshot("on", 7, report=lambda value: stages.append(("emitted", dict(value))))
++        self.assertTrue(result["healthy"])
++        self.assertEqual(stages[0], "api")
++        self.assertEqual(stages[1][0], "emitted")
++        self.assertTrue(stages[1][1]["healthy"])
++        self.assertEqual(stages[2], "route")
++
  
+ if __name__ == "__main__":
+     unittest.main()
 diff --git a/scripts/test.sh b/scripts/test.sh
 index 1bcef7a..8baddfa 100644
 --- a/scripts/test.sh

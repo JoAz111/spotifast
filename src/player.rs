@@ -39,6 +39,7 @@ use librespot_playback::{
 use sha1::{Digest, Sha1};
 
 use crate::api::models::ArtistRef;
+use crate::playback_quality::{QualityObserver, QualitySnapshot};
 use crate::sink::ControlledSink;
 use crate::sink::{AudioControl, ErrorHook, RodioSink};
 
@@ -276,6 +277,8 @@ impl LoadSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlayerCommand {
     Toggle,
+    /// Explicit intent, independent of a delayed playback-state echo.
+    SetPlaying(bool),
     Next,
     Previous,
     /// Remove manually queued tracks and keep context tracks.
@@ -285,9 +288,8 @@ pub enum PlayerCommand {
     Seek(u32),
     /// The volume to keep: applied at once and told to Spotify Connect.
     Volume(u16),
-    /// The slider mid-drag: applied at once, nothing sent. Every Connect
-    /// update costs a round trip to Spotify, and librespot makes them one
-    /// after another, so dragging through fifty values lagged by seconds.
+    /// The slider mid-drag: applied locally at once. Soloist coalesces wire
+    /// updates; librespot defers its serialized Connect updates until commit.
     VolumePreview(u16),
     Shuffle(bool),
     Repeat(RepeatMode),
@@ -299,6 +301,7 @@ pub enum PlayerCommand {
 #[allow(clippy::large_enum_variant)]
 pub enum EngineEvent {
     State(LocalState),
+    Quality(Option<QualitySnapshot>),
     SessionEnded,
 }
 
@@ -315,6 +318,7 @@ pub struct Engine {
     interrupted: Arc<Mutex<Option<Interrupted>>>,
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
     audio: Arc<AudioControl>,
+    quality_observer: Option<QualityObserver>,
 }
 
 impl Engine {
@@ -343,6 +347,11 @@ impl Engine {
             .connect(credentials, true)
             .await
             .context("unable to connect metadata session")?;
+        let quality_notify = Arc::clone(&notify);
+        let quality_observer = QualityObserver::start(
+            session.clone(),
+            Arc::new(move |quality| quality_notify(EngineEvent::Quality(quality))),
+        );
         let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ended_flag = Arc::clone(&shutting_down);
         let watched_session = session.clone();
@@ -366,6 +375,7 @@ impl Engine {
             interrupted: Arc::default(),
             shutting_down,
             audio: AudioControl::new(config.buffer_ms),
+            quality_observer: Some(quality_observer),
             session,
         })
     }
@@ -486,6 +496,7 @@ impl Engine {
             interrupted,
             shutting_down,
             audio,
+            quality_observer: None,
         })
     }
 
@@ -606,6 +617,9 @@ impl Engine {
     pub fn shutdown(&self) {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(observer) = &self.quality_observer {
+            observer.stop();
+        }
         if let Some(spirc) = &self.spirc {
             let _ = spirc.shutdown();
         }
@@ -667,6 +681,8 @@ impl Engine {
             .context("metadata session cannot play audio")?;
         match command {
             PlayerCommand::Toggle => spirc.play_pause()?,
+            PlayerCommand::SetPlaying(true) => spirc.play()?,
+            PlayerCommand::SetPlaying(false) => spirc.pause()?,
             PlayerCommand::Next => spirc.next()?,
             PlayerCommand::Previous => spirc.prev()?,
             PlayerCommand::ClearQueue => spirc.clear_queue()?,

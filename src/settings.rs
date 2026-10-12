@@ -158,7 +158,8 @@ fn proxy_mode_is_system(mode: &ProxyMode) -> bool {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Keep the main experience focused on music.
+    /// Legacy internal display mode. Saved values cannot hide Spotify features.
+    #[serde(skip)]
     pub music_only: bool,
     /// The Spotify Connect name other devices see.
     pub device_name: String,
@@ -273,7 +274,7 @@ impl std::fmt::Debug for Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            music_only: true,
+            music_only: false,
             device_name: "Spotifast".to_string(),
             bitrate: 320,
             normalisation: false,
@@ -712,6 +713,21 @@ impl ManualProxy {
 #[cfg(test)]
 mod tests {
     use super::Settings;
+
+    #[test]
+    fn legacy_music_only_cannot_hide_podcasts_or_episodes() {
+        assert!(!Settings::default().music_only);
+        let settings: Settings = serde_json::from_str(
+            r#"{"music_only":true,"volume":32123,"autoplay":false,"zoom":1.25}"#,
+        )
+        .unwrap();
+        assert!(!settings.music_only);
+        assert_eq!(settings.volume, 32123);
+        assert!(!settings.autoplay);
+        assert_eq!(settings.zoom, 1.25);
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert!(saved.get("music_only").is_none());
+    }
 
     #[test]
     fn obsolete_ornaments_do_not_affect_music_preferences() {

@@ -6,11 +6,14 @@ The native Rust interface remains Spotifast. With `SPOTIFAST_SOLOIST_SOCKET` set
 
 ## Music features
 
-The main interface defaults to music: Home, songs, artists, albums, playlists, Liked Songs, queue and lyrics. Podcast and episode navigation, shelves and search results are hidden. Hidden Home podcast requests also stop. Set `music_only` to `false` in settings to restore the optional upstream surfaces. Direct links and episodes already present in mixed playlists remain internally supported.
+The main interface includes Home, songs, artists, albums, playlists, Liked Songs, queue, lyrics and podcasts. The Library's Podcasts shelf opens followed shows, Search includes podcast and episode results, and Home shows episodes to continue or new episodes from followed podcasts. Episode playback keeps its saved resume position. Legacy `music_only` settings are ignored so earlier previews cannot keep these features hidden.
 
 Local controls support play/pause, next/previous, seek, volume, ordinary shuffle, repeat, queue additions and Connect activation. Album/playlist playback retains the selected row, full context, filtered track list, duplicates and position by activating Soloist first, then using Spotify's Web API. Explicit shuffle and repeat choices are sent in sequence with that load. A failed or disconnected mutation is never automatically replayed.
 
-Soloist's local protocol exposes neither the account ID nor the Connect device ID. Pair Soloist and sign into Spotifast with the **same Spotify account**. A private socket verifies the local OS process, not account equality. A device switch in another Spotify client can race a Web API load targeting the active device; this API limitation is not hidden by guessing a device name.
+Soloist's local protocol exposes neither the account ID nor the Connect device ID.
+The launcher reads the actual device ID from the receiver's owned private state
+file, so its Connect destination is treated as this Mac and appears once in the
+device picker. The green destination strip is reserved for another device. Pair Soloist and sign into Spotifast with the **same Spotify account**. A private socket verifies the local OS process, not account equality. A device switch in another Spotify client can race a Web API load targeting the active device; this API limitation is not hidden by guessing a device name.
 
 ## Current limitations
 
@@ -20,6 +23,22 @@ Soloist's local protocol exposes neither the account ID nor the Connect device I
 - Crossfade/Automix and other engine capabilities do not automatically become interface controls. Smart Shuffle, Jam, DJ, offline downloads and full Spotify feature parity are not implemented here.
 - Skins, custom themes, Winamp layouts, equalizer and visualizers are removed. There is one dark appearance. Soloist audio output selection lives under Settings → Audio output….
 - The compatibility runtime targets Apple Silicon. Intel Mac, Windows and Linux Soloist integration have not been qualified by this change.
+
+## Current-track quality
+
+Soloist's documented local state has no codec or quality field. The metadata
+session therefore has a read-only candidate observer for Spotify's Connect
+cluster feed. It registers no extra Connect device and never starts a player.
+A metadata-only session may receive no cluster messages; live delivery has not
+been qualified. Missing data leaves the badge absent.
+
+The Lossless label requires actual HiFi/HiFi24 quality with HiFi status on,
+the owned receiver identity, the current track, a matching local generation,
+and evidence younger than 15 seconds. Target quality and availability flags
+cannot enable it. Track changes, buffering, disconnection, stale data and
+unknown/lossy quality clear it. An unanchored repeat of the same URI remains
+unknown, because Soloist provides no playback-occurrence identifier. Decoder
+log history and output sample format are not used to guess a current-track label.
 
 ## Local setup and lifecycle
 
@@ -39,6 +58,25 @@ Spotify Connect discovery and pairing are separate network services. macOS can t
 
 These controls exclude other users and browser TCP callers from the control socket. They do not defend against malicious software already running as the same user, or an exploited/replaced engine with host privileges. The proprietary Soloist implementation cannot receive a complete source audit here.
 
+## Control responsiveness
+
+Active pause, resume, seek and volume use the private local socket and bypass Web
+API pacing. Play/pause commands carry an explicit desired state, so repeated
+clicks do not toggle a stale receiver snapshot. Delayed opposite state echoes do
+not erase a newer UI intent. Commands and watchdogs progress while state frames
+arrive continuously. Volume dragging keeps one command in flight and one latest
+pending value; release preserves the final value without queueing every slider
+step. Selecting music still requires a Spotify Web API load, but unchanged repeat
+and shuffle options do not add requests before it.
+
+Runtime health queries and automatic output routing run in one bounded owned
+subprocess while the supervisor continues draining engine output. A fresh healthy
+API response remains valid if only routing stalls; routing delays do not restart
+healthy audio. The subprocess is stopped and reaped on timeout and shutdown.
+These changes have protocol and lifecycle regression coverage. They require a
+rebuilt runtime helper; a frontend-only package refresh cannot include them.
+Fixture results and command acknowledgements do not prove audible smoothness.
+
 ## Sources
 
 - [Official Soloist announcement and lossless support](https://developer.spotify.com/blog/2026-08-13-introducing-spotify-soloist)
@@ -48,3 +86,22 @@ These controls exclude other users and browser TCP callers from the control sock
 - [Upstream Spotifast](https://github.com/crmne/spotifast)
 
 The [complete runtime patch and build instructions](../runtime/README.md) accompany this fork. Startup, private API, simulated protocol tests and authenticated audio are reported separately.
+
+## Home listening mix
+
+Spotify's [November 2024 Web API change](https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api)
+removes Recommendations access from new/development registrations. This fork does
+not send that unsupported request or fall back to somebody else's registration.
+Home instead shows **Inspired by your listening**, a Spotify song-radio preview
+seeded by one of your top songs. This is distinct from Spotify's personalized Home
+feed and its former multi-seed Web API Recommendations endpoint.
+
+The shelf uses the existing metadata session. Its inline **Enable music access**
+button opens the separate Spotify authorization when needed. A visible shelf
+resolves one station and fetches metadata for at most 20 unique songs, with a
+20-second deadline and one outstanding request. Hiding it prevents requests.
+Missing listening history and failed reads settle visibly. Retry reloads just this
+mix, or just the top-song seeds if history failed, while existing songs stay on
+screen. Replaced requests are canceled; stale account/session or retry results
+cannot replace the current mix. No third-party music or recommendation service is
+used.

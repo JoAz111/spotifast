@@ -25,6 +25,9 @@ pub enum Update {
         generation: u64,
     },
     Error(String),
+    /// Local scheduling evidence for account-free transport fixtures only.
+    #[cfg(test)]
+    CommandSent(&'static str),
 }
 
 pub type Notify = Arc<dyn Fn(Update) + Send + Sync>;
@@ -530,6 +533,81 @@ mod unix {
         _ticket: Option<Ticket>,
     }
 
+    struct PendingVolume {
+        volume: u16,
+        generation: u64,
+        ticket: Ticket,
+    }
+
+    struct VolumeFlight {
+        percent: u8,
+        sent: Instant,
+        _ticket: Ticket,
+    }
+
+    /// Dragging replaces one pending value instead of queuing Connect round
+    /// trips. The final commit uses the same slot and cannot be overtaken by
+    /// an older preview. One acknowledgement releases the next latest value.
+    #[derive(Default)]
+    struct VolumeCommands {
+        pending: Option<PendingVolume>,
+        in_flight: Option<VolumeFlight>,
+        acknowledged: Option<u8>,
+    }
+
+    impl VolumeCommands {
+        fn replace(&mut self, volume: u16, generation: u64, ticket: Ticket) {
+            self.pending = Some(PendingVolume {
+                volume,
+                generation,
+                ticket,
+            });
+        }
+
+        fn take_ready(&mut self, generation: u64) -> Option<PendingVolume> {
+            if self.in_flight.is_some() {
+                return None;
+            }
+            let next = self.pending.take()?;
+            if next.generation != generation
+                || self.acknowledged == Some(volume_percent(next.volume))
+            {
+                return None;
+            }
+            Some(next)
+        }
+
+        fn sent(&mut self, request: PendingVolume) {
+            self.in_flight = Some(VolumeFlight {
+                percent: volume_percent(request.volume),
+                sent: Instant::now(),
+                _ticket: request.ticket,
+            });
+        }
+
+        fn observe(&mut self, percent: u8) {
+            if self.in_flight.is_none() {
+                self.acknowledged = Some(percent);
+            }
+        }
+
+        fn acknowledge(&mut self) {
+            if let Some(sent) = self.in_flight.take() {
+                self.acknowledged = Some(sent.percent);
+            }
+        }
+
+        fn clear(&mut self) {
+            self.pending = None;
+            self.in_flight = None;
+            self.acknowledged = None;
+        }
+    }
+
+    fn volume_percent(volume: u16) -> u8 {
+        ((u32::from(volume) * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX)) as u8
+    }
+
     struct QueueRequest {
         seq: u64,
         sent: Instant,
@@ -558,9 +636,11 @@ mod unix {
         model: &mut Model,
     ) -> Result<ConnectionExit, String> {
         let mut controls: VecDeque<Control> = VecDeque::new();
+        let mut volumes = VolumeCommands::default();
         let mut queue: Option<QueueRequest> = None;
         let mut load: Option<LoadRequest> = None;
         let mut tick = interval(Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut received = Instant::now();
         let mut pinged = received;
         let mut snapshot_deadline = Some(received);
@@ -576,6 +656,7 @@ mod unix {
                         continue;
                     }
                     controls.clear();
+                    volumes.clear();
                     queue = None;
                     load = None;
                     if priority_pause.is_none() {
@@ -584,6 +665,86 @@ mod unix {
                         // state snapshot. Old named acknowledgements cannot be
                         // mistaken for new-account mutation acknowledgements.
                         priority_pause = Some(Instant::now());
+                    }
+                }
+                // Watchdogs and the bounded user-command queue must make
+                // progress even while the receiver streams state continuously.
+                _ = tick.tick() => {
+                    if priority_pause.is_some_and(|sent| sent.elapsed() >= DEADLINE) {
+                        return Err("Soloist did not confirm pause. Check playback before trying again.".into());
+                    }
+                    if load.as_ref().is_some_and(|request| request.load_generation != admission.load_generation.load(Ordering::Acquire)) {
+                        load = None;
+                    }
+                    if snapshot_deadline.is_some_and(|sent| sent.elapsed() >= DEADLINE) {
+                        return Err("Soloist did not provide its current playback state.".into());
+                    }
+                    if controls.iter().any(|control| control.sent.elapsed() >= DEADLINE)
+                        || volumes.in_flight.as_ref().is_some_and(|volume| volume.sent.elapsed() >= DEADLINE) {
+                        return Err("Soloist did not confirm a command. Check playback before trying again.".into());
+                    }
+                    if queue.as_ref().is_some_and(|request| request.sent.elapsed() >= DEADLINE) {
+                        return Err("Soloist did not answer the queue request. The connection will refresh.".into());
+                    }
+                    if load.as_ref().is_some_and(|request| request.sent.elapsed() >= DEADLINE) {
+                        load = None;
+                        notify(Update::Error("Soloist did not become active. The requested music was not started.".into()));
+                    }
+                    if received.elapsed() >= Duration::from_secs(45) {
+                        return Err("The Soloist runtime stopped responding.".into());
+                    }
+                    if pinged.elapsed() >= Duration::from_secs(15) {
+                        timeout(WRITE_DEADLINE, socket.send(Message::Ping(Vec::new().into())))
+                            .await.map_err(|_| "The Soloist runtime socket stopped accepting messages.")?
+                            .map_err(|_| "The Soloist runtime socket failed.")?;
+                        pinged = Instant::now();
+                    }
+                }
+                request = receiver.recv() => {
+                    let Some(Pending { generation, load_generation, session_generation, request, mut ticket }) = request else { return Ok(ConnectionExit::Stop) };
+                    if !model.ready() || priority_pause.is_some() || admission.pausing.load(Ordering::Acquire) || generation != admission.generation.load(Ordering::Acquire) {
+                        if !admission.pausing.load(Ordering::Acquire) {
+                            notify(Update::Error(DISCONNECTED.into()));
+                        }
+                        continue;
+                    }
+                    match request {
+                        Request::Queue(seq) => {
+                            send(socket, &WireCommand::GetQueue { limit: QUEUE_LIMIT as u32 }).await?;
+                            queue = Some(QueueRequest { seq, sent: Instant::now(), _ticket: ticket });
+                        }
+                        Request::Control(PlayerCommand::Load(spec)) => {
+                            if load_generation != admission.load_generation.load(Ordering::Acquire) {
+                                continue;
+                            }
+                            if model.is_active {
+                                notify(Update::Load { spec, generation: session_generation });
+                            } else {
+                                send(socket, &WireCommand::Activate).await?;
+                                controls.push_back(Control { name: "activate", sent: Instant::now(), _ticket: None });
+                                load = Some(LoadRequest { spec, load_generation, session_generation, sent: Instant::now(), _ticket: ticket });
+                            }
+                        }
+                        Request::Control(PlayerCommand::VolumePreview(volume) | PlayerCommand::Volume(volume)) => {
+                            model.state.volume = volume;
+                            notify(Update::State(model.state.clone()));
+                            volumes.replace(volume, generation, ticket);
+                        }
+                        Request::Control(command) => {
+                            for wire in wire_commands(command, model.state.playback)? {
+                                // A sign-out racing with a multi-command
+                                // mutation invalidates its remaining writes.
+                                if admission.pausing.load(Ordering::Acquire) || generation != admission.generation.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                send(socket, &wire).await?;
+                                #[cfg(test)]
+                                notify(Update::CommandSent(wire.name()));
+                                controls.push_back(Control {
+                                    name: wire.name(), sent: Instant::now(), _ticket: Some(ticket.split()),
+                                });
+                            }
+                        }
                     }
                 }
                 incoming = socket.next() => {
@@ -603,6 +764,9 @@ mod unix {
                         Event::CommandResult { command } => {
                             if command == "pause" && priority_pause.is_some() {
                                 return Ok(ConnectionExit::Refresh);
+                            }
+                            if command == "set_volume" {
+                                volumes.acknowledge();
                             }
                             if let Some(index) = controls.iter().position(|control| control.name == command) {
                                 controls.remove(index);
@@ -628,14 +792,19 @@ mod unix {
                             let was_logged_in = model.logged_in;
                             let was_active = model.is_active;
                             let authentication = matches!(event, Event::AuthState { .. });
+                            let observed_volume = matches!(event, Event::VolumeChanged { .. } | Event::PlaybackState { .. });
                             let was_ready = model.ready();
                             model.apply(event)?;
+                            if observed_volume {
+                                volumes.observe(volume_percent(model.state.volume));
+                            }
                             if authentication && model.logged_in || !was_active && model.is_active && model.logged_in {
                                 send(socket, &WireCommand::GetState).await?;
                                 snapshot_deadline = Some(Instant::now());
                             }
                             if was_logged_in && !model.logged_in {
                                 controls.clear();
+                                volumes.clear();
                                 queue = None;
                                 load = None;
                                 // Authentication can be replaced while an
@@ -664,80 +833,21 @@ mod unix {
                         }
                     }
                 }
-                request = receiver.recv() => {
-                    let Some(Pending { generation, load_generation, session_generation, request, mut ticket }) = request else { return Ok(ConnectionExit::Stop) };
-                    if !model.ready() || priority_pause.is_some() || admission.pausing.load(Ordering::Acquire) || generation != admission.generation.load(Ordering::Acquire) {
-                        if !admission.pausing.load(Ordering::Acquire) {
-                            notify(Update::Error(DISCONNECTED.into()));
-                        }
-                        continue;
-                    }
-                    match request {
-                        Request::Queue(seq) => {
-                            send(socket, &WireCommand::GetQueue { limit: QUEUE_LIMIT as u32 }).await?;
-                            queue = Some(QueueRequest { seq, sent: Instant::now(), _ticket: ticket });
-                        }
-                        Request::Control(PlayerCommand::Load(spec)) => {
-                            if load_generation != admission.load_generation.load(Ordering::Acquire) {
-                                continue;
-                            }
-                            if model.is_active {
-                                notify(Update::Load { spec, generation: session_generation });
-                            } else {
-                                send(socket, &WireCommand::Activate).await?;
-                                controls.push_back(Control { name: "activate", sent: Instant::now(), _ticket: None });
-                                load = Some(LoadRequest { spec, load_generation, session_generation, sent: Instant::now(), _ticket: ticket });
-                            }
-                        }
-                        Request::Control(PlayerCommand::VolumePreview(volume)) => {
-                            model.state.volume = volume;
-                            notify(Update::State(model.state.clone()));
-                        }
-                        Request::Control(command) => {
-                            for wire in wire_commands(command, model.state.playback)? {
-                                // A sign-out racing with a multi-command
-                                // mutation invalidates its remaining writes.
-                                if admission.pausing.load(Ordering::Acquire) || generation != admission.generation.load(Ordering::Acquire) {
-                                    break;
-                                }
-                                send(socket, &wire).await?;
-                                controls.push_back(Control {
-                                    name: wire.name(), sent: Instant::now(), _ticket: Some(ticket.split()),
-                                });
-                            }
-                        }
-                    }
-                }
-                _ = tick.tick() => {
-                    if priority_pause.is_some_and(|sent| sent.elapsed() >= DEADLINE) {
-                        return Err("Soloist did not confirm pause. Check playback before trying again.".into());
-                    }
-                    if load.as_ref().is_some_and(|request| request.load_generation != admission.load_generation.load(Ordering::Acquire)) {
-                        load = None;
-                    }
-                    if snapshot_deadline.is_some_and(|sent| sent.elapsed() >= DEADLINE) {
-                        return Err("Soloist did not provide its current playback state.".into());
-                    }
-                    if controls.iter().any(|control| control.sent.elapsed() >= DEADLINE) {
-                        return Err("Soloist did not confirm a command. Check playback before trying again.".into());
-                    }
-                    if queue.as_ref().is_some_and(|request| request.sent.elapsed() >= DEADLINE) {
-                        return Err("Soloist did not answer the queue request. The connection will refresh.".into());
-                    }
-                    if load.as_ref().is_some_and(|request| request.sent.elapsed() >= DEADLINE) {
-                        load = None;
-                        notify(Update::Error("Soloist did not become active. The requested music was not started.".into()));
-                    }
-                    if received.elapsed() >= Duration::from_secs(45) {
-                        return Err("The Soloist runtime stopped responding.".into());
-                    }
-                    if pinged.elapsed() >= Duration::from_secs(15) {
-                        timeout(WRITE_DEADLINE, socket.send(Message::Ping(Vec::new().into())))
-                            .await.map_err(|_| "The Soloist runtime socket stopped accepting messages.")?
-                            .map_err(|_| "The Soloist runtime socket failed.")?;
-                        pinged = Instant::now();
-                    }
-                }
+            }
+            if model.ready()
+                && priority_pause.is_none()
+                && !admission.pausing.load(Ordering::Acquire)
+                && let Some(request) =
+                    volumes.take_ready(admission.generation.load(Ordering::Acquire))
+            {
+                send(
+                    socket,
+                    &WireCommand::SetVolume {
+                        volume: volume_percent(request.volume),
+                    },
+                )
+                .await?;
+                volumes.sent(request);
             }
         }
     }
@@ -817,12 +927,16 @@ mod unix {
                     },
                 ]
             }
+            PlayerCommand::SetPlaying(playing) => vec![if playing {
+                WireCommand::Play
+            } else {
+                WireCommand::Pause
+            }],
             PlayerCommand::Next => vec![WireCommand::SkipNext],
             PlayerCommand::Previous => vec![WireCommand::SkipPrev],
             PlayerCommand::Seek(position_ms) => vec![WireCommand::Seek { position_ms }],
             PlayerCommand::Volume(volume) => vec![WireCommand::SetVolume {
-                volume: ((u32::from(volume) * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX))
-                    as u8,
+                volume: volume_percent(volume),
             }],
             PlayerCommand::Shuffle(enabled) => vec![WireCommand::SetShuffle { enabled }],
             PlayerCommand::Repeat(RepeatMode::Off) => vec![
@@ -1973,6 +2087,257 @@ mod unix {
                     .as_deref(),
                 Some("set_volume")
             );
+            drop(handle);
+            server.abort();
+        }
+
+        #[test]
+        fn volume_bursts_retain_only_latest_value_and_cancel_old_generations() {
+            let admission = Arc::new(Admission::default());
+            let mut volumes = VolumeCommands::default();
+            volumes.replace(1000, 7, Ticket::reserve(&admission, 1).unwrap());
+            let first = volumes.take_ready(7).unwrap();
+            volumes.sent(first);
+            for volume in 2000..2100 {
+                volumes.replace(volume, 7, Ticket::reserve(&admission, 1).unwrap());
+                assert_eq!(admission.outstanding.load(Ordering::Acquire), 2);
+            }
+            volumes.replace(u16::MAX, 7, Ticket::reserve(&admission, 1).unwrap());
+            assert!(
+                volumes.take_ready(7).is_none(),
+                "wait for the single volume acknowledgement"
+            );
+            volumes.acknowledge();
+            let last = volumes.take_ready(7).unwrap();
+            assert_eq!(last.volume, u16::MAX, "commit replaces every older preview");
+            volumes.sent(last);
+            volumes.acknowledge();
+            volumes.replace(u16::MAX - 1, 7, Ticket::reserve(&admission, 1).unwrap());
+            assert!(
+                volumes.take_ready(7).is_none(),
+                "same wire percentage needs no duplicate request"
+            );
+            assert_eq!(admission.outstanding.load(Ordering::Acquire), 0);
+            // Another controller changes the volume: the old acknowledged
+            // value must no longer suppress a new explicit request.
+            volumes.observe(20);
+            volumes.replace(u16::MAX, 7, Ticket::reserve(&admission, 1).unwrap());
+            let changed = volumes.take_ready(7).unwrap();
+            volumes.sent(changed);
+            volumes.replace(1000, 7, Ticket::reserve(&admission, 1).unwrap());
+            volumes.clear();
+            assert_eq!(admission.outstanding.load(Ordering::Acquire), 0);
+            assert!(volumes.take_ready(8).is_none());
+            volumes.replace(1000, 7, Ticket::reserve(&admission, 1).unwrap());
+            assert!(
+                volumes.take_ready(8).is_none(),
+                "old socket/account mutations are discarded"
+            );
+            assert_eq!(admission.outstanding.load(Ordering::Acquire), 0);
+        }
+
+        #[tokio::test]
+        async fn buffered_state_stream_cannot_delay_opposite_desired_playback_commands() {
+            use futures_util::FutureExt;
+            use tokio_tungstenite::tungstenite::protocol::Role;
+
+            let (client_stream, server_stream) = UnixStream::pair().unwrap();
+            let mut client =
+                WebSocketStream::from_raw_socket(client_stream, Role::Client, None).await;
+            let mut server =
+                WebSocketStream::from_raw_socket(server_stream, Role::Server, None).await;
+            for _ in 0..64 {
+                server.feed(Message::Text(json!({
+                    "type": "position_sync",
+                    "position": { "position_ms": 45000, "timestamp_ms": now_ms(), "speed": 1.0 }
+                }).to_string().into())).await.unwrap();
+            }
+            server.flush().await.unwrap();
+            client.next().await.unwrap().unwrap();
+            assert!(
+                client.next().now_or_never().is_some(),
+                "the fixture has buffered incoming frames"
+            );
+
+            let admission = Arc::new(Admission::default());
+            admission.ready.store(true, Ordering::Release);
+            let (sender, mut receiver) = mpsc::channel(LIMIT);
+            for command in [
+                PlayerCommand::SetPlaying(false),
+                PlayerCommand::SetPlaying(true),
+            ] {
+                sender
+                    .try_send(Pending {
+                        generation: 0,
+                        load_generation: 0,
+                        session_generation: 0,
+                        request: Request::Control(command),
+                        ticket: Ticket::reserve(&admission, 1).unwrap(),
+                    })
+                    .unwrap_or_else(|_| panic!("pending command"));
+            }
+            let (_pause_sender, mut pauses) = watch::channel(0);
+            let mut model = Model::default();
+            model
+                .apply(event(
+                    json!({ "type": "auth_state", "logged_in": true, "is_active": true }),
+                ))
+                .unwrap();
+            model.apply(event(snapshot(true))).unwrap();
+            let state_updates = Arc::new(AtomicUsize::new(0));
+            let dispatch_order = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let updates = state_updates.clone();
+            let dispatched = dispatch_order.clone();
+            let notify: Notify = Arc::new(move |update| match update {
+                Update::State(_) => {
+                    updates.fetch_add(1, Ordering::Relaxed);
+                }
+                Update::CommandSent(command) => {
+                    dispatched
+                        .lock()
+                        .unwrap()
+                        .push((command, updates.load(Ordering::Relaxed)));
+                }
+                _ => {}
+            });
+            let task = tokio::spawn(async move {
+                connected(
+                    &mut client,
+                    &mut receiver,
+                    &mut pauses,
+                    &admission,
+                    &notify,
+                    &mut model,
+                )
+                .await
+            });
+            for expected in ["pause", "play"] {
+                let message = timeout(Duration::from_secs(2), server.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let Message::Text(text) = message else {
+                    panic!("expected command")
+                };
+                let command: Value = serde_json::from_str(text.as_ref()).unwrap();
+                assert_eq!(command["command"], expected);
+            }
+            // Both writes occur before draining the already buffered state
+            // frames and before any state echo or acknowledgement is sent.
+            assert_eq!(
+                *dispatch_order.lock().unwrap(),
+                vec![("pause", 0), ("play", 0)]
+            );
+            task.abort();
+            let _ = task.await;
+        }
+
+        #[tokio::test]
+        async fn live_volume_coalesces_previews_and_flushes_final_commit_after_ack() {
+            let directory = PrivateDirectory::new();
+            let path = directory.socket();
+            let listener = UnixListener::bind(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let (commands, mut received) = mpsc::unbounded_channel();
+            let (release, mut released) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                server_send(
+                    &mut socket,
+                    json!({ "type": "auth_state", "logged_in": true, "is_active": true }),
+                )
+                .await;
+                let mut first_volume = true;
+                let mut holding_ack = true;
+                loop {
+                    tokio::select! {
+                        _ = &mut released, if holding_ack => {
+                            holding_ack = false;
+                            server_send(&mut socket, json!({ "type": "command_result", "command": "set_volume" })).await;
+                        }
+                        message = socket.next() => {
+                            let Some(Ok(Message::Text(text))) = message else { break };
+                            let value: Value = serde_json::from_str(text.as_ref()).unwrap();
+                            match value["command"].as_str().unwrap() {
+                                "get_state" => server_send(&mut socket, snapshot(true)).await,
+                                "set_volume" => {
+                                    commands.send(value["volume"].as_u64().unwrap()).unwrap();
+                                    if first_volume {
+                                        first_volume = false;
+                                    } else {
+                                        server_send(&mut socket, json!({ "type": "command_result", "command": "set_volume" })).await;
+                                    }
+                                }
+                                other => panic!("unexpected command {other}"),
+                            }
+                        }
+                    }
+                }
+            });
+            let (updates, mut update_receiver) = mpsc::unbounded_channel();
+            let handle = Handle::start(
+                path,
+                Arc::new(move |update| {
+                    let _ = updates.send(update);
+                }),
+            );
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    match update_receiver.recv().await.unwrap() {
+                        Update::Ready(true) => break,
+                        Update::Error(error) => panic!("{error}"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let volume = |percent: u16| ((u32::from(percent) * u32::from(u16::MAX)) / 100) as u16;
+            handle
+                .command(PlayerCommand::VolumePreview(volume(10)))
+                .unwrap();
+            assert_eq!(
+                timeout(Duration::from_secs(2), received.recv())
+                    .await
+                    .unwrap(),
+                Some(10),
+                "dragging changes audio before release"
+            );
+            for percent in 11..31 {
+                handle
+                    .command(PlayerCommand::VolumePreview(volume(percent)))
+                    .unwrap();
+            }
+            handle.command(PlayerCommand::Volume(volume(95))).unwrap();
+            timeout(Duration::from_secs(2), async {
+                while handle.admission.outstanding.load(Ordering::Acquire) != 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                received.try_recv().is_err(),
+                "only one volume command may be in flight"
+            );
+            release.send(()).unwrap();
+            assert_eq!(
+                timeout(Duration::from_secs(2), received.recv())
+                    .await
+                    .unwrap(),
+                Some(95),
+                "the final committed value wins over all previews"
+            );
+            timeout(Duration::from_secs(2), async {
+                while handle.admission.outstanding.load(Ordering::Acquire) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(received.try_recv().is_err());
             drop(handle);
             server.abort();
         }

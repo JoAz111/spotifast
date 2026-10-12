@@ -650,12 +650,14 @@ fn track_list(
     if tracks.is_empty() {
         return;
     }
-    if let Some(page) = title_page {
-        if theme::link(ui, title, theme::bold(17.0), palette.text).clicked() {
-            app.actions.push(Action::Open(page));
+    if !title.is_empty() {
+        if let Some(page) = title_page {
+            if theme::link(ui, title, theme::bold(17.0), palette.text).clicked() {
+                app.actions.push(Action::Open(page));
+            }
+        } else {
+            theme::section_title(ui, &palette, title);
         }
-    } else {
-        theme::section_title(ui, &palette, title);
     }
     ui.add_space(4.0);
     let uris: Arc<[String]> = tracks
@@ -712,9 +714,96 @@ fn top_tracks(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn recommendations(app: &mut App, ui: &mut egui::Ui) {
+    let palette = app.palette;
+    theme::section_title(
+        ui,
+        &palette,
+        &gettext(app.locale, "Inspired by your listening"),
+    );
+    if let Some(seed) = &app.home.recommendations_seed {
+        theme::text(
+            ui,
+            format!("Spotify radio based on {seed}"),
+            theme::regular(13.0),
+            palette.secondary,
+        );
+    }
+    if !app.music_session_ready && app.home.recommendations.get().is_none() {
+        theme::text(
+            ui,
+            "Connect Spotify music access to discover songs from your listening.",
+            theme::regular(13.0),
+            palette.secondary,
+        );
+        if app.music_session_busy {
+            theme::text(ui, "Connecting…", theme::regular(13.0), palette.secondary);
+        } else if theme::pill_button(ui, &palette, "Enable music access", true).clicked() {
+            app.actions.push(Action::EnablePlayback);
+        }
+        ui.add_space(16.0);
+        return;
+    }
     let tracks = app.home.recommendations.clone();
-    let title = gettext(app.locale, "Recommended for you");
-    track_list(app, ui, &title, tracks, 20, None, None);
+    let error = app.home.recommendations_error.clone().or_else(|| {
+        if let Loadable::Failed(message) = &tracks {
+            Some(message.clone())
+        } else {
+            None
+        }
+    });
+    let has_error = error.is_some();
+    if let Some(message) = error {
+        widgets::error_row(ui, app, &message, None);
+        recommendation_retry(app, ui);
+    }
+    match tracks {
+        Loadable::Loaded(tracks) if !tracks.is_empty() => {
+            if app.home.recommendations_loading {
+                theme::text(ui, "Updating…", theme::regular(13.0), palette.secondary);
+            }
+            track_list(app, ui, "", Loadable::Loaded(tracks), 20, None, None);
+        }
+        Loadable::Loaded(_) => {
+            theme::text(
+                ui,
+                "Listen to a few songs on Spotify to give your mix a starting point.",
+                theme::regular(13.0),
+                palette.secondary,
+            );
+            if !has_error {
+                recommendation_retry(app, ui);
+            }
+            ui.add_space(16.0);
+        }
+        Loadable::Loading => {
+            widgets::loading_row(ui, &palette, app.locale);
+            ui.add_space(16.0);
+        }
+        Loadable::Failed(_) | Loadable::NotLoaded => {
+            ui.add_space(16.0);
+        }
+    }
+}
+
+fn recommendation_retry(app: &mut App, ui: &mut egui::Ui) {
+    let palette = app.palette;
+    if app.music_session_ready {
+        if theme::soft_button(
+            ui,
+            &palette,
+            Some(Icon::Refresh),
+            &gettext(app.locale, "Retry"),
+            false,
+        )
+        .clicked()
+        {
+            app.actions.push(Action::RetryHomeRecommendations);
+        }
+    } else if !app.music_session_busy
+        && theme::pill_button(ui, &palette, "Enable music access", true).clicked()
+    {
+        app.actions.push(Action::EnablePlayback);
+    }
 }
 
 #[cfg(test)]

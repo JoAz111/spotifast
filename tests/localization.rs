@@ -20,13 +20,10 @@ fn catalogs_cover_the_template_and_preserve_named_placeholders() {
     let template = polib::po_file::parse_from_reader(template.as_bytes()).unwrap();
     assert!(
         template
-            .find_message(
-                None,
-                "On Wayland, use your desktop's Keep Above shortcut or window rule.",
-                None,
-            )
+            .find_message(None, "Playing on {device}", None,)
             .is_some(),
-        "the active Wayland hint must remain in the translation template"
+        // The old Keep Above hint belonged to the removed Winamp surface.
+        "the active Connect destination must remain in the translation template"
     );
     let mut catalogs = 0;
     for file in std::fs::read_dir("assets/i18n").unwrap() {
