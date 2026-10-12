@@ -320,19 +320,30 @@ pub enum ApiRequest {
 }
 
 impl ApiRequest {
-    fn background(&self) -> bool {
-        matches!(
+    /// Optional enrichment yields to pages, search and playback intent.
+    fn priority(&self) -> crate::api::admission::Priority {
+        use crate::api::admission::Priority;
+        if matches!(
             self,
-            Self::PlaybackState { .. }
-                | Self::RecentlyPlayed { .. }
-                | Self::TopTracks { .. }
+            Self::RecentlyPlayed {
+                who: RecentsFor::Home,
+                ..
+            } | Self::TopTracks { full: false, .. }
                 | Self::TopArtists { .. }
                 | Self::Recommendations { .. }
                 | Self::Discover { .. }
-                | Self::MyPlaylists { .. }
+                | Self::HomeEpisodes { .. }
                 | Self::PlaylistSample { .. }
                 | Self::Contains { .. }
-        )
+        ) {
+            Priority::Background
+        } else {
+            Priority::Foreground
+        }
+    }
+
+    fn background(&self) -> bool {
+        self.priority() == crate::api::admission::Priority::Background
     }
 }
 
@@ -3748,6 +3759,7 @@ impl Worker {
         let personal_lease = self.credentials.lease(CredentialSlot::Personal);
         let background_api = Arc::clone(&self.background_api);
         let background = request.background();
+        let priority = request.priority();
         let engine = if web_only { None } else { self.engine.clone() };
         let commands = self.commands.clone();
         let mut session = self.session.subscribe();
@@ -3761,7 +3773,11 @@ impl Worker {
                     } else {
                         None
                     };
-                    handle(&api, &connect, engine.as_deref(), request).await
+                    crate::api::admission::with_priority(
+                        priority,
+                        handle(&api, &connect, engine.as_deref(), request),
+                    )
+                    .await
                 } => result,
             };
             // Apply completion on the command loop. A late response cannot
@@ -7012,6 +7028,71 @@ mod cover_routing_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn optional_home_reads_yield_to_foreground_pages_search_and_playback() {
+        use crate::api::admission::Priority;
+        for request in [
+            ApiRequest::RecentlyPlayed {
+                who: RecentsFor::Home,
+                generation: 1,
+                before: None,
+                limit: 20,
+            },
+            ApiRequest::TopTracks {
+                offset: 0,
+                full: false,
+                generation: 1,
+            },
+            ApiRequest::TopArtists { generation: 1 },
+            ApiRequest::Discover {
+                term: "demo".into(),
+                generation: 1,
+            },
+            ApiRequest::HomeEpisodes {
+                shows: vec![],
+                generation: 1,
+            },
+            ApiRequest::Contains { uris: vec![] },
+        ] {
+            assert_eq!(request.priority(), Priority::Background);
+            assert!(request.background(), "optional reads use the background cap");
+        }
+        for request in [
+            ApiRequest::RecentlyPlayed {
+                who: RecentsFor::Panel,
+                generation: 1,
+                before: None,
+                limit: 20,
+            },
+            ApiRequest::TopTracks {
+                offset: 0,
+                full: true,
+                generation: 1,
+            },
+            ApiRequest::MyPlaylists {
+                offset: 0,
+                generation: 1,
+            },
+            ApiRequest::Album { id: "demo".into() },
+            ApiRequest::Search {
+                query: "demo".into(),
+                serial: 1,
+            },
+            ApiRequest::AddManyToQueue {
+                request: 1,
+                uris: vec![],
+                device_id: None,
+            },
+            ApiRequest::Transfer {
+                device_id: "demo".into(),
+                play: true,
+            },
+        ] {
+            assert_eq!(request.priority(), Priority::Foreground);
+            assert!(!request.background(), "foreground bypasses the background cap");
+        }
+    }
+
     use super::*;
 
     #[tokio::test]
