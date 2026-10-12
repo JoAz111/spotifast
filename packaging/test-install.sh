@@ -60,8 +60,6 @@ docker run --rm \
     test -s /usr/share/icons/hicolor/scalable/apps/spotifast.svg
     grep -qx "Icon=spotifast" /usr/share/applications/spotifast.desktop
     grep -qx "StartupWMClass=spotifast" /usr/share/applications/spotifast.desktop
-    test -s /usr/share/spotifast/omarchy/spotifast.json.tpl
-    test -x /usr/share/spotifast/omarchy/spotifast-theme
     test "$(cat /root/.config/spotifast/settings-fixture)" = preserve-existing-settings
     if [ "$FORMAT" = deb ]; then
       apt-get remove -y spotifast
@@ -71,7 +69,5 @@ docker run --rm \
     test ! -e /usr/bin/spotifast
     test ! -e /usr/share/applications/spotifast.desktop
     test ! -e /usr/share/icons/hicolor/scalable/apps/spotifast.svg
-    test ! -e /usr/share/spotifast/omarchy/spotifast.json.tpl
-    test ! -e /usr/share/spotifast/omarchy/spotifast-theme
     test "$(cat /root/.config/spotifast/settings-fixture)" = preserve-existing-settings
   '

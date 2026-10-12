@@ -59,8 +59,4 @@ package() {
   install -Dm644 "packaging/icons/spotifast.svg" \
     "${pkgdir}/usr/share/icons/hicolor/scalable/apps/spotifast.svg"
   # Older release fixtures predate the optional integration.
-  if [[ -d contrib/omarchy ]]; then
-    install -Dm644 contrib/omarchy/spotifast.json.tpl "${pkgdir}/usr/share/spotifast/omarchy/spotifast.json.tpl"
-    install -Dm755 contrib/omarchy/spotifast-theme "${pkgdir}/usr/share/spotifast/omarchy/spotifast-theme"
-  fi
 }

@@ -21,7 +21,7 @@ use crate::model::QueueTab;
 use crate::model::*;
 use crate::paths::AppDirs;
 use crate::player::{EngineConfig, LoadSpec, LocalState, Playback, PlayerCommand, RepeatMode};
-use crate::settings::{CachedRootlist, SessionState, Settings, ThemeChoice};
+use crate::settings::{CachedRootlist, SessionState, Settings};
 use crate::single_instance::ControlCommand;
 use crate::theme::{self, Palette};
 use crate::util;
@@ -247,9 +247,6 @@ pub struct App {
     last_settings_save: Instant,
     pub backend: Backend,
     media_controls: Option<MediaControls>,
-    /// The desktop's light or dark preference, for "Follow system".
-    #[cfg(target_os = "linux")]
-    system_appearance: Option<crate::appearance::SystemAppearance>,
     /// The artwork the media controls were last given, and the URL it came
     /// from. Finding the file touches the disk and the controls are synced
     /// every frame, so the answer is kept until the artwork changes.
@@ -277,8 +274,7 @@ pub struct App {
     pub hide_intent: bool,
     /// The outer loop should recreate the hidden window.
     pub wants_show: bool,
-    /// The window should close and reopen at once as the other kind: the
-    /// big window or the Winamp mini player.
+    /// Recreate the main window after changing native window chrome.
     pub switch_intent: bool,
     /// Commands from control clients (a second `spotifast <verb>` launch,
     /// a Raycast script, a link the desktop opens). Drained every frame.
@@ -300,20 +296,9 @@ pub struct App {
     /// The language the interface is drawn in: [`Settings::language`]
     /// resolved against the operating system's preferred languages.
     pub locale: crate::i18n::Locale,
-    /// Whether this window's native backend can keep it above other windows.
-    pub window_level_supported: bool,
-    /// Whether this window's native backend can leave the mini player out of
-    /// the taskbar: Windows and X11.
-    pub taskbar_hiding_supported: bool,
     #[cfg(any(test, feature = "demo"))]
     pub demo_windows_controls: bool,
-    applied_dark: Option<bool>,
-    /// Reveals new colours from the middle of the window outwards.
-    theme_transition: fastframe_theme::Transition,
-    /// Whether colour changes are revealed. Tests that check which palette
-    /// applies, on a context that never draws, turn it off.
-    pub(crate) reveal_theme_changes: bool,
-    pub custom_themes: theme::Catalog,
+    style_applied: bool,
 
     pub auth: AuthStatus,
     pub user: Option<User>,
@@ -335,11 +320,6 @@ pub struct App {
     last_session_save: Instant,
     /// The saved zoom has been applied to the context once.
     zoom_applied: bool,
-    /// Frames left to re-send the Winamp window's always-on-top level after the
-    /// window opens. X11 window managers drop `_NET_WM_STATE_ABOVE` set before
-    /// the window is mapped, so the creation-time level does not stick; a level
-    /// pushed on the first frames after mapping does.
-    winamp_level_reassert: u8,
     pub devices: Vec<Device>,
     /// Receivers seen on the local network. Spotify lists a receiver only
     /// once it has an account, so these are the ones it cannot see yet.
@@ -484,12 +464,6 @@ pub struct App {
     /// Where the open dialog drew itself, so its own layout can be held
     /// to the window it has to fit inside.
     pub dialog_rect: Option<egui::Rect>,
-    /// Where the MilkDrop window last was, as it reported, for restoring it.
-    pub milkdrop_pos: Option<[f32; 2]>,
-    /// The MilkDrop child process; `None` until it is first opened. Its
-    /// `Drop` stops the child when the app does.
-    #[cfg(feature = "milkdrop")]
-    milkdrop_host: Option<crate::milkdrop::host::Host>,
     last_eviction: Instant,
     /// Playback snapshot for the current frame, built once per redraw.
     frame_now: Option<NowPlaying>,
@@ -590,10 +564,6 @@ pub struct App {
     pub update_support: Option<Result<crate::updates::Installation, String>>,
     pub update_restart_arguments: Vec<String>,
     pub update_receipt: Option<fastframe_update::Receipt>,
-    /// Winamp window state and active skin.
-    pub winamp: crate::winamp::WinampState,
-    /// The spectrum behind the player bar, when that is chosen.
-    pub player_bar_analyser: crate::vis::WideAnalyser,
 }
 
 /// How many plays the Home shelf asks for: it shows sixteen cards.
@@ -693,23 +663,12 @@ impl App {
         // settings beside it until migration binds that password in the store.
         settings.proxy_password_legacy |= dirs.proxy_secret_file().try_exists().unwrap_or(true);
         let plays = crate::history::History::load(&dirs.history_file());
-        let tap = crate::vis::AudioTap::new();
-        let eq = crate::eq::shared();
-        if let Ok(mut shared) = eq.lock() {
-            *shared = eq_settings(&settings);
-        }
         let applied_proxy_preferences = settings.proxy_preferences();
         let applied_proxy = match settings.proxy_config() {
             Ok(proxy) => proxy,
             Err(error) => crate::settings::ProxyConfig::Invalid(error),
         };
-        let engine_config = engine_config(
-            &dirs,
-            &settings,
-            applied_proxy.clone(),
-            std::sync::Arc::clone(&tap),
-            std::sync::Arc::clone(&eq),
-        );
+        let engine_config = engine_config(&dirs, &settings, applied_proxy.clone());
         let backend = Backend::spawn(
             dirs.clone(),
             engine_config,
@@ -730,13 +689,6 @@ impl App {
         let media_controls = options
             .media_controls
             .then(|| MediaControls::start(media_app(), move || wake.wake()));
-        #[cfg(target_os = "linux")]
-        let system_appearance = {
-            let wake = waker.clone();
-            options
-                .media_controls
-                .then(|| crate::appearance::SystemAppearance::spawn(move || wake.wake()))
-        };
         #[cfg(target_os = "macos")]
         let media_controls = {
             let mut media_controls = media_controls;
@@ -769,9 +721,8 @@ impl App {
             .filter(|page| !matches!(page, Page::Settings | Page::Queue))
             .unwrap_or(Page::Home);
 
-        let palette = settings.cached_palette().unwrap_or_else(Palette::dark);
+        let palette = Palette::dark();
         let mut app = Self {
-            custom_themes: theme::Catalog::default(),
             dirs,
             settings,
             soloist_mode: std::env::var_os("SPOTIFAST_SOLOIST_SOCKET").is_some(),
@@ -787,8 +738,6 @@ impl App {
             last_settings_save: Instant::now(),
             backend,
             media_controls,
-            #[cfg(target_os = "linux")]
-            system_appearance,
             media_art: None,
             tray,
             tray_playing: false,
@@ -809,13 +758,9 @@ impl App {
             network_reachable: true,
             palette,
             locale,
-            window_level_supported: true,
-            taskbar_hiding_supported: cfg!(windows),
             #[cfg(any(test, feature = "demo"))]
             demo_windows_controls: false,
-            applied_dark: None,
-            theme_transition: fastframe_theme::Transition::default(),
-            reveal_theme_changes: true,
+            style_applied: false,
             auth: AuthStatus::Starting,
             user: None,
             local_device_id: None,
@@ -830,7 +775,6 @@ impl App {
             session_dirty: false,
             last_session_save: Instant::now(),
             zoom_applied: false,
-            winamp_level_reassert: 0,
             devices: Vec::new(),
             receivers: Vec::new(),
             activating_receiver: None,
@@ -933,9 +877,6 @@ impl App {
             },
             session_lyrics_fullscreen_from: session.lyrics_fullscreen_from,
             dialog_rect: None,
-            milkdrop_pos: session.milkdrop_pos,
-            #[cfg(feature = "milkdrop")]
-            milkdrop_host: None,
             last_eviction: Instant::now(),
             frame_now: None,
             sign_in_url: None,
@@ -994,8 +935,6 @@ impl App {
             update_support: None,
             update_restart_arguments: Vec::new(),
             update_receipt: None,
-            winamp: crate::winamp::WinampState::new(session.winamp_pos, tap, eq),
-            player_bar_analyser: crate::vis::WideAnalyser::default(),
         };
         app.local.volume = app.settings.volume;
         // What was played here is on disk and needs nothing from the
@@ -1017,14 +956,12 @@ impl App {
     pub fn attach(&mut self, ctx: &egui::Context) {
         theme::install(ctx);
         ctx.add_bytes_loader(std::sync::Arc::new(self.backend.art().clone()));
-        ctx.set_theme(self.theme_preference());
-        self.applied_dark = None;
-        self.winamp.forget_textures();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        self.style_applied = false;
         self.window_hidden = false;
         self.hide_intent = false;
         self.wants_show = false;
         self.switch_intent = false;
-        self.winamp_level_reassert = 0;
         // A new window starts titled "Spotifast"; name the playing song
         // again rather than trust what the replaced window was told.
         self.window_title.clear();
@@ -1037,20 +974,7 @@ impl App {
         // the frameless main window full screen and nothing else could
         // leave it, it was an ordinary window.
         let lyrics_left = self.session_lyrics_fullscreen_from.take();
-        if self.settings.winamp_window {
-            // The mini player sizes itself; the big window's geometry
-            // waits here for its return. eframe may have restored the big
-            // window's fullscreen/maximized state before creating this one.
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
-            // Re-assert the on-top level over the
-            // first frames, once the window is mapped, because the level set
-            // at creation does not stick on X11.
-            if self.settings.winamp_on_top && self.window_level_supported {
-                self.winamp_level_reassert = 3;
-            }
-            return;
-        }
+
         let restored_full_screen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
         let lyrics_left = lyrics_left.or_else(|| {
             (cfg!(windows) && restored_full_screen).then(crate::settings::WindowMode::default)
@@ -1071,7 +995,6 @@ impl App {
     /// The window is gone but the process stays: audio, the tray, and the
     /// media controls keep running until Show or Quit.
     pub fn window_gone(&mut self) {
-        self.winamp.forget_textures();
         self.window_hidden = true;
         self.hide_intent = false;
         self.wants_show = false;
@@ -1389,6 +1312,44 @@ impl App {
         }))
     }
 
+    /// The active playback destination, using the receiver's real name.
+    pub fn playback_device(&self) -> Option<(String, String)> {
+        if self.local.is_active() && self.local_transfer_sequence != Some(self.local.track_sequence)
+        {
+            let device = self
+                .devices
+                .iter()
+                .find(|device| self.local_device_id.is_some() && device.id == self.local_device_id)
+                .or_else(|| {
+                    self.remote_fresh()
+                        .and_then(|remote| remote.state.device.as_ref())
+                        .filter(|device| {
+                            self.local_device_id.is_some() && device.id == self.local_device_id
+                        })
+                });
+            let name = device
+                .map(|device| device.name.trim())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| {
+                    if self.soloist_mode {
+                        "Spotifast Soloist"
+                    } else {
+                        self.settings.device_name.trim()
+                    }
+                });
+            return (!name.is_empty()).then(|| (name.to_owned(), "computer".to_owned()));
+        }
+        let remote = self.remote_fresh()?;
+        remote.state.item.as_ref()?;
+        let device = remote
+            .state
+            .device
+            .as_ref()
+            .filter(|device| device.is_active)?;
+        let name = device.name.trim();
+        (!name.is_empty()).then(|| (name.to_owned(), device.kind.clone()))
+    }
+
     pub fn now_playing(&self) -> Option<NowPlaying> {
         if let Some(now) = &self.frame_now {
             return Some(now.clone());
@@ -1456,7 +1417,7 @@ impl App {
             };
             return Some(NowPlaying {
                 local: true,
-                device_name: None,
+                device_name: self.playback_device().map(|(name, _)| name),
                 uri: track.uri.clone(),
                 id: util::uri_id(&track.uri).map(str::to_string),
                 title: track.title.clone(),
@@ -1675,9 +1636,6 @@ impl App {
 
     /// The colour to tint the interface with, from the playing art.
     pub fn now_playing_tint(&self) -> Option<Color32> {
-        if !self.settings.accent_from_art {
-            return None;
-        }
         let now = self.now_playing()?;
         let url = now.art_small.or(now.art_url)?;
         self.accents.get(&url).copied()
@@ -2125,9 +2083,6 @@ impl App {
             }
             AuthStatus::WaitingForBrowser { url } => self.sign_in_url = Some(url.clone()),
             AuthStatus::SignedOut => {
-                if matches!(self.dialog, Some(Dialog::PersonalAppIntro)) {
-                    self.dialog = None;
-                }
                 self.uploaded_covers.clear();
                 self.sign_in_url = None;
                 self.web_app = None;
@@ -2895,10 +2850,7 @@ impl App {
         if let Some(url) = now.art_small.or(now.art_url) {
             self.tint_for(Some(&url));
         }
-        if matches!(self.page(), Page::Queue)
-            || self.show_queue_panel
-            || (self.settings.winamp_window && self.settings.playlist_open)
-        {
+        if matches!(self.page(), Page::Queue) || self.show_queue_panel {
             self.refresh_queue(true);
         }
         if self.show_lyrics_panel {
@@ -2925,46 +2877,16 @@ impl App {
             return;
         }
         self.lyrics = Loadable::Loading;
-        self.backend.send(Command::Lyrics(Box::new(LyricsRequest {
-            uri: now.uri,
-            query: crate::lyrics::Query {
-                artist: now
-                    .artists
-                    .first()
-                    .map(|artist| artist.name.clone())
-                    .unwrap_or_default(),
-                title: now.title,
-                album: now.album_name,
-                duration_ms: now.duration_ms,
-            },
-        })));
-    }
-
-    /// Pushes the Winamp window's always-on-top level to the live window.
-    fn push_winamp_level(&self, ctx: &egui::Context) {
-        if self.window_level_supported
-            && let Some(level) =
-                winamp_on_top_level(self.settings.winamp_window, self.settings.winamp_on_top)
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
-        }
+        self.backend
+            .send(Command::Lyrics(Box::new(LyricsRequest { uri: now.uri })));
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
-        self.poll_custom_themes(ctx);
         let now = Instant::now();
-        if self.winamp_level_reassert > 0 {
-            self.winamp_level_reassert -= 1;
-            self.push_winamp_level(ctx);
-            // The window can be idle right after opening, so drive the next
-            // frame to make sure the re-assert actually runs.
-            if self.winamp_level_reassert > 0 {
-                ctx.request_repaint();
-            }
-        }
+
         // The zoom is the main window's: a pass without a window, or in the
         // mini player at its own scale, neither applies nor saves it.
-        let main_window = !self.window_hidden && !self.settings.winamp_window;
+        let main_window = !self.window_hidden;
         if main_window && !self.zoom_applied {
             self.zoom_applied = true;
             let zoom = self.settings.zoom.clamp(0.5, 2.5);
@@ -2981,7 +2903,6 @@ impl App {
         }
         self.toasts
             .retain(|toast| toast.created.elapsed() < TOAST_LIFETIME);
-        self.maybe_suggest_personal_app();
 
         if self.settings.check_for_updates
             && !self.offline
@@ -3016,8 +2937,7 @@ impl App {
             {
                 self.refresh_devices();
             }
-            let playlist_open = self.settings.winamp_window && self.settings.playlist_open;
-            if (self.show_queue_panel || matches!(self.page(), Page::Queue) || playlist_open)
+            if (self.show_queue_panel || matches!(self.page(), Page::Queue))
                 && !self.queue.is_loading()
                 && self
                     .queue_fetched_at
@@ -3063,7 +2983,6 @@ impl App {
             self.backend.art().evict(ctx);
             self.evict_stale_pages();
         }
-        self.sync_skin(ctx);
         if self.settings_dirty && self.last_settings_save.elapsed() > Duration::from_secs(2) {
             self.save_settings();
         }
@@ -3078,198 +2997,6 @@ impl App {
         if self.session_dirty && self.last_session_save.elapsed() > Duration::from_secs(2) {
             self.save_session();
         }
-    }
-
-    /// Loads and applies the skin selected in settings.
-    /// On failure, restores the active skin setting to avoid repeated retries.
-    fn sync_skin(&mut self, ctx: &egui::Context) {
-        if self.settings.winamp_window
-            && !self.winamp.is_loading()
-            && self.winamp.worn != self.settings.skin
-        {
-            match self.settings.skin.clone() {
-                None => self.winamp.wear(None, crate::skin::Skin::builtin()),
-                Some(name) => self.winamp.load(name, &self.dirs.skins_dir(), ctx),
-            }
-        }
-        if let Some(loaded) = self.winamp.poll() {
-            self.skin_loaded(loaded);
-        }
-        let fetched = self.winamp.presets.poll();
-        if let Some(fetched) = fetched {
-            match fetched {
-                Ok(count) => {
-                    self.toast(
-                        ngettext(
-                            self.locale,
-                            // Translators: {count} is the number of visualizer presets added.
-                            "Added {count} MilkDrop preset",
-                            "Added {count} MilkDrop presets",
-                            count as u32,
-                        )
-                        .replace("{count}", &count.to_string()),
-                    );
-                    // Restart the child so it loads the new preset list.
-                    #[cfg(feature = "milkdrop")]
-                    if let Some(host) = self.milkdrop_host.as_mut()
-                        && host.is_running()
-                    {
-                        host.close();
-                    }
-                }
-                Err(error) => self.toast_error(
-                    // Translators: {error} is an error message.
-                    gettext(self.locale, "Couldn't fetch presets: {error}")
-                        .replace("{error}", &error.to_string()),
-                ),
-            }
-        }
-    }
-
-    /// Syncs MilkDrop settings and receives window state and commands.
-    #[cfg(feature = "milkdrop")]
-    fn sync_milkdrop(&mut self, ctx: &egui::Context) {
-        let presets = self.dirs.milkdrop_dir();
-        let open = self.settings.milkdrop_open;
-        let size = self.settings.milkdrop_size;
-        let pos = self.milkdrop_pos;
-        let fullscreen = self.settings.milkdrop_fullscreen;
-        let fps = self.settings.milkdrop_fps;
-        let seconds = self.settings.milkdrop_seconds;
-        let scale = self.settings.milkdrop_scale.max(1);
-        // Track metadata shown when the song changes.
-        let song = self.now_playing().filter(|now| !now.resuming).map(|now| {
-            // Title, artist, and album.
-            vec![
-                now.title.clone(),
-                now.subtitle.clone(),
-                now.album_name.clone(),
-            ]
-        });
-        if self.milkdrop_host.is_none() {
-            let tap = std::sync::Arc::clone(&self.winamp.tap);
-            self.milkdrop_host = Some(crate::milkdrop::host::Host::new(tap));
-        }
-        let poll = {
-            let host = self.milkdrop_host.as_mut().expect("the host was just made");
-            if open {
-                if !host.is_running() {
-                    host.open(&presets, size, pos, fullscreen, fps, seconds, scale);
-                }
-                host.update(fps, seconds, scale);
-                host.song(song);
-            } else if host.is_running() {
-                host.close();
-            }
-            host.poll()
-        };
-        if poll.closed {
-            self.settings.milkdrop_open = false;
-            self.mark_settings_dirty();
-        }
-        if let Some(size) = poll.size
-            && self.settings.milkdrop_size != size
-        {
-            self.settings.milkdrop_size = size;
-            self.mark_settings_dirty();
-        }
-        if let Some(pos) = poll.pos {
-            self.milkdrop_pos = Some(pos);
-        }
-        for command in poll.commands {
-            self.milkdrop_command(&command);
-        }
-        if let Some(hz) = poll.screen_hz {
-            self.learn_screen_hz(hz);
-        }
-        // Poll the child while the main window is otherwise idle.
-        if self.settings.milkdrop_open {
-            ctx.request_repaint_after(std::time::Duration::from_millis(300));
-        }
-    }
-
-    /// Records the MilkDrop screen refresh rate and uses it as the initial FPS.
-    /// Later screen changes do not override a configured FPS.
-    #[cfg(feature = "milkdrop")]
-    fn learn_screen_hz(&mut self, hz: u32) {
-        if hz == 0 || self.settings.milkdrop_screen_hz == hz {
-            return;
-        }
-        let first = self.settings.milkdrop_screen_hz == 0
-            && self.settings.milkdrop_fps == crate::milkdrop::DEFAULT_FPS;
-        self.settings.milkdrop_screen_hz = hz;
-        if first {
-            self.settings.milkdrop_fps = hz;
-        }
-        self.mark_settings_dirty();
-    }
-
-    /// Applies playback commands received from the MilkDrop window.
-    #[cfg(feature = "milkdrop")]
-    fn milkdrop_command(&mut self, command: &str) {
-        match command {
-            "previous" => self.actions.push(Action::Previous),
-            "next" => self.actions.push(Action::Next),
-            "play-pause" => self.actions.push(Action::TogglePlay),
-            "mute" => self.actions.push(Action::ToggleMute),
-            "save-toggle" => {
-                if let Some(now) = self.now_playing().filter(|now| !now.is_episode) {
-                    self.actions.push(Action::ToggleSaved(now.uri));
-                }
-            }
-            "shuffle" => self.actions.push(Action::ToggleShuffle),
-            "volume-up" => self.actions.push(Action::VolumeBy(5)),
-            "volume-down" => self.actions.push(Action::VolumeBy(-5)),
-            _ => {}
-        }
-    }
-
-    /// Creates a config folder if needed and opens it in the file manager.
-    fn open_folder(&mut self, folder: std::path::PathBuf) {
-        let opened = std::fs::create_dir_all(&folder).and_then(|()| crate::opener::open(&folder));
-        if let Err(error) = opened {
-            self.toast_error(
-                // Translators: {folder} is a folder path and {error} is an error message.
-                gettext(self.locale, "Couldn't open {folder}: {error}")
-                    .replace("{folder}", &folder.display().to_string())
-                    .replace("{error}", &error.to_string()),
-            );
-        }
-    }
-
-    /// Applies a loaded skin. Installed files become the selected skin.
-    fn skin_loaded(&mut self, loaded: crate::winamp::Loaded) {
-        match loaded.result {
-            Ok(skin) => {
-                self.winamp
-                    .wear(Some(loaded.name.clone()), std::sync::Arc::new(skin));
-                if loaded.installed {
-                    self.toast(
-                        // Translators: {skin} is the name of a Winamp skin.
-                        gettext(self.locale, "Added {skin} skin")
-                            .replace("{skin}", crate::winamp::label(&loaded.name)),
-                    );
-                    self.winamp.list_choices(&self.dirs.skins_dir());
-                    self.settings.skin = Some(loaded.name);
-                    self.settings_dirty = true;
-                }
-            }
-            Err(error) => {
-                self.toast_error(format!("{}: {error}", crate::winamp::label(&loaded.name)));
-                if !loaded.installed {
-                    self.settings.skin = self.winamp.worn.clone();
-                    self.settings_dirty = true;
-                }
-            }
-        }
-    }
-
-    /// Sends equalizer settings to the player and marks them for saving.
-    fn push_eq(&mut self) {
-        if let Ok(mut shared) = self.winamp.eq.lock() {
-            *shared = eq_settings(&self.settings);
-        }
-        self.settings_dirty = true;
     }
 
     /// Note that a setting changed, so the file is saved shortly.
@@ -3378,121 +3105,13 @@ impl App {
         saved.save(&self.dirs.settings_file());
     }
 
-    /// Called at launch or by the local reload command. Construction and window
-    /// attachment never scan theme files.
-    pub fn load_custom_themes(&mut self, waker: &Waker) {
-        let waker = waker.clone();
-        self.custom_themes.start(
-            self.dirs.config.join("themes"),
-            self.settings.custom_theme.clone(),
-            &fastframe_theme::Waker::new(move || waker.wake()),
-        );
-    }
-
-    /// Adds the desktop's palettes (Omarchy on Linux) for a normal launch.
-    pub fn enable_desktop_themes(&mut self) {
-        theme::enable_desktop_themes(&mut self.custom_themes);
-    }
-
-    fn poll_custom_themes(&mut self, ctx: &egui::Context) {
-        // The themes folder or Omarchy's current theme changed on disk.
-        if self.custom_themes.needs_reload() {
-            self.actions.push(Action::ReloadThemes);
-        }
-        if self.custom_themes.poll() {
-            self.adopt_custom_themes(ctx);
-        }
-    }
-
-    /// Takes the selected and the desktop's palettes from a finished scan.
-    fn adopt_custom_themes(&mut self, ctx: &egui::Context) {
-        let mut changed = false;
-        if let Some(filename) = &self.settings.custom_theme
-            && let Some(theme) = self.custom_themes.find(filename)
-            && self.settings.custom_theme_cache.as_ref() != Some(theme)
-        {
-            // Use the current selection, never the selection captured by the scan.
-            self.settings.custom_theme_cache = Some(theme.clone());
-            changed = true;
-        }
-        if self.custom_themes.follows_omarchy() {
-            if let Some(theme) = self.custom_themes.system_theme()
-                && self.settings.system_theme_cache.as_ref() != Some(theme)
-            {
-                self.settings.system_theme_cache = Some(theme.clone());
-                changed = true;
-            }
-        } else if self.settings.system_theme_cache.take().is_some() {
-            changed = true;
-        }
-        if changed {
-            self.mark_settings_dirty();
-            ctx.set_theme(self.theme_preference());
-        }
-    }
-
-    fn custom_palette(&self) -> Option<Palette> {
-        self.settings.cached_palette()
-    }
-
-    fn theme_preference(&self) -> egui::ThemePreference {
-        if let Some(palette) = self.custom_palette() {
-            return if palette.dark {
-                egui::ThemePreference::Dark
-            } else {
-                egui::ThemePreference::Light
-            };
-        }
-        match self.settings.theme {
-            ThemeChoice::Dark => egui::ThemePreference::Dark,
-            ThemeChoice::Light => egui::ThemePreference::Light,
-            ThemeChoice::System => egui::ThemePreference::System,
-        }
-    }
-
     fn apply_theme(&mut self, ctx: &egui::Context) {
-        // winit reports no system theme on Linux, so "Follow system" falls
-        // back to what the desktop portal says.
-        #[cfg(target_os = "linux")]
-        if let Some(dark) = self
-            .system_appearance
-            .as_ref()
-            .and_then(crate::appearance::SystemAppearance::dark)
-        {
-            let theme = if dark {
-                egui::Theme::Dark
-            } else {
-                egui::Theme::Light
-            };
-            if ctx.options(|options| options.fallback_theme) != theme {
-                ctx.options_mut(|options| options.fallback_theme = theme);
-            }
-        }
-        let dark = ctx.theme() == egui::Theme::Dark;
-        let palette = self.custom_palette().unwrap_or_else(|| {
-            if dark {
-                Palette::dark()
-            } else {
-                Palette::light()
-            }
-        });
-        if self.applied_dark != Some(dark) || self.palette != palette {
-            // The first colours need no reveal, and the mini player's window
-            // is drawn by its skin.
-            if self.reveal_theme_changes
-                && self.applied_dark.is_some()
-                && !self.settings.winamp_window
-            {
-                self.theme_transition.begin(ctx);
-                if self.theme_transition.holding(ctx) {
-                    return;
-                }
-            }
+        ctx.set_theme(egui::ThemePreference::Dark);
+        let palette = Palette::dark();
+        if !self.style_applied || self.palette != palette {
             self.palette = palette;
             theme::apply(ctx, &self.palette);
-            self.applied_dark = Some(dark);
-            self.accents.clear();
-            self.accent_pending.clear();
+            self.style_applied = true;
         }
     }
 
@@ -3553,7 +3172,6 @@ impl App {
             let playing = self.now_playing().is_some_and(|now| now.playing);
             let action = match command {
                 ControlCommand::Show => Some(Action::ShowWindow),
-                ControlCommand::ReloadThemes => Some(Action::ReloadThemes),
                 ControlCommand::PlayPause => Some(Action::TogglePlay),
                 ControlCommand::Play => (!playing).then_some(Action::TogglePlay),
                 ControlCommand::Pause => playing.then_some(Action::TogglePlay),
@@ -3684,11 +3302,6 @@ impl App {
         {
             cfg!(windows)
         }
-    }
-
-    /// Whether to offer hiding the mini player's taskbar entry.
-    pub fn taskbar_setting_visible(&self) -> bool {
-        self.taskbar_hiding_supported || self.windows_controls_visible()
     }
 
     fn sync_media_controls(&mut self, ctx: &egui::Context) {
@@ -4014,6 +3627,9 @@ impl App {
                 .loaded_at
                 .is_some_and(|at| at.elapsed() < Duration::from_secs(600))
         {
+            // Enabling an optional shelf must not refetch the rest of Home.
+            self.load_home_discover();
+            self.load_home_recommendations();
             return;
         }
         self.home.requested = true;
@@ -4041,21 +3657,7 @@ impl App {
             full: false,
             generation,
         });
-        self.home.discover_pending.clear();
-        for term in DISCOVER_TERMS {
-            self.home
-                .discover_pending
-                .insert((*term).to_string(), Loadable::Loading);
-            if !self.home.discover.contains_key(*term) {
-                self.home
-                    .discover
-                    .insert((*term).to_string(), Loadable::Loading);
-            }
-            self.backend.api(ApiRequest::Discover {
-                term: (*term).to_string(),
-                generation,
-            });
-        }
+        self.load_home_discover();
         // The podcast shelf reads from the saved shows. The first page of
         // them is the one the Podcasts shelf of the library asks for.
         if self.settings.music_only {
@@ -4066,6 +3668,57 @@ impl App {
         } else if !self.library.shows.loading && self.library.shows.error.is_none() {
             self.load_more(Page::Podcasts);
         }
+    }
+
+    fn load_home_discover(&mut self) {
+        if !self.settings.home.made_for_you.visible
+            || self.home.discover_generation == self.home.generation
+        {
+            return;
+        }
+        self.home.discover_generation = self.home.generation;
+        self.home.discover_pending.clear();
+        for term in DISCOVER_TERMS {
+            self.home
+                .discover_pending
+                .insert((*term).to_string(), Loadable::Loading);
+            self.home
+                .discover
+                .entry((*term).to_string())
+                .or_insert(Loadable::Loading);
+            self.backend.api(ApiRequest::Discover {
+                term: (*term).to_string(),
+                generation: self.home.generation,
+            });
+        }
+    }
+
+    fn load_home_recommendations(&mut self) {
+        if !self.settings.home.recommendations.visible
+            || self.home.recommendations_generation == self.home.generation
+        {
+            return;
+        }
+        let Some(tracks) = self.home.top_tracks.get() else {
+            return;
+        };
+        let seeds: Vec<String> = tracks
+            .iter()
+            .filter_map(|track| track.id.clone())
+            .take(5)
+            .collect();
+        self.home.recommendations_generation = self.home.generation;
+        if seeds.is_empty() {
+            return;
+        }
+        if self.home.recommendations.get().is_none() {
+            self.home.recommendations = Loadable::Loading;
+        }
+        self.backend.api(ApiRequest::Recommendations {
+            seed_tracks: seeds,
+            seed_artists: Vec::new(),
+            generation: self.home.generation,
+        });
     }
 
     /// Asks for the newest episodes of the most recently saved podcasts,
@@ -4168,14 +3821,17 @@ impl App {
             }
             Page::Albums => {
                 let list = &mut self.library.albums;
-                if let Some(offset) = list.next_offset.filter(|_| list.can_load_more()) {
+                if let Some(offset) = list
+                    .next_offset
+                    .filter(|_| list.error.is_none() && list.can_load_more())
+                {
                     list.loading = true;
                     self.backend.api(ApiRequest::SavedAlbums { offset });
                 }
             }
             Page::Artists => {
                 let list = &mut self.library.artists;
-                if list.can_load_more() {
+                if list.error.is_none() && list.can_load_more() {
                     list.loading = true;
                     self.backend.api(ApiRequest::FollowedArtists {
                         after: list.after.clone(),
@@ -4184,14 +3840,20 @@ impl App {
             }
             Page::Podcasts => {
                 let list = &mut self.library.shows;
-                if let Some(offset) = list.next_offset.filter(|_| list.can_load_more()) {
+                if let Some(offset) = list
+                    .next_offset
+                    .filter(|_| list.error.is_none() && list.can_load_more())
+                {
                     list.loading = true;
                     self.backend.api(ApiRequest::SavedShows { offset });
                 }
             }
             Page::Episodes => {
                 let list = &mut self.library.episodes;
-                if let Some(offset) = list.next_offset.filter(|_| list.can_load_more()) {
+                if let Some(offset) = list
+                    .next_offset
+                    .filter(|_| list.error.is_none() && list.can_load_more())
+                {
                     list.loading = true;
                     self.backend.api(ApiRequest::SavedEpisodes { offset });
                 }
@@ -4232,6 +3894,9 @@ impl App {
             Page::Album(id) => {
                 if let Some(page) = self.album_pages.get_mut(&id) {
                     let list = &mut page.tracks;
+                    if list.error.is_some() {
+                        return;
+                    }
                     if list.base_offset > 0
                         && self.table_sorts.contains_key(&Page::Album(id.clone()))
                     {
@@ -4258,7 +3923,10 @@ impl App {
             Page::Show(id) => {
                 if let Some(page) = self.show_pages.get_mut(&id) {
                     let list = &mut page.episodes;
-                    if let Some(offset) = list.next_offset.filter(|_| list.can_load_more()) {
+                    if let Some(offset) = list
+                        .next_offset
+                        .filter(|_| list.error.is_none() && list.can_load_more())
+                    {
                         list.loading = true;
                         self.backend.api(ApiRequest::ShowEpisodes { id, offset });
                     }
@@ -4454,8 +4122,8 @@ impl App {
         self.ensure_loaded(page);
     }
 
-    fn poll_remote(&mut self, _immediate: bool) {
-        if !self.is_connected() {
+    fn poll_remote(&mut self, immediate: bool) {
+        if !self.is_connected() || (self.soloist_mode && self.local.is_active() && !immediate) {
             return;
         }
         self.remote_poll_pending = true;
@@ -5420,24 +5088,10 @@ impl App {
                     && let Ok(page) = result
                 {
                     let tracks = page.items;
-                    let seeds: Vec<String> = tracks
-                        .iter()
-                        .filter_map(|track| track.id.clone())
-                        .take(5)
-                        .collect();
-                    if !seeds.is_empty() {
-                        if self.home.recommendations.get().is_none() {
-                            self.home.recommendations = Loadable::Loading;
-                        }
-                        self.backend.api(ApiRequest::Recommendations {
-                            seed_tracks: seeds,
-                            seed_artists: Vec::new(),
-                            generation,
-                        });
-                    }
                     let uris: Vec<String> = tracks.iter().map(|track| track.uri.clone()).collect();
                     self.request_contains(uris);
                     self.home.top_tracks = Loadable::Loaded(tracks);
+                    self.load_home_recommendations();
                 } else if generation == self.home.generation
                     && offset == 0
                     && let Err(error) = result
@@ -8586,7 +8240,6 @@ impl App {
                 | Action::Back
                 | Action::Forward
                 | Action::SignOut
-                | Action::ToggleWinampWindow
                 | Action::ToggleQueuePanel
         ) {
             self.leave_lyrics_fullscreen(ctx);
@@ -8595,9 +8248,7 @@ impl App {
             Action::Open(page) => self.open(page),
             Action::OpenSongRadio { uri, track } => self.open_song_radio(&uri, &track),
             Action::PrepareTint(url) => {
-                if self.settings.accent_from_art {
-                    self.tint_for(Some(&url));
-                }
+                self.tint_for(Some(&url));
             }
             Action::OpenUri(uri) => {
                 if let Some(page) = Page::from_uri(&uri) {
@@ -9070,10 +8721,6 @@ impl App {
                 self.dialog = Some(dialog);
             }
             Action::CloseDialog => {
-                if matches!(self.dialog, Some(Dialog::PersonalAppIntro)) {
-                    self.settings.personal_app_intro_seen = true;
-                    self.settings_dirty = true;
-                }
                 self.dialog = None;
             }
             Action::CreatePlaylist {
@@ -9259,21 +8906,6 @@ impl App {
                     self.settings.web_client_id.clone(),
                 ));
             }
-            Action::OpenPersonalAppSetup => {
-                self.settings.personal_app_intro_seen = true;
-                self.settings_dirty = true;
-                self.dialog = None;
-                self.open(Page::Settings);
-                // A saved search could be hiding the Client ID field the
-                // flow is about to focus, so drop it before landing.
-                crate::ui::settings::clear_search(ctx);
-                ctx.data_mut(|data| {
-                    data.insert_temp(
-                        egui::Id::new(crate::ui::settings::PERSONAL_APP_FOCUS_ID),
-                        true,
-                    );
-                });
-            }
             Action::SignOut => {
                 self.backend.send(Command::SignOut);
                 self.history = vec![Page::Home];
@@ -9443,50 +9075,19 @@ impl App {
                     .retain(|key| !self.settings.pinned_contexts.contains(key));
                 self.mark_settings_dirty();
             }
-            Action::SetTheme(choice) => {
-                self.settings.theme = choice;
-                self.settings.custom_theme = None;
-                self.settings.custom_theme_cache = None;
-                self.mark_settings_dirty();
-                ctx.set_theme(self.theme_preference());
-                self.apply_theme(ctx);
-            }
             Action::SetLanguage(choice) => {
                 self.settings.language = choice;
                 self.locale = choice.resolve();
                 self.mark_settings_dirty();
                 ctx.request_repaint();
             }
-            Action::SetCustomTheme(filename) => {
-                if let Some(theme) = self.custom_themes.find(&filename) {
-                    self.settings.custom_theme_cache = Some(theme.clone());
-                    self.settings.custom_theme = Some(filename);
-                    self.mark_settings_dirty();
-                    ctx.set_theme(self.theme_preference());
-                    self.apply_theme(ctx);
-                }
-            }
-            Action::ReloadThemes => {
-                let waker = Waker::default();
-                waker.attach(ctx);
-                self.load_custom_themes(&waker);
-            }
-            Action::OpenThemesFolder => {
-                self.backend.send(Command::OpenThemesFolder);
-            }
             Action::SettingsChanged => {
                 self.settings_dirty = true;
-                ctx.set_theme(self.theme_preference());
+                ctx.set_theme(egui::ThemePreference::Dark);
             }
             Action::RestartEngine => {
                 self.save_settings();
-                let config = engine_config(
-                    &self.dirs,
-                    &self.settings,
-                    self.applied_proxy.clone(),
-                    std::sync::Arc::clone(&self.winamp.tap),
-                    std::sync::Arc::clone(&self.winamp.eq),
-                );
+                let config = engine_config(&self.dirs, &self.settings, self.applied_proxy.clone());
                 self.backend.send(Command::RestartEngine(config));
                 if self.local_ready {
                     self.toast(gettext(self.locale, "Restarting local playback"));
@@ -9578,59 +9179,12 @@ impl App {
                         .replace("{error}", &error.to_string()),
                 ),
             },
-            Action::ToggleWinampWindow => {
-                // One window at a time: this one closes and the loop in
-                // `main` opens the other kind where each was last.
-                if !self.settings.winamp_window && self.settings.random_skin {
-                    self.winamp.refresh_choices(&self.dirs.skins_dir());
-                    let candidates: Vec<Option<String>> = std::iter::once(None)
-                        .chain(
-                            self.winamp
-                                .choices
-                                .iter()
-                                .map(|choice| Some(choice.name.clone())),
-                        )
-                        .collect();
-                    self.settings.skin = crate::winamp::pick_another(
-                        &candidates,
-                        &self.settings.skin,
-                        &mut rand::rng(),
-                    );
-                }
-                self.settings.winamp_window = !self.settings.winamp_window;
-                self.settings_dirty = true;
-                self.switch_intent = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            Action::SetSkin(name) => {
-                self.settings.skin = name;
-                self.settings.random_skin = false;
-                self.settings_dirty = true;
-            }
-            Action::SetRandomSkin(random) => {
-                self.settings.random_skin = random;
-                self.settings_dirty = true;
-            }
-            Action::InstallSkin(path) => {
-                self.winamp.install(path, &self.dirs.skins_dir(), ctx);
-            }
-            Action::SetSkinScale(scale) => {
-                self.settings.skin_scale = Some(scale);
-                self.settings_dirty = true;
-            }
-            Action::ToggleWinampOnTop => {
-                if self.window_level_supported {
-                    self.settings.winamp_on_top = !self.settings.winamp_on_top;
-                    self.settings_dirty = true;
-                    self.push_winamp_level(ctx);
-                }
-            }
             Action::SetCustomTitlebar(custom) => {
                 if self.settings.custom_titlebar != custom {
                     self.settings.custom_titlebar = custom;
                     crate::window::set_custom_titlebar(custom);
                     self.mark_settings_dirty();
-                    if !self.settings.winamp_window {
+                    {
                         // Decorations are fixed at creation. Replace only the
                         // native window, keeping the page and playback.
                         self.switch_intent = true;
@@ -9638,156 +9192,9 @@ impl App {
                     }
                 }
             }
-            Action::SetWinampTaskbar(visible) => {
-                if self.settings.winamp_show_taskbar != visible {
-                    self.settings.winamp_show_taskbar = visible;
-                    self.mark_settings_dirty();
-                    if self.settings.winamp_window {
-                        // This window attribute is fixed at creation. Keep
-                        // the visible mini player, its position, and playback
-                        // while replacing only its native window.
-                        self.switch_intent = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                }
-            }
-            Action::ToggleWinampPlaylist => {
-                self.settings.playlist_open = !self.settings.playlist_open;
-                self.settings_dirty = true;
-                if self.settings.playlist_open {
-                    self.refresh_queue(false);
-                }
-            }
-            Action::SetPlaylistHeight(height) => {
-                self.settings.playlist_height = height.clamp(
-                    crate::skin::layout::PLAYLIST_MIN_HEIGHT,
-                    crate::skin::layout::PLAYLIST_MAX_HEIGHT,
-                );
-                self.settings_dirty = true;
-            }
-            Action::ToggleWinampEq => {
-                self.settings.eq_open = !self.settings.eq_open;
-                self.settings_dirty = true;
-            }
-            Action::ToggleEq => {
-                self.settings.eq_on = !self.settings.eq_on;
-                self.push_eq();
-            }
-            Action::SetEqBand(band, gain_db) => {
-                if let Some(slot) = self.settings.eq_bands_db.get_mut(band) {
-                    *slot = gain_db.clamp(-crate::eq::RANGE_DB, crate::eq::RANGE_DB);
-                    self.push_eq();
-                }
-            }
-            Action::SetEqPreamp(gain_db) => {
-                self.settings.eq_preamp_db =
-                    gain_db.clamp(-crate::eq::RANGE_DB, crate::eq::RANGE_DB);
-                self.push_eq();
-            }
-            Action::ApplyEqPreset(index) => {
-                if let Some(preset) = crate::eq::PRESETS.get(index) {
-                    self.settings.eq_bands_db = preset.bands_db;
-                    self.settings.eq_on = true;
-                    self.push_eq();
-                }
-            }
-            Action::SetBalance(balance) => {
-                self.settings.balance = balance.clamp(-1.0, 1.0);
-                self.push_eq();
-            }
-            Action::ToggleMono => {
-                self.settings.mono = !self.settings.mono;
-                self.push_eq();
-            }
-            Action::ToggleWinampShade => {
-                self.settings.winamp_shaded = !self.settings.winamp_shaded;
-                self.settings_dirty = true;
-            }
-            Action::ToggleWinampPlaylistShade => {
-                self.settings.playlist_shaded = !self.settings.playlist_shaded;
-                self.settings_dirty = true;
-            }
-            Action::ToggleWinampEqShade => {
-                self.settings.eq_shaded = !self.settings.eq_shaded;
-                self.settings_dirty = true;
-            }
             // The same request the window's own close button makes, so the
             // close-to-tray setting decides what follows.
             Action::CloseWindow => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-            Action::CyclePlayerBarVis => {
-                self.settings.player_bar_vis = self.settings.player_bar_vis.next();
-                self.settings_dirty = true;
-            }
-            Action::CycleVisualiser => {
-                self.settings.vis = self.settings.vis.next();
-                self.settings_dirty = true;
-                self.winamp.analyser.reset();
-            }
-            Action::SetVisualiser(mode) => {
-                if self.settings.vis != mode {
-                    self.settings.vis = mode;
-                    self.settings_dirty = true;
-                    self.winamp.analyser.reset();
-                }
-            }
-            Action::OpenSkinsFolder => self.open_folder(self.dirs.skins_dir()),
-            Action::ToggleWinampMilkdrop => {
-                self.settings.milkdrop_open = !self.settings.milkdrop_open;
-                self.settings_dirty = true;
-                #[cfg(feature = "milkdrop")]
-                if self.settings.milkdrop_open {
-                    // A first open has nothing to draw but the idle preset,
-                    // which hardly answers the music; fetch the packs in the
-                    // background and the window fills up on its own.
-                    let folder = self.dirs.milkdrop_dir();
-                    self.winamp.presets.refresh(&folder);
-                    if self.winamp.presets.count() == 0
-                        && self.winamp.presets.downloading().is_none()
-                    {
-                        self.winamp.presets.download_missing(
-                            folder,
-                            ctx.clone(),
-                            self.applied_proxy.clone(),
-                        );
-                        self.toast(gettext(self.locale, "Downloading MilkDrop preset packs"));
-                    }
-                }
-            }
-            Action::SetMilkdropSeconds(seconds) => {
-                self.settings.milkdrop_seconds = seconds.clamp(1, 3600);
-                self.settings_dirty = true;
-            }
-            Action::SetMilkdropFps(fps) => {
-                self.settings.milkdrop_fps = if fps == 0 {
-                    0
-                } else {
-                    fps.clamp(
-                        *crate::milkdrop::FPS_RANGE.start(),
-                        *crate::milkdrop::FPS_RANGE.end(),
-                    )
-                };
-                self.settings_dirty = true;
-            }
-            Action::SetMilkdropScale(scale) => {
-                self.settings.milkdrop_scale = scale.clamp(1, 4);
-                self.settings_dirty = true;
-            }
-            Action::OpenMilkdropFolder => self.open_folder(self.dirs.milkdrop_dir()),
-            Action::DownloadMilkdropPack(index) => {
-                if let Some(pack) = crate::milkdrop::PACKS.get(index) {
-                    self.winamp.presets.download(
-                        pack,
-                        self.dirs.milkdrop_dir(),
-                        ctx.clone(),
-                        self.applied_proxy.clone(),
-                    );
-                    self.toast(
-                        // Translators: {name} is the name of a visualizer preset pack.
-                        gettext(self.locale, "Downloading {name} presets")
-                            .replace("{name}", pack.name),
-                    );
-                }
-            }
             Action::Quit => {
                 self.quit_requested = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -9873,27 +9280,6 @@ impl App {
             manual,
             source: self.update_source.clone(),
         });
-    }
-
-    fn maybe_suggest_personal_app(&mut self) {
-        if self.settings.personal_app_intro_seen
-            || self
-                .settings
-                .web_client_id
-                .as_deref()
-                .is_some_and(|id| !id.trim().is_empty())
-            || self.web_app.is_some()
-            || !self.is_connected()
-            || self.offline
-            || self.user.as_ref().and_then(|user| user.product.as_deref()) != Some("premium")
-            || self.dialog.is_some()
-            || self.show_devices
-            || self.settings.winamp_window
-            || self.page() == &Page::Settings
-        {
-            return;
-        }
-        self.dialog = Some(Dialog::PersonalAppIntro);
     }
 
     /// Selected row indices for `page`.
@@ -10051,10 +9437,6 @@ impl App {
         self.handle_notch_commands();
         self.tick(ctx);
         self.note_listening();
-        // MilkDrop runs in a child process and can outlive the main window.
-        // Poll it before applying actions because its keys produce actions.
-        #[cfg(feature = "milkdrop")]
-        self.sync_milkdrop(ctx);
         self.apply_actions(ctx);
         self.sync_media_controls(ctx);
         self.sync_window_title(ctx);
@@ -10086,9 +9468,7 @@ impl App {
         if self.window_hidden || self.switch_intent {
             return;
         }
-        if self.settings.winamp_window {
-            self.winamp.geometry.remember(ctx);
-        } else if self.lyrics_fullscreen.is_none() && self.lyrics_fullscreen_restoring.is_none() {
+        if self.lyrics_fullscreen.is_none() && self.lyrics_fullscreen_restoring.is_none() {
             self.window_geometry.remember(ctx);
         }
     }
@@ -10161,14 +9541,11 @@ impl App {
 
     /// How long the headless loop may sleep after this tick: until the next
     /// pass is due, and never longer than `HEADLESS_SLEEP`, which keeps the
-    /// timers in `tick` (saving, eviction, update checks) running. MilkDrop's
-    /// window outlives the main one and is polled every tick. Tray clicks,
+    /// timers in `tick` (saving, eviction, update checks) running. Tray clicks,
     /// media keys and backend events wake the loop at once.
     fn headless_wait(&self) -> fastframe_shell::Headless {
         use fastframe_shell::{HEADLESS_TICK, Headless};
-        if self.settings.milkdrop_open {
-            return Headless::Wait;
-        }
+
         let wait = self
             .next_pass()
             .map_or(HEADLESS_SLEEP, |due| due.min(HEADLESS_SLEEP));
@@ -10324,18 +9701,7 @@ impl App {
                 self.leave_lyrics_fullscreen(ctx);
             }
         }
-        // Switch to the main window when sign-in is required.
-        let needs_sign_in = !(self.is_connected() && self.user.is_some())
-            && !matches!(self.auth, AuthStatus::Connecting | AuthStatus::Starting)
-            && !(self.is_connected() && self.user.is_none());
-        if self.settings.winamp_window && needs_sign_in && !self.switch_intent {
-            self.actions.push(Action::ToggleWinampWindow);
-        }
-        if self.settings.winamp_window {
-            crate::ui::winamp::show(self, ui);
-        } else {
-            crate::ui::show(self, ui);
-        }
+        crate::ui::show(self, ui);
         self.apply_actions(ctx);
         let autoscroll = self.autoscroll.finish(
             ctx,
@@ -10347,16 +9713,12 @@ impl App {
         if autoscroll.stop_following_lyrics {
             self.lyrics_following = false;
         }
-        if let Some(offset) = autoscroll.playlist_scroll {
-            self.winamp.playlist_scroll = offset;
-        }
         self.refresh_frame_now();
         self.sync_media_controls(ctx);
 
         if !self.toasts.is_empty() {
             ctx.request_repaint_after(TOAST_FRAME);
         }
-        self.theme_transition.paint(ctx);
         self.frame_now = None;
     }
 
@@ -10425,8 +9787,6 @@ impl App {
                 window_maximized: self.window_geometry.maximized,
                 queue_open: Some(self.show_queue_panel),
                 queue_tab: Some(self.queue_tab.encode().to_string()),
-                winamp_pos: self.winamp.geometry.position,
-                milkdrop_pos: self.milkdrop_pos,
                 lyrics_fullscreen_from: self.lyrics_fullscreen.map(|fullscreen| {
                     crate::settings::WindowMode {
                         fullscreen,
@@ -10629,12 +9989,8 @@ pub fn engine_config(
     dirs: &AppDirs,
     settings: &Settings,
     proxy: crate::settings::ProxyConfig,
-    tap: std::sync::Arc<crate::vis::AudioTap>,
-    eq: crate::eq::SharedEq,
 ) -> EngineConfig {
     EngineConfig {
-        tap,
-        eq,
         device_name: settings.device_name.trim().to_string(),
         bitrate_kbps: settings.bitrate,
         normalisation: settings.normalisation,
@@ -10654,42 +10010,12 @@ pub fn engine_config(
     }
 }
 
-/// The equalizer as the settings describe it.
-pub fn eq_settings(settings: &Settings) -> crate::eq::EqSettings {
-    crate::eq::EqSettings {
-        on: settings.eq_on,
-        preamp_db: settings.eq_preamp_db,
-        bands_db: settings.eq_bands_db,
-        balance: settings.balance,
-        mono: settings.mono,
-    }
-    .clamped()
-}
-
 pub fn volume_to_percent(volume: u16) -> u8 {
     ((u32::from(volume) * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX)) as u8
 }
 
 pub fn percent_to_volume(percent: u8) -> u16 {
     ((u32::from(percent.min(100)) * u32::from(u16::MAX)) / 100) as u16
-}
-
-/// The window level for the Winamp window's always-on-top setting. Shared by
-/// window creation and the live window, so the mapping is owned in one place.
-pub fn on_top_window_level(on_top: bool) -> egui::WindowLevel {
-    if on_top {
-        egui::WindowLevel::AlwaysOnTop
-    } else {
-        egui::WindowLevel::Normal
-    }
-}
-
-/// The window level to push to the live window, or `None` when there is no
-/// Winamp window to change. The big window (where Settings lives) keeps its
-/// normal level, so toggling the setting there only takes effect once the
-/// Winamp window opens.
-fn winamp_on_top_level(winamp_window: bool, on_top: bool) -> Option<egui::WindowLevel> {
-    winamp_window.then_some(on_top_window_level(on_top))
 }
 
 fn page_related_needs_load(pages: &HashMap<String, ArtistPage>, id: &str) -> bool {
@@ -10927,6 +10253,48 @@ mod tests {
     use crate::api::models::{
         Episode, Image, Page as ApiPage, ResumePoint, SavedEpisode, SavedTrack, SearchResults,
     };
+
+    #[test]
+    fn active_soloist_does_not_poll_web_playback_on_every_tick() {
+        let mut app = headless_app();
+        app.auth = AuthStatus::Connected {
+            username: "listener".into(),
+        };
+        app.soloist_mode = true;
+        app.local.track = Some(crate::player::LocalTrack {
+            uri: "spotify:track:current".into(),
+            ..Default::default()
+        });
+        app.local.playback = Playback::Playing;
+        let start = app.remote_poll_seq;
+        app.poll_remote(false);
+        assert_eq!(
+            app.remote_poll_seq, start,
+            "local events already supply transport state"
+        );
+        app.poll_remote(true);
+        assert_eq!(
+            app.remote_poll_seq,
+            start + 1,
+            "explicit refresh still loads metadata"
+        );
+        app.local.playback = Playback::Stopped;
+        app.poll_remote(false);
+        assert_eq!(
+            app.remote_poll_seq,
+            start + 2,
+            "inactive receiver still discovers remote playback"
+        );
+        app.soloist_mode = false;
+        app.local.playback = Playback::Playing;
+        app.poll_remote(false);
+        assert_eq!(
+            app.remote_poll_seq,
+            start + 3,
+            "ordinary client polling is unchanged"
+        );
+        app.backend.shutdown();
+    }
 
     #[test]
     fn soloist_metadata_authorization_does_not_replace_audio_readiness() {
@@ -11202,24 +10570,20 @@ mod tests {
     }
 
     #[test]
-    fn autoscroll_updates_the_real_lyrics_and_skinned_playlist_without_changing_playback() {
-        for (skinned, chosen) in [(false, false), (true, false), (false, true), (true, true)] {
+    fn autoscroll_updates_the_real_lyrics_without_changing_playback() {
+        for chosen in [false, true] {
             let on = crate::autoscroll::enabled(chosen);
             let ctx = egui::Context::default();
-            let mut app = test_app(match (skinned, chosen) {
-                (false, false) => "autoscroll-lyrics",
-                (true, false) => "autoscroll-skin",
-                (false, true) => "autoscroll-lyrics-chosen",
-                (true, true) => "autoscroll-skin-chosen",
+            let mut app = test_app(if chosen {
+                "autoscroll-lyrics-chosen"
+            } else {
+                "autoscroll-lyrics"
             });
             app.attach(&ctx);
             crate::demo::populate(&mut app);
             app.settings.middle_click_autoscroll = chosen;
             app.show_queue_panel = false;
-            app.show_lyrics_panel = !skinned;
-            app.settings.winamp_window = skinned;
-            app.settings.playlist_open = skinned;
-            app.settings.skin_scale = Some(2);
+            app.show_lyrics_panel = true;
             if let Loadable::Loaded(queue) = &mut app.queue {
                 queue.queue = queue.queue.iter().cycle().take(80).cloned().collect();
             }
@@ -11243,14 +10607,9 @@ mod tests {
                 frame += 1;
                 let mut output = ctx.run_ui(
                     egui::RawInput {
-                        screen_rect: Some(egui::Rect::from_min_size(
-                            egui::Pos2::ZERO,
-                            if skinned {
-                                egui::vec2(550.0, 580.0)
-                            } else {
-                                egui::vec2(1280.0, 800.0)
-                            },
-                        )),
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, {
+                            egui::vec2(1280.0, 800.0)
+                        })),
                         time: Some(frame as f64 / 60.0),
                         events,
                         ..Default::default()
@@ -11261,14 +10620,7 @@ mod tests {
             };
             draw(&mut app, vec![]);
             draw(&mut app, vec![]);
-            let anchor = if skinned {
-                ctx.read_response(egui::Id::new(("playlist-row", 0_usize)))
-                    .unwrap()
-                    .rect
-                    .center()
-            } else {
-                egui::pos2(1120.0, 100.0)
-            };
+            let anchor = { egui::pos2(1120.0, 100.0) };
             let press = |button, pressed| egui::Event::PointerButton {
                 pos: anchor,
                 button,
@@ -11282,12 +10634,8 @@ mod tests {
                     press(egui::PointerButton::Middle, true),
                 ],
             );
-            assert_eq!(
-                app.autoscroll.active(),
-                on,
-                "real surface, skinned={skinned}"
-            );
-            if !skinned {
+            assert_eq!(app.autoscroll.active(), on, "real lyrics surface");
+            {
                 assert_eq!(app.lyrics_following, !on);
             }
             draw(&mut app, vec![press(egui::PointerButton::Middle, false)]);
@@ -11297,34 +10645,14 @@ mod tests {
                     vec![egui::Event::PointerMoved(anchor + egui::vec2(0.0, 120.0))],
                 );
             }
-            if skinned {
-                if on {
-                    assert!(app.winamp.playlist_scroll > 0);
-                } else {
-                    assert_eq!(app.winamp.playlist_scroll, 0);
-                }
-                assert!(
-                    app.winamp.playlist_selection.is_empty(),
-                    "middle-click must not select a row"
-                );
-            } else {
+            {
                 assert_eq!(app.lyrics_following, !on);
             }
             assert_eq!(app.now_playing().unwrap().uri, playing);
             draw(&mut app, vec![press(egui::PointerButton::Primary, true)]);
             assert!(!app.autoscroll.active());
             draw(&mut app, vec![press(egui::PointerButton::Primary, false)]);
-            if skinned {
-                // After cancelling, a normal click selects the visible row.
-                draw(&mut app, vec![egui::Event::PointerMoved(anchor)]);
-                draw(&mut app, vec![press(egui::PointerButton::Primary, true)]);
-                draw(&mut app, vec![press(egui::PointerButton::Primary, false)]);
-                assert_eq!(
-                    app.winamp.playlist_selection.len(),
-                    1,
-                    "ordinary row selection must still work after cancellation"
-                );
-            }
+
             app.backend.shutdown();
         }
     }
@@ -11788,7 +11116,6 @@ mod tests {
 
     /// The title bar choice is saved and, because decorations are fixed when
     /// a window is created, replaces only the main window's native window.
-    /// The mini player picks it up the next time the main window opens.
     #[test]
     fn choosing_the_custom_title_bar_recreates_only_the_main_window() {
         let mut app = headless_app();
@@ -11805,10 +11132,12 @@ mod tests {
         app.apply(Action::SetCustomTitlebar(true), &ctx);
         assert!(!app.switch_intent, "an unchanged choice keeps the window");
 
-        app.settings.winamp_window = true;
         app.apply(Action::SetCustomTitlebar(false), &ctx);
         assert!(!app.settings.custom_titlebar);
-        assert!(!app.switch_intent, "the mini player is not the main window");
+        assert!(
+            app.switch_intent,
+            "changing back replaces the main window too"
+        );
         assert!(!crate::window::custom_titlebar());
     }
 
@@ -12440,115 +11769,6 @@ mod tests {
         assert_eq!(volume_to_percent(0), 0);
         assert_eq!(volume_to_percent(percent_to_volume(70)), 70);
         assert_eq!(percent_to_volume(200), u16::MAX);
-    }
-
-    /// Toggling always-on-top pushes the matching level to the live Winamp
-    /// window, so the change takes effect without recreating the window.
-    #[test]
-    fn the_winamp_window_follows_the_on_top_toggle_live() {
-        assert_eq!(
-            winamp_on_top_level(true, true),
-            Some(egui::WindowLevel::AlwaysOnTop)
-        );
-        assert_eq!(
-            winamp_on_top_level(true, false),
-            Some(egui::WindowLevel::Normal)
-        );
-    }
-
-    /// The setting lives in the big window's Settings page. Toggling it there
-    /// must never force the big window on top, so no level command is sent.
-    #[test]
-    fn the_big_window_never_follows_the_on_top_toggle() {
-        assert_eq!(winamp_on_top_level(false, true), None);
-        assert_eq!(winamp_on_top_level(false, false), None);
-    }
-
-    /// The level set at window creation does not stick on X11, so opening the
-    /// Winamp window with always-on-top saved must schedule a re-assert.
-    #[test]
-    fn opening_the_winamp_window_on_top_schedules_a_reassert() {
-        let ctx = egui::Context::default();
-        let mut app = headless_app();
-        app.settings.winamp_window = true;
-        app.settings.winamp_on_top = true;
-        app.attach(&ctx);
-        assert_eq!(app.winamp_level_reassert, 3);
-    }
-
-    /// Opening the Winamp window without always-on-top re-asserts nothing.
-    #[test]
-    fn opening_the_winamp_window_without_on_top_schedules_no_reassert() {
-        let ctx = egui::Context::default();
-        let mut app = headless_app();
-        app.settings.winamp_window = true;
-        app.settings.winamp_on_top = false;
-        app.attach(&ctx);
-        assert_eq!(app.winamp_level_reassert, 0);
-    }
-
-    #[test]
-    fn unsupported_on_top_controls_keep_the_saved_preference_without_commands() {
-        for saved in [false, true] {
-            let ctx = egui::Context::default();
-            let mut app = headless_app();
-            app.settings.winamp_window = true;
-            app.settings.winamp_on_top = saved;
-            app.window_level_supported = false;
-            app.attach(&ctx);
-            assert_eq!(app.winamp_level_reassert, 0);
-            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                app.apply(Action::ToggleWinampOnTop, ui.ctx());
-                app.push_winamp_level(ui.ctx());
-            });
-            output.textures_delta.clear();
-            assert_eq!(app.settings.winamp_on_top, saved);
-            assert!(!app.settings_dirty);
-            assert!(
-                !output.viewport_output[&egui::ViewportId::ROOT]
-                    .commands
-                    .iter()
-                    .any(|command| matches!(command, egui::ViewportCommand::WindowLevel(_)))
-            );
-            app.backend.shutdown();
-        }
-    }
-
-    #[test]
-    fn returning_to_the_mini_player_restores_its_position_and_shade() {
-        let mut app = headless_app();
-        app.settings.winamp_window = true;
-        app.settings.winamp_shaded = true;
-        app.winamp.geometry.position = Some([300.0, 200.0]);
-        let main = fastframe_shell::window::Geometry {
-            size: Some([1024.0, 768.0]),
-            position: Some([100.0, 100.0]),
-            maximized: false,
-        };
-        app.window_geometry = main;
-
-        let main_ctx = egui::Context::default();
-        app.apply(Action::ToggleWinampWindow, &main_ctx);
-        app.attach(&main_ctx);
-        app.apply(Action::ToggleWinampWindow, &main_ctx);
-
-        let mini_ctx = egui::Context::default();
-        let mut output = mini_ctx.run_ui(Default::default(), |_ui| app.attach(&mini_ctx));
-        output.textures_delta.clear();
-        let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
-        assert!(app.settings.winamp_window);
-        assert!(app.settings.winamp_shaded);
-        assert!(commands.contains(&egui::ViewportCommand::Fullscreen(false)));
-        assert!(commands.contains(&egui::ViewportCommand::Maximized(false)));
-        // The position goes to the window's builder before it exists
-        // (entrypoint's native_options), not after it in a command.
-        assert!(
-            !commands
-                .iter()
-                .any(|command| matches!(command, egui::ViewportCommand::OuterPosition(_)))
-        );
-        assert_eq!(app.winamp.geometry.position, Some([300.0, 200.0]));
-        assert_eq!(app.window_geometry, main);
     }
 
     /// A window left maximized or full screen comes back that way, instead of
@@ -15818,7 +15038,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("spotifast-{name}-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let mut app = App::new(
+        App::new(
             &Waker::default(),
             AppDirs {
                 config: root.join("config"),
@@ -15831,9 +15051,7 @@ mod tests {
                 restore_sign_in: false,
                 tray: false,
             },
-        );
-        app.reveal_theme_changes = false;
-        app
+        )
     }
 
     /// Two lookups of one adder can overlap; the one that found nothing
@@ -15860,74 +15078,6 @@ mod tests {
         app.set_user_name("nobody".into(), None);
         assert_eq!(app.user_names.get("nobody"), Some(&None));
         app.backend.shutdown();
-    }
-
-    /// With Random on, each switch to the mini player shows a skin other
-    /// than the last one, and choosing a skin turns Random off.
-    #[test]
-    fn a_random_skin_changes_each_time_the_mini_player_opens() {
-        let ctx = egui::Context::default();
-        let mut app = test_app("random-skin");
-        let skins = app.dirs.skins_dir();
-        std::fs::create_dir_all(&skins).unwrap();
-        for name in ["A.wsz", "B.wsz"] {
-            std::fs::write(skins.join(name), b"skin").unwrap();
-        }
-        app.apply(Action::SetRandomSkin(true), &ctx);
-        for _ in 0..6 {
-            let before = app.settings.skin.clone();
-            app.settings.winamp_window = false;
-            app.switch_intent = false;
-            app.apply(Action::ToggleWinampWindow, &ctx);
-            assert!(app.settings.winamp_window);
-            assert_ne!(app.settings.skin, before, "never the same twice in a row");
-        }
-        app.apply(Action::SetSkin(Some("B.wsz".into())), &ctx);
-        assert!(!app.settings.random_skin);
-        app.settings.winamp_window = false;
-        app.apply(Action::ToggleWinampWindow, &ctx);
-        assert_eq!(
-            app.settings.skin.as_deref(),
-            Some("B.wsz"),
-            "a chosen skin stays"
-        );
-    }
-
-    /// A change of colours keeps the old ones until the window's picture of
-    /// them arrives, or a short wait passes without one, then applies.
-    #[test]
-    fn a_colour_change_waits_for_the_picture_of_the_old_colours() {
-        let ctx = egui::Context::default();
-        let mut app = test_app("theme-reveal");
-        app.reveal_theme_changes = true;
-        let frame = |app: &mut App, time: f64| {
-            let mut output = ctx.run_ui(
-                egui::RawInput {
-                    time: Some(time),
-                    ..Default::default()
-                },
-                |ui| app.apply_theme(ui.ctx()),
-            );
-            output.textures_delta.clear();
-            output
-        };
-        ctx.set_theme(egui::ThemePreference::Dark);
-        frame(&mut app, 0.0);
-        assert_eq!(app.palette, Palette::dark(), "the first colours at once");
-
-        ctx.set_theme(egui::ThemePreference::Light);
-        let output = frame(&mut app, 0.1);
-        assert_eq!(app.palette, Palette::dark(), "held for the picture");
-        assert!(
-            output.viewport_output[&egui::ViewportId::ROOT]
-                .commands
-                .iter()
-                .any(|command| matches!(command, egui::ViewportCommand::Screenshot(_)))
-        );
-        frame(&mut app, 0.2);
-        assert_eq!(app.palette, Palette::dark());
-        frame(&mut app, 0.5);
-        assert_eq!(app.palette, Palette::light(), "no picture came: apply");
     }
 
     #[test]
@@ -16000,84 +15150,6 @@ mod tests {
     }
 
     #[test]
-    fn custom_theme_cache_preserves_first_frame_and_settings_after_file_removal_or_corruption() {
-        let mut app = test_app("custom-theme-restart");
-        app.backend.shutdown();
-        let ctx = egui::Context::default();
-        let directory = app.dirs.config.join("themes");
-        let file = directory.join("local.json");
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            &file,
-            br##"{"base":"light","colors":{"accent":"#8c3fa5"}}"##,
-        )
-        .unwrap();
-        app.settings.theme = ThemeChoice::Dark;
-        app.settings.audio_cache_mb = 777;
-        app.settings.custom_theme = Some("local.json".into());
-        assert!(
-            !app.custom_themes.loading(),
-            "construction never starts theme discovery"
-        );
-        app.load_custom_themes(&Waker::default());
-        wait_for_custom_themes(&mut app, &ctx);
-        app.apply_theme(&ctx);
-        let mut expected = Palette::light();
-        expected.accent = egui::Color32::from_rgb(140, 63, 165);
-        assert_eq!(app.palette, expected);
-        app.save_settings();
-        let accepted = Settings::load(&app.dirs.settings_file());
-        assert!(accepted.custom_theme_cache.is_some());
-
-        for contents in [
-            None,
-            Some("{broken"),
-            Some(r##"{"colors":{"accent":"#bad"}}"##),
-        ] {
-            if let Some(contents) = contents {
-                std::fs::write(&file, contents).unwrap();
-            } else {
-                std::fs::remove_file(&file).unwrap();
-            }
-            let mut restored = App::new(
-                &Waker::default(),
-                app.dirs.clone(),
-                Settings::load(&app.dirs.settings_file()),
-                AppOptions {
-                    media_controls: false,
-                    restore_sign_in: false,
-                    tray: false,
-                },
-            );
-            restored.backend.shutdown();
-            assert_eq!(
-                restored.palette, expected,
-                "even the first window clear uses the accepted palette"
-            );
-            let ctx = egui::Context::default();
-            restored.attach(&ctx);
-            restored.apply_theme(&ctx);
-            assert_eq!(ctx.theme(), egui::Theme::Light);
-            assert_eq!(restored.palette, expected);
-            restored.load_custom_themes(&Waker::default());
-            wait_for_custom_themes(&mut restored, &ctx);
-            restored.apply_theme(&ctx);
-            assert_eq!(restored.palette, expected);
-            assert!(
-                theme::catalog_detail(
-                    &restored.custom_themes,
-                    crate::i18n::Locale::English,
-                    Some("local.json")
-                )
-                .contains("last usable")
-            );
-            restored.save_settings();
-            assert_eq!(Settings::load(&restored.dirs.settings_file()), accepted);
-        }
-        std::fs::remove_dir_all(app.dirs.config.parent().unwrap()).unwrap();
-    }
-
-    #[test]
     fn a_chosen_language_applies_at_once_and_survives_a_restart() {
         use crate::i18n::Locale;
         use crate::settings::LanguageChoice;
@@ -16107,17 +15179,6 @@ mod tests {
         std::fs::remove_dir_all(app.dirs.config.parent().unwrap()).unwrap();
     }
 
-    /// What a scan reports when Omarchy is (or is not) followed.
-    fn show_system_theme(
-        app: &mut App,
-        ctx: &egui::Context,
-        theme: Option<theme::CustomTheme>,
-        follows: bool,
-    ) {
-        app.custom_themes = theme::Catalog::preview(theme.into_iter().collect(), follows);
-        app.adopt_custom_themes(ctx);
-    }
-
     /// Closing hides to the tray only when the tray can take the app, and
     /// never overrides a quit or a switch between windows. The decision runs
     /// in the logic pass, so it also holds for a minimised window, whose
@@ -16141,7 +15202,7 @@ mod tests {
 
     /// In the tray the app sleeps as long as nothing is due: until the next
     /// progress update while music plays, and a short tick while a play is
-    /// pending or MilkDrop's window is open.
+    /// pending.
     #[test]
     fn the_tray_sleeps_until_something_is_due() {
         use fastframe_shell::Headless;
@@ -16157,13 +15218,10 @@ mod tests {
             app.headless_wait(),
             Headless::WaitFor(Duration::from_millis(250))
         );
-
-        app.settings.milkdrop_open = true;
-        assert_eq!(app.headless_wait(), Headless::Wait);
     }
 
-    /// Quit wins over everything, a switch between the main window and the
-    /// mini player reopens at once, and closing to the tray runs headless
+    /// Quit wins over everything, a native chrome change reopens at once,
+    /// and closing to the tray runs headless
     /// until Show or Quit.
     #[test]
     fn the_shell_learns_what_a_closed_window_means() {
@@ -16189,323 +15247,6 @@ mod tests {
         assert_eq!(app.headless_frame(&ctx), Headless::Show);
         app.quit_requested = true;
         assert_eq!(app.headless_frame(&ctx), Headless::Quit);
-    }
-
-    fn wait_for_custom_themes(app: &mut App, ctx: &egui::Context) {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while app.custom_themes.loading() {
-            app.poll_custom_themes(ctx);
-            assert!(Instant::now() < deadline, "theme worker did not finish");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    #[test]
-    fn following_omarchy_is_automatic_live_and_never_overrides_an_explicit_choice() {
-        let mut app = test_app("system-omarchy");
-        app.backend.shutdown();
-        let ctx = egui::Context::default();
-        app.settings = Settings::default();
-        app.window_hidden = true;
-        app.resume_track = Some("spotify:track:playing".into());
-        app.resume_position_ms = 123_000;
-        let theme = theme::CustomTheme {
-            filename: "omarchy.json".into(),
-            palette: Palette::light(),
-        };
-        show_system_theme(&mut app, &ctx, Some(theme.clone()), true);
-        app.apply_theme(&ctx);
-        assert_eq!(app.palette, theme.palette);
-        assert_eq!(app.settings.theme, ThemeChoice::System);
-        assert!(app.settings.custom_theme.is_none());
-        app.save_settings();
-        let saved = Settings::load(&app.dirs.settings_file());
-        assert_eq!(saved.cached_palette(), Some(theme.palette));
-
-        show_system_theme(&mut app, &ctx, None, true);
-        app.apply_theme(&ctx);
-        assert_eq!(
-            app.palette, theme.palette,
-            "missing colours retain the last palette"
-        );
-        for (choice, expected) in [
-            (ThemeChoice::Dark, Palette::dark()),
-            (ThemeChoice::Light, Palette::light()),
-        ] {
-            app.apply(Action::SetTheme(choice), &ctx);
-            let mut updated = theme.clone();
-            updated.palette.accent = egui::Color32::RED;
-            show_system_theme(&mut app, &ctx, Some(updated), true);
-            app.apply_theme(&ctx);
-            assert_eq!(app.palette, expected);
-        }
-        app.apply(Action::SetTheme(ThemeChoice::System), &ctx);
-        assert_eq!(app.palette.accent, egui::Color32::RED);
-        let custom = theme::CustomTheme {
-            filename: "mine.json".into(),
-            palette: Palette::dark(),
-        };
-        app.custom_themes = theme::Catalog::preview(vec![custom.clone()], false);
-        app.apply(Action::SetCustomTheme(custom.filename.clone()), &ctx);
-        show_system_theme(&mut app, &ctx, Some(theme), true);
-        app.apply_theme(&ctx);
-        assert_eq!(app.palette, custom.palette);
-        app.apply(Action::SetTheme(ThemeChoice::System), &ctx);
-        show_system_theme(&mut app, &ctx, None, false);
-        assert!(app.settings.system_theme_cache.is_none());
-        assert_eq!(app.theme_preference(), egui::ThemePreference::System);
-        assert!(app.window_hidden);
-        assert_eq!(app.resume_track.as_deref(), Some("spotify:track:playing"));
-        assert_eq!(app.resume_position_ms, 123_000);
-        std::fs::remove_dir_all(app.dirs.config.parent().unwrap()).unwrap();
-    }
-
-    /// winit reports no system theme on Linux, so "Follow system" takes
-    /// the desktop portal's preference, and a fixed choice ignores it.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn follow_system_uses_the_desktops_preference_on_linux() {
-        let mut app = headless_app();
-        let ctx = egui::Context::default();
-        app.settings.theme = ThemeChoice::System;
-        ctx.set_theme(app.theme_preference());
-        app.system_appearance = Some(crate::appearance::SystemAppearance::fixed(false));
-        app.apply_theme(&ctx);
-        assert_eq!(ctx.theme(), egui::Theme::Light);
-        assert_eq!(app.palette, Palette::light());
-
-        app.system_appearance = Some(crate::appearance::SystemAppearance::fixed(true));
-        app.apply_theme(&ctx);
-        assert_eq!(ctx.theme(), egui::Theme::Dark);
-
-        app.settings.theme = ThemeChoice::Dark;
-        ctx.set_theme(app.theme_preference());
-        app.system_appearance = Some(crate::appearance::SystemAppearance::fixed(false));
-        app.apply_theme(&ctx);
-        assert_eq!(ctx.theme(), egui::Theme::Dark, "a chosen theme wins");
-    }
-
-    #[test]
-    fn custom_theme_reload_updates_the_selected_palette_without_showing_the_window() {
-        let mut app = test_app("custom-theme-reload");
-        app.backend.shutdown();
-        let ctx = egui::Context::default();
-        let directory = app.dirs.config.join("themes");
-        let file = directory.join("omarchy.json");
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(&file, br#"{"base":"dark"}"#).unwrap();
-        app.settings.custom_theme = Some("omarchy.json".into());
-        app.load_custom_themes(&Waker::default());
-        wait_for_custom_themes(&mut app, &ctx);
-        app.apply_theme(&ctx);
-        assert_eq!(app.palette, Palette::dark());
-
-        app.window_hidden = true;
-        app.settings.volume = 37;
-        app.resume_track = Some("spotify:track:playing".into());
-        app.resume_position_ms = 123_000;
-        let queue: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
-        app.control_commands = Some(queue.clone());
-        for (contents, expected) in [
-            (r#"{"base":"light"}"#, Palette::light()),
-            ("broken", Palette::light()),
-            (r#"{"base":"dark"}"#, Palette::dark()),
-        ] {
-            std::fs::write(&file, contents).unwrap();
-            queue.lock().unwrap().push(ControlCommand::ReloadThemes);
-            app.handle_control_commands();
-            assert!(matches!(app.actions.as_slice(), [Action::ReloadThemes]));
-            let action = app.actions.pop().unwrap();
-            app.apply(action, &ctx);
-            wait_for_custom_themes(&mut app, &ctx);
-            app.apply_theme(&ctx);
-            assert_eq!(app.palette, expected);
-            assert!(app.window_hidden);
-            assert_eq!(app.settings.volume, 37);
-            assert_eq!(app.resume_track.as_deref(), Some("spotify:track:playing"));
-            assert_eq!(app.resume_position_ms, 123_000);
-            assert_eq!(app.settings.custom_theme.as_deref(), Some("omarchy.json"));
-        }
-
-        app.apply(Action::SetTheme(ThemeChoice::Light), &ctx);
-        app.apply(Action::ReloadThemes, &ctx);
-        wait_for_custom_themes(&mut app, &ctx);
-        app.apply_theme(&ctx);
-        assert_eq!(
-            app.palette,
-            Palette::light(),
-            "a hook never selects a custom theme"
-        );
-        assert!(app.settings.custom_theme.is_none());
-        std::fs::remove_dir_all(app.dirs.config.parent().unwrap()).unwrap();
-    }
-
-    #[test]
-    fn custom_theme_worker_does_not_block_selection_or_restore_a_stale_choice() {
-        let mut app = test_app("custom-theme-worker");
-        app.backend.shutdown();
-        let ctx = egui::Context::default();
-        let directory = app.dirs.config.join("themes");
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("old.json"), br#"{"base":"dark"}"#).unwrap();
-        app.settings.custom_theme = Some("old.json".into());
-        app.load_custom_themes(&Waker::default());
-        app.apply(Action::SetTheme(ThemeChoice::Light), &ctx);
-        assert_eq!(app.palette, Palette::light());
-        assert!(app.custom_themes.loading());
-        wait_for_custom_themes(&mut app, &ctx);
-        app.apply_theme(&ctx);
-        assert_eq!(app.palette, Palette::light());
-        assert!(app.custom_themes.find("old.json").is_some());
-        assert!(app.settings.custom_theme.is_none());
-        assert!(app.settings.custom_theme_cache.is_none());
-        std::fs::remove_dir_all(app.dirs.config.parent().unwrap()).unwrap();
-    }
-
-    #[test]
-    fn custom_theme_changes_egui_base_and_colors_together_and_builtin_choices_remain_available() {
-        let mut app = test_app("custom-theme");
-        let ctx = egui::Context::default();
-        app.settings.theme = ThemeChoice::System;
-        let mut palette = Palette::light();
-        palette.accent = egui::Color32::RED;
-        app.custom_themes = theme::Catalog::preview(
-            vec![theme::CustomTheme {
-                filename: "local.json".into(),
-                palette,
-            }],
-            false,
-        );
-        app.apply(Action::SetCustomTheme("local.json".into()), &ctx);
-        assert_eq!(app.palette, palette);
-        assert_eq!(
-            app.settings.theme,
-            ThemeChoice::System,
-            "custom selection preserves the built-in choice"
-        );
-        assert_eq!(ctx.theme(), egui::Theme::Light);
-        assert!(!ctx.global_style().visuals.dark_mode);
-        assert_eq!(ctx.global_style().visuals.panel_fill, palette.panel);
-        let accepted = app.settings.clone();
-        app.apply(Action::SetCustomTheme("missing.json".into()), &ctx);
-        assert_eq!(
-            app.settings, accepted,
-            "an unavailable selection cannot erase usable settings"
-        );
-        app.apply(Action::SettingsChanged, &ctx);
-        assert_eq!(
-            ctx.theme(),
-            egui::Theme::Light,
-            "unrelated settings must keep the custom base"
-        );
-        for choice in ThemeChoice::ALL {
-            app.apply(Action::SetTheme(choice), &ctx);
-            assert_eq!(app.settings.theme, choice);
-            assert!(app.settings.custom_theme.is_none());
-            assert!(app.settings.custom_theme_cache.is_none());
-            if choice != ThemeChoice::System {
-                assert_eq!(app.palette.dark, choice == ThemeChoice::Dark);
-            }
-        }
-    }
-
-    #[test]
-    fn premium_listeners_discover_personal_apps_before_requests_slow_down() {
-        let mut app = test_app("personal-app-intro");
-        app.auth = AuthStatus::Connected {
-            username: "listener".into(),
-        };
-        app.user = Some(User {
-            product: Some("premium".into()),
-            ..User::default()
-        });
-        // Having seen an old transient toast does not count as seeing the intro.
-        app.settings.personal_app_nudge_at = Some("2026-09-09T10:00:00Z".into());
-        app.maybe_suggest_personal_app();
-        assert!(matches!(app.dialog, Some(Dialog::PersonalAppIntro)));
-        assert!(!app.settings.personal_app_intro_seen);
-        app.actions.push(Action::CloseDialog);
-        app.apply_actions(&egui::Context::default());
-        assert!(app.settings.personal_app_intro_seen);
-        assert!(app.dialog.is_none());
-        let saved = serde_json::to_string(&app.settings).unwrap();
-        let mut restarted = test_app("personal-app-intro-restart");
-        restarted.settings = serde_json::from_str(&saved).unwrap();
-        restarted.auth = app.auth.clone();
-        restarted.user = app.user.clone();
-        restarted.maybe_suggest_personal_app();
-        assert!(restarted.dialog.is_none(), "dismissal survives a restart");
-        assert!(app.toasts.is_empty(), "the old daily reminder is replaced");
-    }
-
-    #[test]
-    fn personal_app_intro_waits_for_a_premium_account_using_shared_access() {
-        let mut app = test_app("personal-app-intro-eligibility");
-        app.auth = AuthStatus::Connected {
-            username: "listener".into(),
-        };
-        for product in [None, Some("free"), Some("open")] {
-            app.user = Some(User {
-                product: product.map(str::to_string),
-                ..User::default()
-            });
-            app.maybe_suggest_personal_app();
-            assert!(app.dialog.is_none());
-        }
-        app.user = Some(User {
-            product: Some("premium".into()),
-            ..User::default()
-        });
-        app.settings.web_client_id = Some("personal-client".into());
-        app.maybe_suggest_personal_app();
-        assert!(app.dialog.is_none());
-        app.settings.web_client_id = None;
-        app.web_app = Some("personal-client".into());
-        app.maybe_suggest_personal_app();
-        assert!(app.dialog.is_none());
-        app.web_app = None;
-        app.auth = AuthStatus::SignedOut;
-        app.maybe_suggest_personal_app();
-        assert!(app.dialog.is_none());
-        app.auth = AuthStatus::Connected {
-            username: "listener".into(),
-        };
-        app.offline = true;
-        app.maybe_suggest_personal_app();
-        assert!(app.dialog.is_none());
-    }
-
-    #[test]
-    fn personal_app_intro_defers_while_another_surface_is_in_use() {
-        let mut app = test_app("personal-app-intro-defer");
-        app.auth = AuthStatus::Connected {
-            username: "listener".into(),
-        };
-        app.user = Some(User {
-            product: Some("premium".into()),
-            ..User::default()
-        });
-        app.dialog = Some(Dialog::Shortcuts);
-        app.maybe_suggest_personal_app();
-        assert!(matches!(app.dialog, Some(Dialog::Shortcuts)));
-        app.dialog = None;
-        app.show_devices = true;
-        app.maybe_suggest_personal_app();
-        assert!(app.dialog.is_none());
-        app.show_devices = false;
-        app.settings.winamp_window = true;
-        app.maybe_suggest_personal_app();
-        assert!(app.dialog.is_none());
-        app.settings.winamp_window = false;
-        app.open(Page::Settings);
-        app.maybe_suggest_personal_app();
-        assert!(app.dialog.is_none());
-        app.open(Page::Home);
-        app.maybe_suggest_personal_app();
-        assert!(matches!(app.dialog, Some(Dialog::PersonalAppIntro)));
-        app.handle_auth(AuthStatus::SignedOut);
-        assert!(app.dialog.is_none());
-        assert!(!app.settings.personal_app_intro_seen);
     }
 
     fn play(uri: &str, at: &str) -> crate::api::models::PlayHistory {
@@ -16885,6 +15626,93 @@ mod tests {
         assert!(app.library.episodes.items.is_empty() && !app.library.episodes.loaded_once);
         app.backend.shutdown();
         let _ = std::fs::remove_dir_all(app.dirs.config.parent().unwrap());
+    }
+
+    #[test]
+    fn hidden_home_shelves_do_not_request_then_enable_without_reloading_home() {
+        let mut app = test_app("home-lazy-shelves");
+        app.settings.music_only = true;
+        app.settings.home.made_for_you.visible = false;
+        app.settings.home.recommendations.visible = false;
+        app.load_home(false);
+        let initial = app.backend.take_api_requests();
+        assert_eq!(
+            initial.len(),
+            3,
+            "only recents and the two visible top shelves load"
+        );
+        assert!(!initial.iter().any(|request| matches!(
+            request,
+            ApiRequest::Discover { .. } | ApiRequest::Recommendations { .. }
+        )));
+        let generation = app.home.generation;
+        app.handle_api(ApiResponse::TopTracks {
+            offset: 0,
+            full: false,
+            generation,
+            result: Ok(crate::api::models::Page {
+                items: vec![Track {
+                    id: Some("seed".into()),
+                    uri: "spotify:track:seed".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        });
+        assert!(
+            !app.backend
+                .take_api_requests()
+                .iter()
+                .any(|request| matches!(request, ApiRequest::Recommendations { .. }))
+        );
+        app.settings.home.made_for_you.visible = true;
+        app.settings.home.recommendations.visible = true;
+        app.load_home(false);
+        let enabled = app.backend.take_api_requests();
+        assert_eq!(enabled.len(), DISCOVER_TERMS.len() + 1);
+        assert!(enabled.iter().all(|request| matches!(
+            request,
+            ApiRequest::Discover { .. } | ApiRequest::Recommendations { .. }
+        )));
+        assert_eq!(
+            app.home.generation, generation,
+            "existing shelves are retained"
+        );
+        app.load_home(false);
+        assert!(
+            app.backend.take_api_requests().is_empty(),
+            "opening Home again never duplicates pending work"
+        );
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn failed_album_pagination_waits_for_explicit_retry() {
+        let mut app = test_app("album-pagination-retry");
+        app.album_pages.insert(
+            "failed".into(),
+            AlbumPage {
+                tracks: PagedList {
+                    next_offset: Some(50),
+                    loaded_once: true,
+                    error: Some("quota".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        for _ in 0..10 {
+            app.load_more(Page::Album("failed".into()));
+        }
+        assert!(app.backend.take_api_requests().is_empty());
+        app.retry_window(Page::Album("failed".into()));
+        assert!(matches!(
+            app.backend.take_api_requests().as_slice(),
+            [ApiRequest::AlbumTracks { offset: 50, .. }]
+        ));
+        assert!(app.album_pages["failed"].tracks.loading);
+        assert!(app.album_pages["failed"].tracks.error.is_none());
+        app.backend.shutdown();
     }
 
     /// Home's podcast shelf reads a bounded number of saved shows once per
@@ -17530,78 +16358,6 @@ mod tests {
         app.backend.shutdown();
     }
 
-    /// MilkDrop playback keys produce the same actions as the main window.
-    #[cfg(feature = "milkdrop")]
-    #[test]
-    fn the_milkdrop_window_drives_playback() {
-        let mut app = headless_app();
-        app.local.track = Some(crate::player::LocalTrack {
-            uri: "spotify:track:a".into(),
-            ..Default::default()
-        });
-        app.local.playback = Playback::Playing;
-
-        for command in [
-            "play-pause",
-            "next",
-            "previous",
-            "mute",
-            "save-toggle",
-            "shuffle",
-            "volume-up",
-            "volume-down",
-        ] {
-            app.actions.clear();
-            app.milkdrop_command(command);
-            assert_eq!(
-                app.actions.len(),
-                1,
-                "{command} asks the player for one thing"
-            );
-        }
-
-        app.actions.clear();
-        app.milkdrop_command("save-toggle");
-        assert!(matches!(
-            app.actions.first(),
-            Some(Action::ToggleSaved(uri)) if uri == "spotify:track:a"
-        ));
-        app.actions.clear();
-        app.milkdrop_command("next");
-        assert!(matches!(app.actions.first(), Some(Action::Next)));
-        app.actions.clear();
-        app.milkdrop_command("volume-down");
-        assert!(matches!(app.actions.first(), Some(Action::VolumeBy(-5))));
-
-        // Ignore unknown commands.
-        app.actions.clear();
-        app.milkdrop_command("teleport");
-        assert!(app.actions.is_empty());
-    }
-
-    /// The first reported screen rate sets the default FPS, but later reports
-    /// do not override a configured value.
-    #[cfg(feature = "milkdrop")]
-    #[test]
-    fn the_frame_rate_matches_the_screen_the_first_time_it_is_known() {
-        let mut app = headless_app();
-        assert_eq!(app.settings.milkdrop_screen_hz, 0, "no screen has spoken");
-        assert_eq!(app.settings.milkdrop_fps, crate::milkdrop::DEFAULT_FPS);
-
-        app.learn_screen_hz(144);
-        assert_eq!(app.settings.milkdrop_screen_hz, 144);
-        assert_eq!(app.settings.milkdrop_fps, 144, "smooth without being asked");
-
-        // Keep the configured FPS when the screen changes.
-        app.settings.milkdrop_fps = 30;
-        app.learn_screen_hz(60);
-        assert_eq!(
-            app.settings.milkdrop_screen_hz, 60,
-            "the new screen is noted"
-        );
-        assert_eq!(app.settings.milkdrop_fps, 30, "their number stands");
-    }
-
     /// A window in the Dock is drawn no frames, so the one frame a Show
     /// request buys has to be the frame that brings it back. Focus alone
     /// leaves it down there, and nothing asks again.
@@ -17766,57 +16522,6 @@ mod tests {
         app.attach(&ctx);
         assert_eq!(buttons(&app.thumb_state(false))[1].icon, Icon::Play);
         assert!(!app.thumb_state(false).dark);
-        app.backend.shutdown();
-    }
-
-    #[test]
-    fn changing_mini_taskbar_visibility_recreates_only_an_open_mini_window() {
-        let mut app = headless_app();
-        app.backend.set_offline(true);
-        let ctx = egui::Context::default();
-        app.apply(Action::SetWinampTaskbar(false), &ctx);
-        assert!(!app.settings.winamp_show_taskbar);
-        assert!(!app.switch_intent, "settings do not close the main window");
-        app.settings.winamp_window = true;
-        app.local.track = Some(crate::player::LocalTrack {
-            uri: "spotify:track:continues".into(),
-            ..Default::default()
-        });
-        app.local.playback = Playback::Playing;
-        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
-            app.apply(Action::SetWinampTaskbar(true), &ctx);
-        });
-        output.textures_delta.clear();
-        assert!(app.settings.winamp_window && app.switch_intent);
-        assert!(!app.hide_intent && !app.quit_requested);
-        assert!(
-            output.viewport_output[&egui::ViewportId::ROOT]
-                .commands
-                .iter()
-                .any(|command| matches!(command, egui::ViewportCommand::Close))
-        );
-        assert_eq!(app.local.playback, Playback::Playing);
-        assert_eq!(
-            app.local.track.as_ref().unwrap().uri,
-            "spotify:track:continues"
-        );
-        app.switch_intent = false;
-        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
-            app.apply(Action::SetWinampTaskbar(true), &ctx);
-        });
-        output.textures_delta.clear();
-        assert!(!app.switch_intent);
-        assert!(
-            !output.viewport_output[&egui::ViewportId::ROOT]
-                .commands
-                .iter()
-                .any(|command| matches!(command, egui::ViewportCommand::Close))
-        );
-        app.apply(Action::ToggleWinampWindow, &ctx);
-        assert!(
-            !app.settings.winamp_window,
-            "returning to the main interface remains available"
-        );
         app.backend.shutdown();
     }
 
@@ -22476,7 +21181,7 @@ mod tests {
         std::fs::write(app.dirs.settings_file(), original).unwrap();
         app.settings = Settings::load(&app.dirs.settings_file());
         app.applied_proxy_preferences = app.settings.proxy_preferences();
-        app.settings.theme = crate::settings::ThemeChoice::Light;
+        app.settings.zoom = 1.25;
         app.settings.proxy_host = "other.example".into();
         app.save_settings();
         assert_eq!(
@@ -22489,7 +21194,7 @@ mod tests {
         );
         app.handle_proxy_password_stored();
         let saved = Settings::load(&app.dirs.settings_file());
-        assert_eq!(saved.theme, crate::settings::ThemeChoice::Light);
+        assert_eq!(saved.zoom, 1.25);
         assert_eq!(
             saved.proxy_host, "127.0.0.1",
             "unapplied draft is not saved"
@@ -22613,11 +21318,11 @@ mod tests {
         app.settings.proxy_host = "127.0.0.1".into();
         app.settings.proxy_port = "8080".into();
         app.settings.proxy_password = "dummy-private-password".into();
-        app.settings.theme = ThemeChoice::Light;
+        app.settings.zoom = 1.25;
         app.save_settings();
         let saved = Settings::load(&app.dirs.settings_file());
         assert_eq!(saved.proxy_mode, crate::settings::ProxyMode::System);
-        assert_eq!(saved.theme, ThemeChoice::Light);
+        assert_eq!(saved.zoom, 1.25);
         assert!(
             !std::fs::read_to_string(app.dirs.settings_file())
                 .unwrap()
@@ -23209,61 +21914,6 @@ mod tests {
         );
     }
 
-    /// A skin with a bitmap in it, for pretending one was read.
-    fn some_skin(name: &str) -> crate::skin::Skin {
-        let image = image::RgbImage::from_pixel(275, 116, image::Rgb([9, 9, 9]));
-        let mut png = std::io::Cursor::new(Vec::new());
-        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
-        let archive = crate::skin::zip::write(&[("main.bmp", png.get_ref(), false)]);
-        crate::skin::Skin::from_archive(name, &archive).unwrap()
-    }
-
-    #[test]
-    fn a_skin_read_late_does_not_override_a_newer_choice() {
-        let mut app = headless_app();
-        app.settings.winamp_window = true;
-        app.settings.skin = Some("B.wsz".into());
-        app.skin_loaded(crate::winamp::Loaded {
-            name: "A.wsz".into(),
-            result: Ok(some_skin("A")),
-            installed: false,
-        });
-        assert_eq!(app.winamp.worn.as_deref(), Some("A.wsz"));
-        assert_eq!(app.settings.skin.as_deref(), Some("B.wsz"));
-    }
-
-    #[test]
-    fn a_dropped_skin_becomes_the_choice_and_a_failed_one_is_forgotten() {
-        let mut app = headless_app();
-        app.settings.winamp_window = true;
-        app.skin_loaded(crate::winamp::Loaded {
-            name: "Dropped.wsz".into(),
-            result: Ok(some_skin("Dropped")),
-            installed: true,
-        });
-        assert_eq!(app.settings.skin.as_deref(), Some("Dropped.wsz"));
-        assert_eq!(app.winamp.worn.as_deref(), Some("Dropped.wsz"));
-        assert!(
-            app.toasts
-                .iter()
-                .any(|toast| toast.message == "Added Dropped skin")
-        );
-
-        app.settings.skin = Some("Gone.wsz".into());
-        app.skin_loaded(crate::winamp::Loaded {
-            name: "Gone.wsz".into(),
-            result: Err(crate::skin::SkinError::Empty),
-            installed: false,
-        });
-        assert_eq!(app.settings.skin.as_deref(), Some("Dropped.wsz"));
-        assert_eq!(app.winamp.worn.as_deref(), Some("Dropped.wsz"));
-        assert!(
-            app.toasts
-                .iter()
-                .any(|toast| toast.message.starts_with("Gone: "))
-        );
-    }
-
     /// A link from outside waits for the account and then opens its page;
     /// a song's link opens the album the song is on.
     #[test]
@@ -23736,111 +22386,6 @@ mod tests {
         );
         drop(restored);
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn a_closing_main_window_never_takes_the_mini_players_size() {
-        let mut app = headless_app();
-        let ctx = egui::Context::default();
-        app.attach(&ctx);
-        app.actions.push(Action::ToggleWinampWindow);
-        app.apply_actions(&ctx);
-        assert!(app.switch_intent && app.settings.winamp_window);
-
-        // Native close events may leave another UI frame to draw. It still
-        // belongs to the main window, whose geometry eframe will save.
-        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.frame_ui(ui));
-        output.textures_delta.clear();
-        let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
-        assert!(
-            !commands.iter().any(|command| matches!(
-                command,
-                egui::ViewportCommand::InnerSize(_)
-                    | egui::ViewportCommand::MinInnerSize(_)
-                    | egui::ViewportCommand::MaxInnerSize(_)
-                    | egui::ViewportCommand::Maximized(_)
-            )),
-            "the retiring main window must keep its geometry: {commands:?}"
-        );
-    }
-
-    /// Switching from Winamp back to the main window preserves the main
-    /// window's size and position across the closing mini-window frame,
-    /// and the mini player's position across the main window's.
-    #[test]
-    fn closing_winamp_frame_does_not_overwrite_main_window_geometry() {
-        let mut app = headless_app();
-        let main = fastframe_shell::window::Geometry {
-            size: Some([1024.0, 768.0]),
-            position: Some([100.0, 150.0]),
-            maximized: false,
-        };
-        app.window_geometry = main;
-        let frame = |app: &mut App, ctx: &egui::Context, rect: egui::Rect| {
-            let mut raw_input = egui::RawInput::default();
-            let viewport = raw_input
-                .viewports
-                .entry(egui::ViewportId::ROOT)
-                .or_default();
-            viewport.inner_rect = Some(rect);
-            viewport.outer_rect = Some(rect);
-            let mut output = ctx.run_ui(raw_input, |ui| {
-                app.frame_ui(ui);
-                app.remember_geometry(ui.ctx());
-            });
-            output.textures_delta.clear();
-        };
-
-        // Toggle from main window to Winamp window
-        let ctx = egui::Context::default();
-        app.actions.push(Action::ToggleWinampWindow);
-        app.apply_actions(&ctx);
-        assert!(app.settings.winamp_window);
-        assert!(app.switch_intent);
-
-        // The main window's closing frame is not the mini player's position.
-        let big = egui::Rect::from_min_size(egui::pos2(100.0, 150.0), egui::vec2(1024.0, 768.0));
-        frame(&mut app, &ctx, big);
-        assert_eq!(app.winamp.geometry.position, None);
-
-        // Attach the Winamp window, which follows its own position.
-        let mini_ctx = egui::Context::default();
-        app.attach(&mini_ctx);
-        assert!(!app.switch_intent);
-        let mini_rect = egui::Rect::from_min_size(egui::pos2(50.0, 50.0), egui::vec2(275.0, 116.0));
-        frame(&mut app, &mini_ctx, mini_rect);
-        assert_eq!(app.winamp.geometry.position, Some([50.0, 50.0]));
-        assert_eq!(app.window_geometry, main);
-
-        // Switch back: the closing mini frame arms switch_intent, which
-        // keeps its tiny rectangle out of the main window's geometry.
-        app.actions.push(Action::ToggleWinampWindow);
-        frame(&mut app, &mini_ctx, mini_rect);
-        assert!(!app.settings.winamp_window);
-        assert!(app.switch_intent);
-        assert_eq!(app.window_geometry, main);
-
-        // The new main window opens from it (entrypoint's native_options),
-        // so attaching sends no size or position after the fact.
-        let main_ctx = egui::Context::default();
-        let mut output = main_ctx.run_ui(Default::default(), |_ui| {
-            app.attach(&main_ctx);
-        });
-        output.textures_delta.clear();
-        let commands = &output
-            .viewport_output
-            .get(&egui::ViewportId::ROOT)
-            .expect("the root viewport")
-            .commands;
-        assert!(
-            !commands.iter().any(|command| matches!(
-                command,
-                egui::ViewportCommand::InnerSize(_) | egui::ViewportCommand::OuterPosition(_)
-            )),
-            "{commands:?}"
-        );
-        assert_eq!(app.window_geometry, main);
-        app.backend.shutdown();
     }
 
     fn cached_liked_app() -> App {

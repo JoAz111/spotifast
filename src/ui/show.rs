@@ -270,9 +270,7 @@ pub fn episode_row(
         ui.painter().rect_filled(
             rect,
             CornerRadius::same(6),
-            palette
-                .surface_hover
-                .gamma_multiply(if palette.dark { 0.7 } else { 1.0 }),
+            palette.surface_hover.gamma_multiply(0.7),
         );
     }
     let inner = rect.shrink2(vec2(12.0, 12.0));
@@ -358,11 +356,7 @@ pub fn episode_row(
         icon,
         32.0,
         palette.text,
-        if palette.dark {
-            egui::Color32::WHITE
-        } else {
-            palette.text
-        },
+        egui::Color32::WHITE,
         palette.window,
         &gettext(locale, "Play"),
     )

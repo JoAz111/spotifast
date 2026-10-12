@@ -48,8 +48,6 @@ pub enum Outcome {
 pub enum ControlCommand {
     /// Bring the window forward, creating it if needed.
     Show,
-    /// Re-read local palette files without showing the window or restarting audio.
-    ReloadThemes,
     PlayPause,
     Play,
     Pause,
@@ -284,7 +282,6 @@ fn parse(line: &str) -> Option<Request> {
     };
     let command = match (verb, argument) {
         ("show", None) => ControlCommand::Show,
-        ("reload-themes", None) => ControlCommand::ReloadThemes,
         ("playpause", None) => ControlCommand::PlayPause,
         ("play", None) => ControlCommand::Play,
         ("pause", None) => ControlCommand::Pause,
@@ -357,7 +354,6 @@ mod tests {
     fn parses_every_control_verb() {
         // #given / #when / #then
         assert_eq!(command("show\n"), Some(ControlCommand::Show));
-        assert_eq!(command("reload-themes"), Some(ControlCommand::ReloadThemes));
         assert_eq!(command("reload-themes extra"), None);
         assert_eq!(command("playpause"), Some(ControlCommand::PlayPause));
         assert_eq!(command("play"), Some(ControlCommand::Play));

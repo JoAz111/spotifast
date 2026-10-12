@@ -21,23 +21,20 @@ pub mod sidebar;
 pub mod topbar;
 mod update;
 pub mod widgets;
-pub mod winamp;
 
 use egui::{Align2, Color32, Context, CornerRadius, Frame, Id, Margin, Rect, Stroke, vec2};
 
 use crate::api::models::pick_image;
 use crate::app::App;
 use crate::backend::AuthStatus;
-use crate::model::{Action, Loadable, Page, ToastKind};
+use crate::model::{Loadable, Page, ToastKind};
 use crate::theme::{self, Icon};
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     let ctx = &ctx;
     keys::handle(app, ctx);
-    for path in winamp::dropped_skins(ctx) {
-        app.actions.push(Action::InstallSkin(path));
-    }
+
     let signed_in = app.is_connected() && app.user.is_some();
     let connecting = matches!(app.auth, AuthStatus::Connecting | AuthStatus::Starting)
         || (app.is_connected() && app.user.is_none());
@@ -62,6 +59,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ),
         );
     }
+    player_bar::device_bar(app, ui);
     player_bar::show(app, ui);
     if app.lyrics_fullscreen.is_some() {
         lyrics::fullscreen(app, ui);
@@ -82,7 +80,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     dialogs::show(app, ctx);
     update::show(app, ctx);
     widgets::drag_ghost(ctx, &app.palette, app.locale);
-    toasts(app, ctx, theme::PLAYER_BAR_HEIGHT + 16.0);
+    let device_height = if app.playback_device().is_some() {
+        player_bar::DEVICE_BAR_HEIGHT
+    } else {
+        0.0
+    };
+    toasts(app, ctx, theme::PLAYER_BAR_HEIGHT + device_height + 16.0);
     window_controls(ui, &app.palette, app.locale);
     window_resize(ui);
 }
@@ -244,9 +247,6 @@ fn page_tint(app: &mut App) -> Option<Color32> {
         Page::LikedSongs => return Some(Color32::from_rgb(0x50, 0x38, 0xc8)),
         _ => None,
     };
-    if !app.settings.accent_from_art && image.is_some() {
-        return None;
-    }
     match image {
         Some(url) => app.tint_for(Some(&url)).or_else(|| app.now_playing_tint()),
         None => app.now_playing_tint(),
@@ -315,19 +315,18 @@ fn central(app: &mut App, ui: &mut egui::Ui) {
                         });
                 },
             );
-            header_shadow(ui, scroll.inner_rect, scroll.state.offset.y, palette.dark);
+            header_shadow(ui, scroll.inner_rect, scroll.state.offset.y);
         });
 }
 
 /// The shadow the header casts on a page scrolled under it, deepening over
-/// the first few points of scrolling. Dark in both themes, lighter over a
-/// light page.
-fn header_shadow(ui: &egui::Ui, page: Rect, scrolled: f32, dark: bool) {
+/// the first few points of scrolling.
+fn header_shadow(ui: &egui::Ui, page: Rect, scrolled: f32) {
     let depth = (scrolled / 24.0).clamp(0.0, 1.0);
     if depth <= 0.0 {
         return;
     }
-    let strength = if dark { 110.0 } else { 36.0 };
+    let strength = 110.0;
     let rect = Rect::from_min_size(page.min, vec2(page.width(), 14.0));
     widgets::paint_vertical_gradient(
         ui,
@@ -852,14 +851,14 @@ mod tests {
     use super::*;
 
     /// The header casts a shadow only on a page scrolled under it, and it
-    /// is black in both themes, never the page's own colour.
+    /// stays black over the music artwork.
     #[test]
     fn the_header_shadow_appears_once_the_page_scrolls() {
         let ctx = egui::Context::default();
         let page = Rect::from_min_size(egui::pos2(0.0, 80.0), vec2(800.0, 600.0));
-        let shadows = |scrolled: f32, dark: bool| {
+        let shadows = |scrolled: f32| {
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                header_shadow(ui, page, scrolled, dark);
+                header_shadow(ui, page, scrolled);
             });
             output.textures_delta.clear();
             output
@@ -872,12 +871,9 @@ mod tests {
                 .flatten()
                 .collect::<Vec<_>>()
         };
-        assert!(
-            shadows(0.0, true).is_empty(),
-            "nothing at the top of the page"
-        );
-        for dark in [true, false] {
-            let vertices = shadows(40.0, dark);
+        assert!(shadows(0.0).is_empty(), "nothing at the top of the page");
+        {
+            let vertices = shadows(40.0);
             let top = vertices
                 .iter()
                 .find(|vertex| vertex.pos.y == page.top())

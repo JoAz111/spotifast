@@ -2,8 +2,8 @@
 //!
 //! Nothing here talks to Spotify: the backend is switched offline, the
 //! session is marked connected, and every page is filled with plausible
-//! content. Cover art comes from a public placeholder service so the artwork
-//! pipeline (download, disk cache, accent colour) is exercised too.
+//! content. Cover art is generated locally, so screenshots and tests make
+//! no requests to placeholder services or other external hosts.
 
 use std::time::Instant;
 
@@ -22,21 +22,66 @@ use crate::model::*;
 fn image(seed: u32) -> Vec<Image> {
     vec![
         Image {
-            url: format!("https://picsum.photos/seed/spotifast{seed}/640/640"),
+            url: format!("spotifast-demo://cover/{seed}-640.svg"),
             width: Some(640),
             height: Some(640),
         },
         Image {
-            url: format!("https://picsum.photos/seed/spotifast{seed}/300/300"),
+            url: format!("spotifast-demo://cover/{seed}-300.svg"),
             width: Some(300),
             height: Some(300),
         },
         Image {
-            url: format!("https://picsum.photos/seed/spotifast{seed}/64/64"),
+            url: format!("spotifast-demo://cover/{seed}-64.svg"),
             width: Some(64),
             height: Some(64),
         },
     ]
+}
+
+/// Deterministic demo artwork without a network loader or on-disk media.
+struct DemoCoverLoader;
+
+impl egui::load::BytesLoader for DemoCoverLoader {
+    fn id(&self) -> &'static str {
+        "spotifast::DemoCoverLoader"
+    }
+    fn load(&self, _ctx: &egui::Context, uri: &str) -> egui::load::BytesLoadResult {
+        use egui::load::{Bytes, BytesPoll, LoadError};
+        let path = uri
+            .strip_prefix("spotifast-demo://cover/")
+            .ok_or(LoadError::NotSupported)?;
+        let seed: u32 = path
+            .split_once('-')
+            .and_then(|(seed, _)| seed.parse().ok())
+            .filter(|seed| *seed <= 10_000)
+            .ok_or(LoadError::NotSupported)?;
+        let color = |offset: u32| {
+            format!(
+                "#{:06x}",
+                (seed.wrapping_mul(0x539d53).wrapping_add(offset)) & 0xffffff
+            )
+        };
+        let bg = color(0x102033);
+        let fg = color(0x876543);
+        let svg = format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="640" viewBox="0 0 640 640"><rect width="640" height="640" fill="{bg}"/><circle cx="320" cy="320" r="230" fill="{fg}"/><path d="M0 430 L640 150 V640 H0Z" fill="#0b0e14" opacity=".55"/><circle cx="320" cy="320" r="62" fill="{bg}"/></svg>"##
+        );
+        Ok(BytesPoll::Ready {
+            size: None,
+            bytes: Bytes::Shared(svg.into_bytes().into()),
+            mime: Some("image/svg+xml".into()),
+        })
+    }
+    fn forget(&self, _uri: &str) {}
+    fn forget_all(&self) {}
+    fn byte_size(&self) -> usize {
+        0
+    }
+}
+
+pub(crate) fn install_art(ctx: &egui::Context) {
+    ctx.add_bytes_loader(std::sync::Arc::new(DemoCoverLoader));
 }
 
 const ARTISTS: &[&str] = &[
@@ -714,76 +759,9 @@ fn play_here(app: &mut App) {
     app.local.position_ms = now.as_ref().map_or(0, |now| now.position_ms);
 }
 
-/// Half a second of stereo sound shaped like a busy mix, the same every
-/// time: a bass line, chords and their overtones at uneven levels up
-/// through the mids and highs, a bright hi-hat hiss and pink noise
-/// beneath, so a visualizer shows peaks across the whole range rather
-/// than a slope from the bass.
-#[cfg(feature = "demo")]
-fn demo_sound() -> Vec<f64> {
-    // Frequency and level of each partial, uneven on purpose so
-    // neighbouring bands stand at different heights.
-    const PARTIALS: [(f64, f64); 18] = [
-        (55.0, 0.16),
-        (110.0, 0.07),
-        (146.8, 0.1),
-        (196.0, 0.04),
-        (246.9, 0.09),
-        (392.0, 0.03),
-        (523.3, 0.08),
-        (740.0, 0.025),
-        (880.0, 0.07),
-        (1174.7, 0.02),
-        (1568.0, 0.06),
-        (2093.0, 0.018),
-        (2637.0, 0.05),
-        (3520.0, 0.014),
-        (4698.6, 0.04),
-        (6271.9, 0.012),
-        (8372.0, 0.03),
-        (11175.3, 0.01),
-    ];
-    let rate = f64::from(librespot_playback::SAMPLE_RATE);
-    let mut seed = 0x2545_f491_u32;
-    let mut white = move || {
-        seed ^= seed << 13;
-        seed ^= seed >> 17;
-        seed ^= seed << 5;
-        f64::from(seed) / f64::from(u32::MAX) - 0.5
-    };
-    // Paul Kellet's economy filter turns white noise pink; the difference
-    // of two white samples leaves only the treble, like a hi-hat.
-    let (mut b0, mut b1, mut b2, mut last) = (0.0, 0.0, 0.0, 0.0);
-    (0..librespot_playback::SAMPLE_RATE as usize / 2)
-        .flat_map(|index| {
-            let time = index as f64 / rate;
-            let noise = white();
-            b0 = 0.99765 * b0 + noise * 0.099_046;
-            b1 = 0.963 * b1 + noise * 0.296_516_4;
-            b2 = 0.57 * b2 + noise * 1.052_691_3;
-            let pink = (b0 + b1 + b2 + noise * 0.1848) * 0.12;
-            let hiss = (noise - last) * 0.05;
-            last = noise;
-            let sample = PARTIALS
-                .iter()
-                .map(|(hertz, level)| {
-                    // Everything above the bass half again as loud, so the
-                    // skin's bars, four bands each, stand tall too.
-                    let level = if *hertz > 100.0 { level * 1.5 } else { *level };
-                    level * (time * hertz * std::f64::consts::TAU).sin()
-                })
-                .sum::<f64>()
-                + pink
-                + hiss;
-            [sample, sample]
-        })
-        .collect()
-}
-
 #[cfg(feature = "demo")]
 pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
     // Default screenshots to the main window regardless of saved settings.
-    app.settings.winamp_window = false;
     if let Some(page) = page.and_then(Page::decode) {
         app.open(page);
     }
@@ -824,16 +802,6 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                 // as without this override.
                 play_here(app);
                 app.local.playback = crate::player::Playback::Paused;
-            }
-            "player-bar-spectrum" | "player-bar-waveform" => {
-                app.settings.player_bar_vis = if surface == "player-bar-spectrum" {
-                    crate::settings::PlayerBarVis::Spectrum
-                } else {
-                    crate::settings::PlayerBarVis::Waveform
-                };
-                play_here(app);
-                app.local.playback = crate::player::Playback::Playing;
-                app.winamp.tap.push(&demo_sound(), 1.0);
             }
             // The sign-in card and the card while the session connects.
             "signed-out" => {
@@ -945,7 +913,6 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                     url: "https://spotifast.rocks/download/".into(),
                 });
             }
-            "personal-app" => app.dialog = Some(Dialog::PersonalAppIntro),
             "many-devices" => {
                 app.show_devices = true;
                 app.devices.extend((0..40).map(|index| Device {
@@ -991,14 +958,6 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                     }
                 }
             }
-            "light" => {
-                app.settings.theme = crate::settings::ThemeChoice::Light;
-                app.actions.push(Action::SettingsChanged);
-            }
-            "dark" => {
-                app.settings.theme = crate::settings::ThemeChoice::Dark;
-                app.actions.push(Action::SettingsChanged);
-            }
             "song-top-result" => {
                 if let Loadable::Loaded(results) = &mut app.search.results {
                     results.artists = None;
@@ -1034,23 +993,29 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                 app.resume_position_ms = 19_566;
                 app.actions.push(Action::Next);
             }
-            // Use the built-in skin for deterministic screenshots.
-            "winamp" => {
-                app.settings.winamp_window = true;
-                app.settings.skin = None;
-                // Two screen pixels per skin pixel, whatever the display, so
-                // captures match the pages that show them.
-                app.settings.skin_scale = Some(2);
+            "soloist" => {
+                let track = track(0);
+                app.soloist_mode = true;
+                app.local_device_id = Some("local-demo".into());
+                app.local.connected = true;
+                app.local.playback = crate::player::Playback::Playing;
+                app.local.volume = app.settings.volume;
+                app.local.track = Some(crate::player::LocalTrack {
+                    uri: track.uri,
+                    title: track.name,
+                    artists: track.artists,
+                    duration_ms: track.duration_ms,
+                    art_url: track
+                        .album
+                        .as_ref()
+                        .and_then(|album| crate::api::models::pick_image(&album.images, 640))
+                        .map(str::to_owned),
+                    ..Default::default()
+                });
+                app.remote = None;
+                app.devices[0].name = "Spotifast Soloist".into();
+                app.devices[0].is_active = true;
             }
-            "playlist" => app.settings.playlist_open = true,
-            "shade" => app.settings.winamp_shaded = true,
-            "playlist-shade" => app.settings.playlist_shaded = true,
-            "eq" => {
-                app.settings.eq_open = true;
-                app.settings.eq_on = true;
-                app.settings.eq_bands_db = crate::eq::PRESETS[13].bands_db;
-            }
-            "presets" => app.winamp.open_presets = true,
             "art" => app.settings.art_expanded = true,
             "folders" => {
                 use crate::player::RootlistEntry;
@@ -1074,17 +1039,11 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                 ];
                 app.collapsed_folders = vec!["f2".into()];
             }
-            "small" => app.settings.skin_scale = Some(1),
             "windows-taskbar" => app.demo_windows_controls = true,
             "compact" => {
                 app.settings.sidebar_compact = true;
                 app.settings.tracklist_compact = true;
             }
-            "eq-shade" => {
-                app.settings.eq_open = true;
-                app.settings.eq_shaded = true;
-            }
-            "milkdrop" => app.settings.milkdrop_open = true,
             "pins" => {
                 app.settings.pinned_contexts =
                     vec!["spotify:playlist:pl2".into(), "spotify:playlist:pl4".into()];
@@ -1246,12 +1205,6 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                     }
                 }
             }
-            // A Spotify app of one's own, in use.
-            "faster" => {
-                let id = "8f2c1d0e4a6b4c3d9e7f5a1b2c3d4e5f".to_string();
-                app.settings.web_client_id = Some(id.clone());
-                app.web_app = Some(id);
-            }
             _ => {}
         }
     }
@@ -1289,13 +1242,172 @@ mod tests {
         app.attach(&ctx);
         populate(&mut app);
         // These frames never advance the clock or take pictures.
-        app.reveal_theme_changes = false;
         (ctx, app)
     }
 
     /// #576: the Library heading never runs under the header's buttons. It
     /// shrinks a little for a long translation and gives way entirely in
     /// the narrowest sidebar, but stays where there is room.
+    #[test]
+    fn playback_destination_is_a_clickable_green_bar_below_the_player() {
+        use egui::accesskit::Role;
+        let (ctx, mut app) = accessible_app("green-device-bar");
+        for width in [760.0, 1240.0] {
+            let mut draw = |events| {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 800.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.frame_ui(ui),
+                );
+                output.textures_delta.clear();
+                output
+            };
+            draw(vec![]);
+            let output = draw(vec![]);
+            let bar = egui::containers::panel::PanelState::load(
+                &ctx,
+                egui::Id::new("playback-device-bar"),
+            )
+            .unwrap()
+            .outer_rect;
+            let player =
+                egui::containers::panel::PanelState::load(&ctx, egui::Id::new("player-bar"))
+                    .unwrap()
+                    .outer_rect;
+            assert_eq!((bar.left(), bar.right(), bar.bottom()), (0.0, width, 800.0));
+            assert_eq!(bar.height(), crate::ui::player_bar::DEVICE_BAR_HEIGHT);
+            assert_eq!(player.bottom(), bar.top());
+            fn painted(
+                shape: &egui::Shape,
+                bar: egui::Rect,
+                green: &mut bool,
+                text: &mut Option<(egui::Rect, egui::Color32)>,
+            ) {
+                match shape {
+                    egui::Shape::Rect(shape) if shape.rect == bar => {
+                        *green |= shape.fill == crate::ui::player_bar::DEVICE_BAR_COLOR;
+                    }
+                    egui::Shape::Text(shape)
+                        if shape.galley.job.text == "Playing on Kitchen speaker" =>
+                    {
+                        *text = Some((
+                            shape.galley.rect.translate(shape.pos.to_vec2()),
+                            shape.galley.job.sections[0].format.color,
+                        ));
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            painted(shape, bar, green, text);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut green = false;
+            let mut text = None;
+            for shape in &output.shapes {
+                painted(&shape.shape, bar, &mut green, &mut text);
+            }
+            assert!(green, "the entire destination strip is Spotify green");
+            let (text, color) = text.expect("the real destination label");
+            assert_eq!(color, egui::Color32::BLACK);
+            assert!((bar.right() - text.right() - 14.0).abs() < 1.0);
+            assert!(text.top() >= bar.top() && text.bottom() <= bar.bottom());
+            let tree = output.platform_output.accesskit_update.unwrap();
+            let button = accessible_node(&tree, "Playing on Kitchen speaker", Role::Button);
+            draw(vec![accessible_action(
+                button,
+                egui::accesskit::Action::Click,
+                None,
+            )]);
+            assert!(app.show_devices, "the strip opens Spotify Connect");
+            app.show_devices = false;
+        }
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn local_soloist_destination_has_a_real_name_and_no_inactive_banner() {
+        let (ctx, mut app) = accessible_app("soloist-device-name");
+        app.soloist_mode = true;
+        app.local.playback = crate::player::Playback::Playing;
+        app.local.track = Some(crate::player::LocalTrack {
+            uri: "spotify:track:current".into(),
+            ..Default::default()
+        });
+        app.remote = None;
+        app.devices[0].name = "Spotifast Soloist".into();
+        assert_eq!(app.playback_device().unwrap().0, "Spotifast Soloist");
+        app.devices[0].name = "My Mac speakers".into();
+        assert_eq!(app.playback_device().unwrap().0, "My Mac speakers");
+        app.devices.clear();
+        assert_eq!(app.playback_device().unwrap().0, "Spotifast Soloist");
+        app.local.playback = crate::player::Playback::Stopped;
+        assert!(app.playback_device().is_none());
+        frame(&ctx, &mut app);
+        app.backend.shutdown();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn soloist_audio_output_opens_native_settings() {
+        let (ctx, mut app) = accessible_app("soloist-audio-output");
+        app.soloist_mode = true;
+        settings_text(&ctx, &mut app, "Audio output");
+        let painted = view_frame(&ctx, &mut app, vec![], crate::ui::settings::show);
+        let button = sidebar_text(&painted, "Audio output…").center();
+        app.actions.clear();
+        view_frame(
+            &ctx,
+            &mut app,
+            pointer_click(button, egui::PointerButton::Primary),
+            crate::ui::settings::show,
+        );
+        assert!(app.actions.iter().any(
+            |action| matches!(action, Action::OpenUrl(url) if url == "spotifast-soloist://settings")
+        ));
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn settings_are_dark_and_offer_only_music_preferences() {
+        let (ctx, mut app) = accessible_app("pure-music-settings");
+        ctx.set_theme(egui::ThemePreference::Light);
+        app.open(Page::Settings);
+        for _ in 0..3 {
+            frame(&ctx, &mut app);
+        }
+        assert_eq!(ctx.theme(), egui::Theme::Dark);
+        assert_eq!(app.palette, crate::theme::Palette::dark());
+        let painted = view_frame(&ctx, &mut app, vec![], crate::ui::settings::show);
+        let labels: Vec<_> = painted.iter().map(|(label, _)| label.as_str()).collect();
+        assert!(labels.contains(&"Language"));
+        assert!(labels.contains(&"Sign out"));
+        for ornament in [
+            "Theme",
+            "Light",
+            "Dark",
+            "Follow system",
+            "Custom theme",
+            "Winamp",
+            "Winamp skins",
+            "MilkDrop",
+            "Equalizer",
+            "Player bar visualizer",
+            "Personal Spotify app",
+            "Client ID",
+        ] {
+            assert!(!labels.contains(&ornament), "redundant control {ornament}");
+        }
+        app.backend.shutdown();
+    }
+
     #[test]
     fn the_library_heading_never_overlaps_its_buttons() {
         fn texts(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Rect)>) {
@@ -1398,9 +1510,9 @@ mod tests {
     }
 
     #[test]
-    fn cover_editing_fits_large_and_narrow_windows_in_both_themes() {
+    fn cover_editing_fits_large_and_narrow_windows_in_dark_mode() {
         for (width, height) in [(1240.0, 800.0), (760.0, 520.0)] {
-            for light in [false, true] {
+            {
                 let (ctx, mut app) = accessible_app("cover-dialog");
                 app.open(Page::Playlist("pl1".into()));
                 app.dialog = Some(Dialog::EditPlaylist {
@@ -1410,10 +1522,6 @@ mod tests {
                     public: Some(false),
                     cover: Default::default(),
                 });
-                if light {
-                    app.settings.theme = crate::settings::ThemeChoice::Light;
-                    app.actions.push(Action::SettingsChanged);
-                }
                 if let Some(Dialog::EditPlaylist { cover, .. }) = &mut app.dialog {
                     cover.error = Some("Spotify refused this cover. Check that you own the playlist, then sign in again to grant image upload permission.".into());
                 }
@@ -2707,53 +2815,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn personal_app_intro_can_be_dismissed_or_open_setup_with_keyboard_focus() {
-        use egui::accesskit::{Action as AccessibleAction, Role};
-
-        for setup in [false, true] {
-            let (ctx, mut app) = accessible_app(&format!("personal-app-intro-{setup}"));
-            app.dialog = Some(Dialog::PersonalAppIntro);
-            accessible_frame(&ctx, &mut app, vec![]);
-            let tree = accessible_frame(&ctx, &mut app, vec![]);
-            let button = accessible_node(
-                &tree,
-                if setup {
-                    "Set up personal app"
-                } else {
-                    "Keep shared app"
-                },
-                Role::Button,
-            );
-            accessible_frame(
-                &ctx,
-                &mut app,
-                vec![accessible_action(button, AccessibleAction::Click, None)],
-            );
-            assert!(app.dialog.is_none());
-            assert!(app.settings.personal_app_intro_seen);
-            if setup {
-                assert_eq!(app.page(), &Page::Settings);
-                accessible_frame(&ctx, &mut app, vec![]);
-                assert!(
-                    ctx.memory(|memory| memory.has_focus(egui::Id::new("personal-web-client-id")))
-                );
-            }
-            app.backend.shutdown();
-        }
-        let (ctx, mut app) = accessible_app("personal-app-intro-escape");
-        app.dialog = Some(Dialog::PersonalAppIntro);
-        accessible_frame(&ctx, &mut app, vec![]);
-        accessible_frame(
-            &ctx,
-            &mut app,
-            vec![keyboard(egui::Key::Escape, egui::Modifiers::NONE)],
-        );
-        assert!(app.dialog.is_none());
-        assert!(app.settings.personal_app_intro_seen);
-        app.backend.shutdown();
-    }
-
     fn settings_filter(ctx: &egui::Context) -> String {
         ctx.data_mut(|data| {
             data.get_temp::<String>(egui::Id::new("settings-filter"))
@@ -2972,9 +3033,6 @@ mod tests {
             ("Sign out", Role::Button),
             ("Normalize volume", Role::CheckBox),
             ("Dark", Role::Button),
-            ("Switch to it", Role::Button),
-            ("MilkDrop window", Role::CheckBox),
-            ("Equalizer", Role::CheckBox),
             ("Clear artwork", Role::Button),
             ("Check for updates", Role::Button),
         ] {
@@ -2988,49 +3046,6 @@ mod tests {
         app.backend.shutdown();
     }
 
-    #[test]
-    fn personal_app_setup_clears_a_saved_settings_search() {
-        use egui::accesskit::{Action as AccessibleAction, Role};
-        let (ctx, mut app) = accessible_app("settings-search-setup");
-        app.open(Page::Settings);
-        accessible_frame(&ctx, &mut app, vec![]);
-        let tree = accessible_frame(&ctx, &mut app, vec![]);
-        let field = accessible_node(&tree, "Search settings", Role::TextInput);
-        // Search for something that hides the Account section...
-        accessible_frame(
-            &ctx,
-            &mut app,
-            vec![accessible_action(field, AccessibleAction::Focus, None)],
-        );
-        accessible_frame(&ctx, &mut app, vec![egui::Event::Text("theme".into())]);
-        assert_eq!(settings_filter(&ctx), "theme");
-        // ...leave Settings...
-        app.open(Page::Home);
-        accessible_frame(&ctx, &mut app, vec![]);
-        // ...and enter Personal App setup, which must reveal and focus
-        // the Client ID field instead of landing on a filtered-out row.
-        app.dialog = Some(Dialog::PersonalAppIntro);
-        accessible_frame(&ctx, &mut app, vec![]);
-        let tree = accessible_frame(&ctx, &mut app, vec![]);
-        let setup = accessible_node(&tree, "Set up personal app", Role::Button);
-        accessible_frame(
-            &ctx,
-            &mut app,
-            vec![accessible_action(setup, AccessibleAction::Click, None)],
-        );
-        assert_eq!(app.page(), &Page::Settings);
-        assert!(
-            settings_filter(&ctx).is_empty(),
-            "setup must drop the saved search so its row is visible"
-        );
-        accessible_frame(&ctx, &mut app, vec![]);
-        assert!(
-            ctx.memory(|memory| memory.has_focus(egui::Id::new("personal-web-client-id"))),
-            "the Client ID field takes focus once its row is visible"
-        );
-        app.backend.shutdown();
-    }
-
     fn settings_text(ctx: &egui::Context, app: &mut App, query: &str) -> Vec<String> {
         ctx.data_mut(|data| {
             data.insert_temp(egui::Id::new("settings-filter"), query.to_owned());
@@ -3040,56 +3055,6 @@ mod tests {
             .into_iter()
             .map(|(text, _)| text)
             .collect()
-    }
-
-    /// The About card ends with the author's credit, and the name opens
-    /// the author's website.
-    #[test]
-    fn the_about_card_credits_the_author() {
-        let (ctx, mut app) = accessible_app("about-credit");
-        settings_text(&ctx, &mut app, "Rust");
-        let texts = view_frame(&ctx, &mut app, vec![], crate::ui::settings::show);
-        assert!(
-            texts
-                .iter()
-                .any(|(text, _)| text.contains("Built with love by")),
-            "{texts:?}"
-        );
-        let name = texts
-            .iter()
-            .find(|(text, _)| text == "Carmine Paolino")
-            .map(|(_, rect)| rect.center())
-            .expect("the author's name");
-        app.actions.clear();
-        view_frame(
-            &ctx,
-            &mut app,
-            vec![
-                egui::Event::PointerMoved(name),
-                egui::Event::PointerButton {
-                    pos: name,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                },
-                egui::Event::PointerButton {
-                    pos: name,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-            crate::ui::settings::show,
-        );
-        assert!(
-            app.actions.iter().any(|action| matches!(
-                action,
-                Action::OpenUrl(url) if url == crate::ui::widgets::AUTHOR_URL
-            )),
-            "{:?}",
-            app.actions
-        );
-        app.backend.shutdown();
     }
 
     #[test]
@@ -3133,19 +3098,6 @@ mod tests {
     #[test]
     fn settings_search_never_shows_a_section_for_an_unavailable_row() {
         let (ctx, mut app) = accessible_app("settings-search-availability");
-        let text = settings_text(&ctx, &mut app, "Show in taskbar");
-        assert_eq!(
-            text.iter().any(|text| text == "Winamp skins"),
-            cfg!(windows)
-        );
-        if !cfg!(windows) {
-            assert!(text.iter().any(|text| text.starts_with("No settings for")));
-        }
-        app.demo_windows_controls = true;
-        let text = settings_text(&ctx, &mut app, "Show in taskbar");
-        assert!(text.iter().any(|text| text == "Winamp skins"));
-        assert!(text.iter().any(|text| text == "Show in taskbar"));
-
         app.settings.web_client_id = None;
         app.web_app = None;
         let text = settings_text(&ctx, &mut app, "Personal app ready");
@@ -3155,30 +3107,6 @@ mod tests {
         app.web_app = Some("test-client".into());
         let text = settings_text(&ctx, &mut app, "Personal app ready");
         assert!(text.iter().any(|text| text == "Personal app ready"));
-        app.backend.shutdown();
-    }
-
-    #[test]
-    fn create_an_app_row_hides_once_the_personal_app_is_ready() {
-        let (ctx, mut app) = accessible_app("settings-create-app");
-        app.settings.web_client_id = None;
-        app.web_app = None;
-        let text = settings_text(&ctx, &mut app, "Account");
-        assert!(text.iter().any(|text| text == "Create an app"));
-
-        app.settings.web_client_id = Some("test-client".into());
-        let text = settings_text(&ctx, &mut app, "Account");
-        assert!(text.iter().any(|text| text == "Create an app"));
-        assert!(
-            text.iter()
-                .any(|text| text == "Authorize your personal app")
-        );
-
-        app.web_app = Some("test-client".into());
-        let text = settings_text(&ctx, &mut app, "Account");
-        assert!(text.iter().any(|text| text == "Personal app ready"));
-        assert!(!text.iter().any(|text| text == "Create an app"));
-        assert!(!text.iter().any(|text| text == "Setup guide"));
         app.backend.shutdown();
     }
 
@@ -3609,45 +3537,6 @@ mod tests {
         app.backend.shutdown();
     }
 
-    #[test]
-    fn the_windows_taskbar_setting_keeps_its_choice_without_closing_settings() {
-        use egui::accesskit::Role;
-        let (ctx, mut app) = accessible_app("winamp-taskbar-setting");
-        app.open(Page::Settings);
-        accessible_frame(&ctx, &mut app, vec![]);
-        let tree = accessible_frame(&ctx, &mut app, vec![]);
-        if !cfg!(windows) {
-            assert!(
-                !tree
-                    .nodes
-                    .iter()
-                    .any(|(_, node)| node.label() == Some("Show Winamp in taskbar"))
-            );
-        }
-        app.demo_windows_controls = true;
-        for _ in 0..4 {
-            accessible_frame(&ctx, &mut app, vec![]);
-        }
-        let tree = accessible_frame(&ctx, &mut app, vec![]);
-        let control = accessible_node(&tree, "Show Winamp in taskbar", Role::CheckBox);
-        accessible_frame(
-            &ctx,
-            &mut app,
-            vec![accessible_action(
-                control,
-                egui::accesskit::Action::Click,
-                None,
-            )],
-        );
-        assert!(!app.settings.winamp_show_taskbar);
-        assert!(!app.settings.winamp_window && !app.switch_intent);
-        let path = app.dirs.config.join("winamp-taskbar-choice.json");
-        app.settings.save(&path);
-        app.settings = Settings::load(&path);
-        assert!(!app.settings.winamp_show_taskbar);
-        app.backend.shutdown();
-    }
-
     /// Linux offers middle-click autoscroll as a switch that starts off and
     /// is saved; Windows always autoscrolls and macOS never does, so neither
     /// shows the row.
@@ -3693,60 +3582,13 @@ mod tests {
         app.backend.shutdown();
     }
 
-    /// X11 can hide the mini player's taskbar entry, so it gets the same row
-    /// and menu item as Windows; Wayland and macOS never show them.
-    #[test]
-    fn the_taskbar_setting_follows_the_window_backend() {
-        let (ctx, mut app) = accessible_app("x11-taskbar-setting");
-        app.taskbar_hiding_supported = true;
-        let text = settings_text(&ctx, &mut app, "Show in taskbar");
-        assert!(text.iter().any(|text| text == "Winamp skins"));
-        assert!(text.iter().any(|text| text == "Show in taskbar"));
-
-        app.taskbar_hiding_supported = false;
-        let text = settings_text(&ctx, &mut app, "Show in taskbar");
-        assert_eq!(
-            text.iter().any(|text| text == "Winamp skins"),
-            cfg!(windows)
-        );
-        app.backend.shutdown();
-    }
-
-    #[test]
-    fn wayland_on_top_setting_is_disabled_and_does_not_look_active() {
-        use egui::accesskit::{Role, Toggled};
-        let (ctx, mut app) = accessible_app("wayland-on-top");
-        app.window_level_supported = false;
-        app.settings.winamp_on_top = true;
-        app.open(Page::Settings);
-        accessible_frame(&ctx, &mut app, vec![]);
-        let tree = accessible_frame(&ctx, &mut app, vec![]);
-        let id = accessible_node(&tree, "Always on top", Role::CheckBox);
-        let node = &tree
-            .nodes
-            .iter()
-            .find(|(node_id, _)| *node_id == id)
-            .unwrap()
-            .1;
-        assert!(node.is_disabled());
-        assert_eq!(node.toggled(), Some(Toggled::False));
-        assert!(
-            app.settings.winamp_on_top,
-            "the saved preference is preserved"
-        );
-        app.backend.shutdown();
-    }
-
     fn frame(ctx: &egui::Context, app: &mut App) {
         frame_events(ctx, app, Vec::new());
     }
 
     #[test]
     fn an_idle_sonos_in_the_picker_transfers_instead_of_authorizing() {
-        for palette in [
-            crate::theme::Palette::dark(),
-            crate::theme::Palette::light(),
-        ] {
+        for palette in [crate::theme::Palette::dark(), crate::theme::Palette::dark()] {
             let (ctx, mut app) = accessible_app("sonos-device-picker");
             app.backend.set_offline(true);
             app.palette = palette;
@@ -4401,10 +4243,7 @@ mod tests {
             }
         }
         let (ctx, mut app) = accessible_app("compact-artist-date-gap");
-        for palette in [
-            crate::theme::Palette::dark(),
-            crate::theme::Palette::light(),
-        ] {
+        for palette in [crate::theme::Palette::dark(), crate::theme::Palette::dark()] {
             app.palette = palette;
             crate::theme::apply(&ctx, &palette);
             view_frame(&ctx, &mut app, vec![], rows);
@@ -4562,194 +4401,6 @@ mod tests {
             (heading - album).abs() < 1.0,
             "album heading at {heading}, album names at {album}"
         );
-    }
-
-    /// The player bar's visualizer draws only when chosen and while the
-    /// song plays on this computer, and asks for frames only then.
-    #[cfg(feature = "demo")]
-    #[test]
-    fn the_player_bar_visualizer_moves_only_when_chosen_and_playing() {
-        use crate::settings::PlayerBarVis;
-        let (ctx, mut app) = accessible_app("player-bar-vis");
-        let draw = |app: &mut App| {
-            let mut output = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(1280.0, 800.0),
-                    )),
-                    ..Default::default()
-                },
-                |ui| crate::ui::player_bar::show(app, ui),
-            );
-            output.textures_delta.clear();
-            output
-        };
-        // Both draw an untextured mesh; the waveform also strokes its line
-        // in many short runs.
-        let lines = |output: &egui::FullOutput| {
-            output
-                .shapes
-                .iter()
-                .filter(|shape| matches!(&shape.shape, egui::Shape::Path(_)))
-                .count()
-        };
-        let drawn = |output: &egui::FullOutput| {
-            output.shapes.iter().any(|shape| {
-                matches!(&shape.shape, egui::Shape::Mesh(mesh)
-                    if mesh.texture_id == egui::TextureId::default() && !mesh.vertices.is_empty())
-            })
-        };
-        let spectrum = |output: &egui::FullOutput| drawn(output) && lines(output) < 20;
-        let waveform = |output: &egui::FullOutput| drawn(output) && lines(output) >= 20;
-        let wants_frames = |output: &egui::FullOutput| {
-            output
-                .viewport_output
-                .get(&egui::ViewportId::ROOT)
-                .is_some_and(|viewport| {
-                    viewport.repaint_delay < std::time::Duration::from_millis(100)
-                })
-        };
-
-        // #given a song playing here with the spectrum chosen
-        apply_flags(&mut app, None, Some("player-bar-spectrum"));
-        draw(&mut app);
-        let output = draw(&mut app);
-        assert!(spectrum(&output), "the spectrum is drawn");
-        assert!(wants_frames(&output));
-
-        // #when the waveform is chosen
-        app.settings.player_bar_vis = PlayerBarVis::Waveform;
-        let output = draw(&mut app);
-        assert!(waveform(&output), "the waveform is drawn");
-        assert!(!spectrum(&output));
-
-        // #when it is turned off
-        app.settings.player_bar_vis = PlayerBarVis::Off;
-        let output = draw(&mut app);
-        assert!(!drawn(&output));
-        assert!(!wants_frames(&output), "nothing to animate");
-
-        // #when the song is paused
-        app.settings.player_bar_vis = PlayerBarVis::Waveform;
-        app.local.playback = crate::player::Playback::Paused;
-        let output = draw(&mut app);
-        assert!(!waveform(&output), "a paused song is still");
-        app.backend.shutdown();
-    }
-
-    /// A click on the player bar's empty space moves the visualizer to its
-    /// next mode, and a click on a control does not.
-    #[cfg(feature = "demo")]
-    #[test]
-    fn clicking_the_player_bars_empty_space_cycles_the_visualizer() {
-        let (ctx, mut app) = accessible_app("player-bar-cycle");
-        let draw = |app: &mut App, events: Vec<egui::Event>| {
-            let mut output = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(1280.0, 800.0),
-                    )),
-                    events,
-                    ..Default::default()
-                },
-                |ui| crate::ui::player_bar::show(app, ui),
-            );
-            output.textures_delta.clear();
-        };
-        draw(&mut app, vec![]);
-        // The margin at the bar's left edge, beside the cover.
-        let empty = egui::pos2(6.0, 796.0);
-        draw(&mut app, pointer_click(empty, egui::PointerButton::Primary));
-        assert!(
-            app.actions
-                .iter()
-                .any(|action| matches!(action, Action::CyclePlayerBarVis))
-        );
-
-        app.actions.clear();
-        app.settings.player_bar_vis_click = false;
-        draw(&mut app, pointer_click(empty, egui::PointerButton::Primary));
-        assert!(
-            !app.actions
-                .iter()
-                .any(|action| matches!(action, Action::CyclePlayerBarVis))
-        );
-        app.settings.player_bar_vis_click = true;
-
-        // The play button, in the middle of the bar, is still the play button.
-        app.actions.clear();
-        let play = egui::pos2(640.0, 800.0 - crate::theme::PLAYER_BAR_HEIGHT / 2.0 - 10.0);
-        draw(&mut app, pointer_click(play, egui::PointerButton::Primary));
-        assert!(
-            !app.actions
-                .iter()
-                .any(|action| matches!(action, Action::CyclePlayerBarVis)),
-            "{:?}",
-            app.actions
-        );
-        app.backend.shutdown();
-    }
-
-    /// The empty space's tooltip belongs to the empty space: once shown, it
-    /// closes when the pointer moves onto a control drawn over the bar.
-    #[cfg(feature = "demo")]
-    #[test]
-    fn the_visualizer_tooltip_stays_off_the_player_bar_controls() {
-        let (ctx, mut app) = accessible_app("player-bar-tooltip");
-        ctx.global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
-        let mut time = 0.0;
-        let mut draw = |app: &mut App, pos: egui::Pos2| {
-            time += 1.0;
-            let mut output = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(1280.0, 800.0),
-                    )),
-                    time: Some(time),
-                    events: vec![egui::Event::PointerMoved(pos)],
-                    ..Default::default()
-                },
-                |ui| crate::ui::player_bar::show(app, ui),
-            );
-            output.textures_delta.clear();
-            fn texts(shape: &egui::epaint::Shape, found: &mut Vec<String>) {
-                match shape {
-                    egui::epaint::Shape::Text(text) => found.push(text.galley.job.text.clone()),
-                    egui::epaint::Shape::Vec(shapes) => {
-                        shapes.iter().for_each(|shape| texts(shape, found));
-                    }
-                    _ => {}
-                }
-            }
-            let mut found = Vec::new();
-            output
-                .shapes
-                .iter()
-                .for_each(|clipped| texts(&clipped.shape, &mut found));
-            found
-        };
-        let tip = "Click to change the visualizer";
-
-        // #given the tooltip shown over the empty margin beside the cover
-        let empty = egui::pos2(6.0, 796.0);
-        for _ in 0..3 {
-            draw(&mut app, empty);
-        }
-        assert!(draw(&mut app, empty).iter().any(|text| text == tip));
-
-        // #when the pointer moves onto the play button
-        let play = egui::pos2(640.0, 800.0 - crate::theme::PLAYER_BAR_HEIGHT / 2.0 - 10.0);
-        for _ in 0..3 {
-            draw(&mut app, play);
-        }
-
-        // #then the tooltip is gone
-        let shown = draw(&mut app, play);
-        assert!(!shown.iter().any(|text| text == tip), "{shown:?}");
-        app.backend.shutdown();
     }
 
     #[test]
@@ -4946,7 +4597,7 @@ mod tests {
         );
         assert_eq!(app.locale, Locale::Spanish);
         // The English search text no longer matches the Spanish row.
-        crate::ui::settings::clear_search(&ctx);
+        ctx.data_mut(|data| data.remove::<String>(egui::Id::new("settings-filter")));
         accessible_frame(&ctx, &mut app, vec![]);
         let tree = accessible_frame(&ctx, &mut app, vec![]);
         accessible_node(&tree, &gettext(Locale::Spanish, "Home"), Role::Button);
@@ -4965,134 +4616,6 @@ mod tests {
         let tree = accessible_frame(&ctx, &mut app, vec![]);
         accessible_node(&tree, "Home", Role::Button);
         app.backend.shutdown();
-    }
-
-    /// Beside the themes folder, a button opens the guide to writing a
-    /// theme.
-    #[test]
-    fn the_theme_row_links_to_the_guide_to_making_a_theme() {
-        // Only the page is drawn, so the click's action is collected and
-        // never opens a browser.
-        let (ctx, mut app) = accessible_app("theme-guide");
-        ctx.data_mut(|data| {
-            data.insert_temp(egui::Id::new("settings-filter"), "Appearance".to_string())
-        });
-        for _ in 0..3 {
-            view_frame(&ctx, &mut app, vec![], crate::ui::settings::show);
-        }
-        let painted = view_frame(&ctx, &mut app, vec![], crate::ui::settings::show);
-        let guide = sidebar_text(&painted, "How to make a theme").center();
-        let folder = sidebar_text(&painted, "Open themes folder").center();
-        assert!((guide.y - folder.y).abs() < 1.0, "side by side");
-        app.actions.clear();
-        view_frame(
-            &ctx,
-            &mut app,
-            pointer_click(guide, egui::PointerButton::Primary),
-            crate::ui::settings::show,
-        );
-        assert!(app.actions.iter().any(|action| matches!(action,
-            Action::OpenUrl(url) if url == "https://spotifast.rocks/settings-and-files/#custom-themes")));
-        app.backend.shutdown();
-    }
-
-    #[test]
-    fn custom_theme_picker_applies_the_clicked_palette_and_exposes_its_name_and_value() {
-        let (ctx, mut app) = accessible_app("custom-theme-picker");
-        app.open(Page::Settings);
-        ctx.data_mut(|data| {
-            data.insert_temp(egui::Id::new("settings-filter"), "Appearance".to_string())
-        });
-        let mut palette = crate::theme::Palette::light();
-        palette.accent = egui::Color32::from_rgb(140, 63, 165);
-        app.custom_themes = crate::theme::Catalog::preview(
-            vec![crate::theme::CustomTheme {
-                filename: "local.json".into(),
-                palette,
-            }],
-            false,
-        );
-        for _ in 0..3 {
-            view_frame(&ctx, &mut app, vec![], App::frame_ui);
-        }
-        let painted = view_frame(&ctx, &mut app, vec![], App::frame_ui);
-        let picker = sidebar_text(&painted, "Follow system").center();
-        view_frame(
-            &ctx,
-            &mut app,
-            pointer_click(picker, egui::PointerButton::Primary),
-            App::frame_ui,
-        );
-        let painted = view_frame(&ctx, &mut app, vec![], App::frame_ui);
-        let menu_y = |name: &str| {
-            painted
-                .iter()
-                .filter(|(text, rect)| text == name && rect.center().y > picker.y)
-                .map(|(_, rect)| rect.center().y)
-                .next()
-                .expect("theme menu entry")
-        };
-        assert!(menu_y("Follow system") < menu_y("Light"));
-        assert!(menu_y("Light") < menu_y("Dark"));
-        // Listed by name, without `.json`.
-        assert!(menu_y("Dark") < menu_y("local"));
-        let custom = sidebar_text(&painted, "local").center();
-        view_frame(
-            &ctx,
-            &mut app,
-            pointer_click(custom, egui::PointerButton::Primary),
-            App::frame_ui,
-        );
-        assert_eq!(app.settings.custom_theme.as_deref(), Some("local.json"));
-        assert_eq!(app.palette, palette);
-        assert_eq!(
-            app.settings.custom_theme_cache.as_ref().unwrap().palette,
-            palette
-        );
-        assert_eq!(ctx.theme(), egui::Theme::Light);
-        let tree = accessible_frame(&ctx, &mut app, vec![]);
-        let id = accessible_node(&tree, "Theme", egui::accesskit::Role::ComboBox);
-        let node = &tree
-            .nodes
-            .iter()
-            .find(|(node_id, _)| *node_id == id)
-            .unwrap()
-            .1;
-        assert_eq!(node.value(), Some("local"), "read out as shown");
-        app.backend.shutdown();
-    }
-
-    #[test]
-    fn themes_folder_button_is_visible_accessible_and_emits_an_action() {
-        let (ctx, mut app) = accessible_app("themes-folder-button");
-        app.backend.shutdown();
-        ctx.data_mut(|data| {
-            data.insert_temp(egui::Id::new("settings-filter"), "Theme".to_string())
-        });
-        for _ in 0..3 {
-            view_frame(&ctx, &mut app, vec![], crate::ui::settings::show);
-        }
-        let painted = view_frame(&ctx, &mut app, vec![], crate::ui::settings::show);
-        let button = sidebar_text(&painted, "Open themes folder").center();
-        view_frame(
-            &ctx,
-            &mut app,
-            pointer_click(button, egui::PointerButton::Primary),
-            crate::ui::settings::show,
-        );
-        assert!(matches!(app.actions.as_slice(), [Action::OpenThemesFolder]));
-        app.actions.clear();
-        app.open(Page::Settings);
-        ctx.data_mut(|data| {
-            data.insert_temp(egui::Id::new("settings-filter"), "Theme".to_string())
-        });
-        accessible_frame(&ctx, &mut app, vec![]);
-        let tree = accessible_frame(&ctx, &mut app, vec![]);
-        accessible_node(&tree, "Open themes folder", egui::accesskit::Role::Button);
-        assert!(
-            !app.dirs.config.join("themes").exists(),
-            "drawing cannot open or create folders"
-        );
     }
 
     /// The painted rect of a sidebar label, for pointer tests against the
@@ -5803,90 +5326,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// The frame rate is a dial with detents: it stops at the rates
-    /// worth having, names the one it is on, and moving it one notch
-    /// lands on the next of them rather than somewhere in between.
-    #[cfg(feature = "milkdrop")]
-    #[test]
-    fn the_frame_rate_dial_steps_between_its_stops() {
-        let root =
-            std::env::temp_dir().join(format!("spotifast-fps-dial-test-{}", std::process::id()));
-        let dirs = AppDirs {
-            config: root.join("config"),
-            state: root.join("state"),
-            cache: root.join("cache"),
-        };
-        let ctx = egui::Context::default();
-        let waker = crate::backend::Waker::default();
-        waker.attach(&ctx);
-        let mut app = App::new(
-            &waker,
-            dirs,
-            Settings::default(),
-            AppOptions {
-                media_controls: false,
-                restore_sign_in: false,
-                tray: false,
-            },
-        );
-        app.attach(&ctx);
-        populate(&mut app);
-        app.settings.milkdrop_screen_hz = 144;
-        app.settings.milkdrop_fps = 60;
-        app.open(Page::Settings);
-
-        // Read labels from the real Settings page.
-        let drawn = |app: &mut App, ctx: &egui::Context| -> Vec<String> {
-            let input = egui::RawInput {
-                // Draw the full Settings page, including MilkDrop.
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1280.0, 4000.0),
-                )),
-                ..Default::default()
-            };
-            let mut output = ctx.run_ui(input, |ui| app.frame_ui(ui));
-            output.textures_delta.clear();
-            let mut said = Vec::new();
-            fn walk(shape: &egui::epaint::Shape, said: &mut Vec<String>) {
-                match shape {
-                    egui::epaint::Shape::Text(text) => said.push(text.galley.job.text.clone()),
-                    egui::epaint::Shape::Vec(shapes) => {
-                        shapes.iter().for_each(|shape| walk(shape, said))
-                    }
-                    _ => {}
-                }
-            }
-            for clipped in &output.shapes {
-                walk(&clipped.shape, &mut said);
-            }
-            said
-        };
-
-        for _ in 0..3 {
-            let said = drawn(&mut app, &ctx);
-            assert!(
-                said.iter().any(|text| text.contains("60 fps")),
-                "the dial names the rate it is on: {said:?}"
-            );
-        }
-
-        // Every stop can be reached, and each names itself.
-        for (rate, expected) in [
-            (144, "144 fps, your screen"),
-            (0, "Uncapped"),
-            (30, "30 fps"),
-        ] {
-            app.settings.milkdrop_fps = rate;
-            let said = drawn(&mut app, &ctx);
-            assert!(
-                said.iter().any(|text| text == expected),
-                "the dial on {rate} should read {expected}: {said:?}"
-            );
-        }
-        app.backend.shutdown();
-    }
-
     /// Rule: side-panel headers stay on one line at their narrowest width.
     #[test]
     fn the_narrowest_panels_keep_their_headers_on_one_row() {
@@ -6331,7 +5770,6 @@ mod tests {
         app.attach(&ctx);
         populate(&mut app);
         // These frames never advance the clock or take pictures.
-        app.reveal_theme_changes = false;
 
         let pages = [
             Page::Home,
@@ -6409,13 +5847,12 @@ mod tests {
             app.dialog = Some(dialog);
             frame(&ctx, &mut app);
         }
-        app.settings.theme = crate::settings::ThemeChoice::Light;
         app.actions.push(Action::SettingsChanged);
         app.open(Page::Home);
         for _ in 0..3 {
             frame(&ctx, &mut app);
         }
-        assert!(!app.palette.dark);
+        assert_eq!(app.palette, crate::theme::Palette::dark());
         app.lyrics_fullscreen = Some(false);
         frame(&ctx, &mut app);
         app.backend.shutdown();
@@ -7506,7 +6943,11 @@ mod tests {
             &mut app,
             vec![egui::Event::PointerMoved(egui::pos2(
                 start.x,
-                800.0 - crate::theme::PLAYER_BAR_HEIGHT - 14.0,
+                egui::containers::panel::PanelState::load(&ctx, egui::Id::new("queue-panel"))
+                    .expect("the list panel is visible")
+                    .outer_rect
+                    .bottom()
+                    - 14.0,
             ))],
         );
         for _ in 0..400 {
@@ -8203,7 +7644,46 @@ mod tests {
                         app.queue.get().unwrap().currently_playing.clone().unwrap()
                     };
                     accessible_frame(&ctx, &mut app, vec![]);
-                    let tree = accessible_frame(&ctx, &mut app, vec![]);
+                    let mut tree = accessible_frame(&ctx, &mut app, vec![]);
+                    if position == 4 {
+                        // The last insertion slot may begin below the visible
+                        // table once the playback-device strip takes its space.
+                        // Scroll the actual page before choosing that slot.
+                        let first = tree
+                            .nodes
+                            .iter()
+                            .find(|(_, node)| {
+                                node.role() == egui::accesskit::Role::Button
+                                    && node
+                                        .label()
+                                        .is_some_and(|text| text.starts_with("Play Destination 0,"))
+                            })
+                            .expect("the first destination row is visible")
+                            .1
+                            .bounds()
+                            .unwrap();
+                        let cursor = egui::pos2(
+                            ((first.x0 + first.x1) / 2.0) as f32,
+                            ((first.y0 + first.y1) / 2.0) as f32,
+                        );
+                        frame_events(
+                            &ctx,
+                            &mut app,
+                            vec![
+                                egui::Event::PointerMoved(cursor),
+                                egui::Event::MouseWheel {
+                                    unit: egui::MouseWheelUnit::Point,
+                                    delta: egui::vec2(0.0, -10_000.0),
+                                    modifiers: egui::Modifiers::NONE,
+                                    phase: egui::TouchPhase::Move,
+                                },
+                            ],
+                        );
+                        for _ in 0..30 {
+                            frame_events(&ctx, &mut app, vec![]);
+                        }
+                        tree = accessible_frame(&ctx, &mut app, vec![]);
+                    }
                     let row_rect = |name: &str| {
                         let prefix = format!("Play {name},");
                         let bounds = tree
@@ -8226,7 +7706,10 @@ mod tests {
                         let row = row_rect(source_item.name());
                         egui::pos2(row.left() + 80.0, row.center().y)
                     } else {
-                        egui::pos2(40.0, 755.0)
+                        ctx.read_response(egui::Id::new("now-playing-cover"))
+                            .expect("the player cover is visible")
+                            .rect
+                            .center()
                     };
                     let row = row_rect(&format!("Destination {}", position.min(3)));
                     let end = egui::pos2(
@@ -8236,6 +7719,16 @@ mod tests {
                         } else {
                             row.top() + 1.0
                         },
+                    );
+                    let player = egui::containers::panel::PanelState::load(
+                        &ctx,
+                        egui::Id::new("player-bar"),
+                    )
+                    .unwrap()
+                    .outer_rect;
+                    assert!(
+                        end.y < player.top(),
+                        "the insertion slot must be inside the visible playlist: {end:?}"
                     );
                     frame_events(
                         &ctx,
@@ -8686,7 +8179,11 @@ mod tests {
                 &mut app,
                 vec![egui::Event::PointerMoved(egui::pos2(
                     112.0,
-                    800.0 - crate::theme::PLAYER_BAR_HEIGHT - 14.0,
+                    egui::containers::panel::PanelState::load(&ctx, egui::Id::new("sidebar"))
+                        .expect("the list panel is visible")
+                        .outer_rect
+                        .bottom()
+                        - 14.0,
                 ))],
             );
             for _ in 0..400 {
@@ -9165,14 +8662,6 @@ mod tests {
                         .rect
                         .right()
                         + FIELD_RIGHT_INSET;
-                    // Collapsed to an icon a badge keeps its label for a screen
-                    // reader, so it is found at every width.
-                    let device = badge("Playing on").expect("the device badge");
-                    assert!(
-                        device >= field,
-                        "the device badge covers {} px of the search field at {width} px",
-                        field - device
-                    );
                     if let Some(label) = label {
                         let release = badge(label).expect("the update badge");
                         assert!(
@@ -9220,15 +8709,11 @@ mod tests {
             ("song row", "Remove from Liked Songs", |b| b.y1 < 700.0),
             ("player bar", "Remove from Liked Songs", |b| b.y0 > 700.0),
         ];
-        for theme in ["dark", "light"] {
+        {
+            let theme = "dark";
             for (place, label, pick) in targets {
                 let (ctx, mut app) = accessible_app(&format!("saved-hover-{theme}"));
                 app.open(Page::Album("alb0".into()));
-                app.settings.theme = if theme == "light" {
-                    crate::settings::ThemeChoice::Light
-                } else {
-                    crate::settings::ThemeChoice::Dark
-                };
                 app.actions.push(Action::SettingsChanged);
                 let mut frame = |events| {
                     let mut output = ctx.run_ui(
@@ -9290,14 +8775,10 @@ mod tests {
 
     #[test]
     fn side_panels_keep_their_full_height_beside_the_page_toolbar() {
-        for theme in ["dark", "light"] {
+        {
+            let theme = "dark";
             let (ctx, mut app) = accessible_app(&format!("full-height-panels-{theme}"));
             app.open(Page::Playlist("pl1".into()));
-            app.settings.theme = if theme == "light" {
-                crate::settings::ThemeChoice::Light
-            } else {
-                crate::settings::ThemeChoice::Dark
-            };
             app.actions.push(Action::SettingsChanged);
             for panel in ["queue", "lyrics"] {
                 app.show_queue_panel = panel == "queue";

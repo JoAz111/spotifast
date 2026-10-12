@@ -109,7 +109,7 @@ mode where possible. Match the data, page, interaction state, zoom and window
 size so the difference shows the proposed change. Identify the baseline and
 candidate, and report which platforms actually produced the captures.
 
-Include light/dark and narrow/normal window selectors, plus Before and After
+Include narrow/normal window selectors in the fixed dark interface, plus Before and After
 buttons or a comparison slider. Show relevant open menus, loading, error and
 empty states. Explain the visible change briefly and list any remaining checks.
 
@@ -143,13 +143,9 @@ Linux needs the development packages listed under
 [Build from source](https://spotifast.rocks/getting-started/#build-from-source); `nix develop`
 provides the complete development environment. The command compatibility test
 also needs `dbus-run-session`, to use a private bus instead of the desktop's.
-MilkDrop builds libprojectM
-from source, so every platform also needs CMake, a C++ compiler, and
-libclang (on Windows, vcpkg with `glew:x64-windows-static` installed and
-`VCPKG_INSTALLATION_ROOT` pointing at it); `--no-default-features` leaves
-MilkDrop out and needs none of that. CI repeats the test suite on Linux,
-macOS, and Windows. Passing CI is required, but does not replace review
-for correctness, product fit, maintainability, or security.
+CI repeats the test suite on Linux, macOS, and Windows. Passing CI is required,
+but does not replace review for correctness, product fit, maintainability, or
+security.
 
 Credential-storage changes also need a native store round trip. With the
 desktop keyring unlocked, run

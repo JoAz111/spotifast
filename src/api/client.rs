@@ -22,7 +22,9 @@ use crate::http::Http;
 const BASE_URL: &str = "https://api.spotify.com/v1";
 const MAX_IN_FLIGHT: usize = 6;
 const RATE_LIMIT_RETRIES: u32 = 3;
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+// Pace starts as well as limiting concurrency: a release from cooldown must
+// not send an entire queue of requests in the same instant.
+const REQUEST_SPACING: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, Error)]
 pub enum ApiError {
@@ -333,7 +335,8 @@ pub struct ApiClient {
     tokens: Mutex<Option<TokenProvider>>,
     limiter: Semaphore,
     queue_writes: tokio::sync::Mutex<()>,
-    cooldown_until: tokio::sync::Mutex<Instant>,
+    cooldown_until: tokio::sync::Mutex<tokio::time::Instant>,
+    next_request_at: tokio::sync::Mutex<tokio::time::Instant>,
     search_limit: u32,
     artist_albums_limit: u32,
     source: ApiSource,
@@ -355,7 +358,8 @@ impl ApiClient {
             tokens: Mutex::new(None),
             limiter: Semaphore::new(MAX_IN_FLIGHT),
             queue_writes: tokio::sync::Mutex::new(()),
-            cooldown_until: tokio::sync::Mutex::new(Instant::now()),
+            cooldown_until: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+            next_request_at: tokio::sync::Mutex::new(tokio::time::Instant::now()),
             search_limit,
             artist_albums_limit,
             source,
@@ -389,19 +393,30 @@ impl ApiClient {
             .ok_or(ApiError::NotSignedIn)
     }
 
-    async fn wait_for_cooldown(&self) {
+    async fn wait_for_request_slot(&self) {
         loop {
-            let until = *self.cooldown_until.lock().await;
-            let Some(wait) = until.checked_duration_since(Instant::now()) else {
-                return;
-            };
-            tokio::time::sleep(wait).await;
+            let mut next = self.next_request_at.lock().await;
+            let until = self.cooldown_until.lock().await;
+            let now = tokio::time::Instant::now();
+            let due = (*next).max(*until);
+            if due > now {
+                drop(until);
+                drop(next);
+                tokio::time::sleep_until(due).await;
+                continue;
+            }
+            *next = now + REQUEST_SPACING;
+            return;
         }
     }
 
     async fn extend_cooldown(&self, wait: Duration) {
         let mut until = self.cooldown_until.lock().await;
-        *until = (*until).max(Instant::now() + wait);
+        let now = tokio::time::Instant::now();
+        let requested = now
+            .checked_add(wait)
+            .unwrap_or_else(|| now + Duration::from_secs(u32::MAX.into()));
+        *until = (*until).max(requested);
     }
 
     // ---- transport -------------------------------------------------------
@@ -445,12 +460,14 @@ impl ApiClient {
         let queue_write = method == Method::POST && path == "/me/player/queue";
         loop {
             attempt = u32::saturating_add(attempt, 1);
-            self.wait_for_cooldown().await;
             let permit = self
                 .limiter
                 .acquire()
                 .await
                 .map_err(|_| ApiError::NotSignedIn)?;
+            // A request that was queued on the semaphore must recheck a
+            // cooldown set by another request before it sends anything.
+            self.wait_for_request_slot().await;
             let token = provider.access_token().await?;
             let mut request = self
                 .http
@@ -482,19 +499,16 @@ impl ApiClient {
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.parse::<u64>().ok())
-                    .map_or(Duration::from_secs(1), Duration::from_secs);
+                    .map_or(
+                        Duration::from_secs(5 * u64::from(attempt.min(6))),
+                        Duration::from_secs,
+                    );
                 let text = response.text().await.unwrap_or_default();
                 if is_quota_exhausted(&text) {
                     return Err(ApiError::QuotaExhausted);
                 }
-                // A rejected queue append is safe to retry. Keep its place
-                // in the write lock and honor the full server-requested wait.
-                // Other requests retain their existing bounded retry policy.
-                let wait = if queue_write {
-                    wait
-                } else {
-                    wait.min(MAX_RETRY_AFTER)
-                };
+                // Honor the complete Retry-After value for every endpoint.
+                // Queue appends keep their ordered place while waiting.
                 log::warn!("Spotify rate limit source={} wait={wait:?}", self.source);
                 log::info!(
                     "Spotify cooldown source={} duration_ms={}",
@@ -1192,7 +1206,7 @@ mod tests {
         let tokens = WebTokens::new(
             reqwest::Client::new(),
             crate::auth::StoredToken {
-                client_id: crate::auth::DEFAULT_WEB_CLIENT_ID.into(),
+                client_id: crate::auth::PRIMARY_WEB_CLIENT_ID.into(),
                 access_token: "dummy-access".into(),
                 refresh_token: "dummy-refresh".into(),
                 expires_at: u64::MAX,
@@ -1219,6 +1233,59 @@ mod tests {
         );
         assert!(store.lease(slot).load().await.unwrap().grant.is_none());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_cooldown_blocks_every_request_and_releases_them_at_a_paced_rate() {
+        let client = Arc::new(ApiClient::new(
+            reqwest::Client::new(),
+            Arc::new(NetActivity::default()),
+            10,
+            10,
+            ApiSource::Shared,
+        ));
+        client.extend_cooldown(Duration::from_secs(120)).await;
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        for _ in 0..3 {
+            let client = Arc::clone(&client);
+            let sent = sent.clone();
+            tokio::spawn(async move {
+                client.wait_for_request_slot().await;
+                sent.send(tokio::time::Instant::now()).unwrap();
+            });
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(119)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            received.try_recv().is_err(),
+            "Retry-After must not be truncated to 30 seconds"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let first = received.try_recv().unwrap();
+        assert!(
+            received.try_recv().is_err(),
+            "one request starts when cooldown ends"
+        );
+        tokio::time::advance(REQUEST_SPACING).await;
+        tokio::task::yield_now().await;
+        let second = received.try_recv().unwrap();
+        assert!(second.duration_since(first) >= REQUEST_SPACING);
+        assert!(
+            received.try_recv().is_err(),
+            "waiting requests must not burst together"
+        );
+        client.extend_cooldown(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_secs(59)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            received.try_recv().is_err(),
+            "queued work rechecks a later cooldown"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(received.try_recv().is_ok());
     }
 
     #[tokio::test]
@@ -1506,7 +1573,7 @@ mod tests {
             ApiSource::Personal,
         );
         shared.extend_cooldown(Duration::from_secs(10)).await;
-        assert!(*shared.cooldown_until.lock().await > Instant::now());
-        assert!(*personal.cooldown_until.lock().await <= Instant::now());
+        assert!(*shared.cooldown_until.lock().await > tokio::time::Instant::now());
+        assert!(*personal.cooldown_until.lock().await <= tokio::time::Instant::now());
     }
 }

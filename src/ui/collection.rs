@@ -916,6 +916,7 @@ fn table_contents(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
         && !needle.is_empty()
         && table.can_load_more
         && !table.loading
+        && table.error.is_none()
     {
         // Filtering a partially loaded list: keep fetching so matches appear.
         app.actions.push(Action::LoadMore(table.page));
@@ -924,7 +925,7 @@ fn table_contents(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
             ui,
             app,
             table.page,
-            table.can_load_more && !table.loading,
+            table.can_load_more && !table.loading && table.error.is_none(),
         );
     }
 }
@@ -2012,6 +2013,22 @@ fn extend_liked_rows(app: &mut App, revision: u64, names: u64) -> Option<Arc<Vec
     Some(items)
 }
 
+/// A complete collection has a Spotify context, so it never needs a copy of
+/// every song URI merely to draw its visible rows.
+fn liked_row_context(
+    uri: Option<String>,
+    complete: bool,
+    fallback: impl FnOnce() -> Arc<[String]>,
+) -> RowContext {
+    match uri {
+        Some(uri) if complete => RowContext::Context {
+            uri,
+            editable_playlist: None,
+        },
+        _ => RowContext::Uris(fallback()),
+    }
+}
+
 pub fn liked(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
     let revision = app.library.liked.revision;
@@ -2101,18 +2118,13 @@ pub fn liked(app: &mut App, ui: &mut egui::Ui) {
         actions_row(app, ui, actions, Some(&mut filter));
     }
     ui.data_mut(|data| data.insert_temp(filter_id, filter.clone()));
-    let uris: Arc<[String]> = items
-        .iter()
-        .map(|(item, _, _)| item.uri().to_string())
-        .collect::<Vec<_>>()
-        .into();
-    let context = match collection_uri {
-        Some(uri) if app.library.liked.is_complete() => RowContext::Context {
-            uri,
-            editable_playlist: None,
-        },
-        _ => RowContext::Uris(uris),
-    };
+    let context = liked_row_context(collection_uri, app.library.liked.is_complete(), || {
+        items
+            .iter()
+            .map(|(item, _, _)| item.uri().to_string())
+            .collect::<Vec<_>>()
+            .into()
+    });
     let loading = app.library.liked.loading;
     let error = app.library.liked.error.clone();
     let can_load_more = app.library.liked.can_load_more();
@@ -2567,6 +2579,73 @@ mod tests {
         assert_eq!(list.total, Some(1000));
         assert!(list.loading);
         app.backend.shutdown();
+    }
+
+    #[test]
+    fn failed_next_pages_never_retry_from_rendering_or_filtering() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let items = make_large_tracks(1);
+        for filter in ["", "unmatched"] {
+            for _ in 0..5 {
+                let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    table(
+                        &mut app,
+                        ui,
+                        Table {
+                            items: &items,
+                            row_offset: 0,
+                            pagination: None,
+                            context: RowContext::Context {
+                                uri: "spotify:album:failed".into(),
+                                editable_playlist: None,
+                            },
+                            show_album: false,
+                            show_cover: false,
+                            show_added: false,
+                            show_added_by: false,
+                            page: Page::Album("failed".into()),
+                            loading: false,
+                            error: Some("quota exhausted"),
+                            can_load_more: true,
+                            filter,
+                            items_revision: 0,
+                        },
+                    );
+                });
+                output.textures_delta.clear();
+                assert!(
+                    !app.actions
+                        .iter()
+                        .any(|action| matches!(action, Action::LoadMore(_))),
+                    "a failed page waits for Retry"
+                );
+            }
+        }
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn complete_liked_context_never_constructs_the_song_uri_fallback() {
+        let context = liked_row_context(
+            Some("spotify:user:listener:collection".into()),
+            true,
+            || {
+                panic!("a complete collection must not allocate per-song URIs");
+            },
+        );
+        assert!(matches!(context, RowContext::Context { .. }));
+        let fallback: Arc<[String]> = vec!["spotify:track:one".into()].into();
+        let context = liked_row_context(
+            Some("spotify:user:listener:collection".into()),
+            false,
+            || Arc::clone(&fallback),
+        );
+        let RowContext::Uris(uris) = context else {
+            panic!("a partial collection plays its loaded rows");
+        };
+        assert!(Arc::ptr_eq(&uris, &fallback));
     }
 
     #[test]

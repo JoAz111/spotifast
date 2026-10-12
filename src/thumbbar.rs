@@ -14,11 +14,9 @@
 //! again. The native object belongs to the window shell, on its owning thread.
 //!
 //! The icons are drawn here rather than loaded, because Windows wants
-//! `HICON`s at whatever size the system asks for and the app already
-//! compiles `tiny-skia` for the Winamp playlist's text. They follow the
-//! system's light or dark setting, not the app's: the preview flyout is
-//! Windows' own surface, so a Spotifast set to Light on a dark desktop
-//! still needs light icons there.
+//! `HICON`s at whatever size the system asks for. `tiny-skia` renders these
+//! native transport icons on Windows. They follow the system's light or
+//! dark setting because the preview flyout is Windows' own surface.
 
 #[cfg(windows)]
 mod win;

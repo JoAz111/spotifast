@@ -39,8 +39,8 @@ use librespot_playback::{
 use sha1::{Digest, Sha1};
 
 use crate::api::models::ArtistRef;
+use crate::sink::ControlledSink;
 use crate::sink::{AudioControl, ErrorHook, RodioSink};
-use crate::vis::{AudioTap, Tapped};
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -57,9 +57,6 @@ pub struct EngineConfig {
     pub audio_cache_limit: Option<u64>,
     /// Output buffer length in milliseconds.
     pub buffer_ms: u32,
-    pub tap: Arc<AudioTap>,
-    /// The equalizer's settings, shared with the window that sets them.
-    pub eq: crate::eq::SharedEq,
     /// Proxy used by the Web API client. Librespot only uses the HTTP form.
     pub proxy: crate::settings::ProxyConfig,
 }
@@ -387,17 +384,12 @@ impl Engine {
             proxy,
             ..SessionConfig::default()
         };
-        let normalisation_factor = Arc::new(std::sync::atomic::AtomicU64::new(1.0f64.to_bits()));
         let player_config = PlayerConfig {
             bitrate: config.bitrate(),
             gapless: config.gapless,
             normalisation: config.normalisation,
             normalisation_type: NormalisationType::Auto,
             position_update_interval: Some(Duration::from_secs(1)),
-            // The fork reports each track's normalisation factor here, so
-            // the tap can undo it for the visualisers: they show the music,
-            // not the loudness housekeeping.
-            normalisation_report: Some(Arc::clone(&normalisation_factor)),
             ..PlayerConfig::default()
         };
 
@@ -424,7 +416,6 @@ impl Engine {
             Arc::clone(&state),
             Arc::clone(&notify),
             &mixer,
-            Arc::clone(&normalisation_factor),
             Arc::clone(&audio),
         );
         let player = Player::new(player_config, session.clone(), volume, sink_builder);
@@ -773,13 +764,10 @@ fn sink_builder(
     state: Arc<Mutex<LocalState>>,
     notify: Notify,
     mixer: &Arc<dyn Mixer>,
-    normalisation: Arc<std::sync::atomic::AtomicU64>,
     audio: Arc<AudioControl>,
 ) -> SinkAndVolume {
     let device = config.audio_device.clone();
     let buffer_ms = config.buffer_ms;
-    let tap = Arc::clone(&config.tap);
-    let eq = Arc::clone(&config.eq);
     let report: ErrorHook = Arc::new(move |message: String| {
         let snapshot = {
             let mut current = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -789,29 +777,20 @@ fn sink_builder(
         notify(EngineEvent::State(snapshot));
     });
     if let Some(builder) = librespot_backend(config.backend.as_deref()) {
-        // Apply volume after the tap so visualizers are independent of
-        // volume, including at zero.
-        let applied = mixer.get_soft_volume();
-        let normalisation = Arc::clone(&normalisation);
+        let volume = mixer.get_soft_volume();
         return (
             Box::new(move || {
-                let sink = builder(device, AudioFormat::S16);
-                Box::new(Tapped::new(
-                    sink,
+                Box::new(ControlledSink::new(
+                    builder(device, AudioFormat::S16),
                     audio,
-                    tap,
-                    applied,
+                    volume,
                     true,
-                    eq,
-                    normalisation,
                 )) as Box<dyn Sink>
             }),
             Box::new(NoOpVolume),
         );
     }
     let volume = mixer.get_soft_volume();
-    // The output applies volume to queued audio. The wrapper reads the same
-    // value to calculate the pre-volume limiter ceiling.
     let ceiling = mixer.get_soft_volume();
     (
         Box::new(move || {
@@ -822,15 +801,7 @@ fn sink_builder(
                 buffer_ms,
                 Arc::clone(&audio),
             ));
-            Box::new(Tapped::new(
-                sink,
-                audio,
-                tap,
-                ceiling,
-                false,
-                eq,
-                normalisation,
-            )) as Box<dyn Sink>
+            Box::new(ControlledSink::new(sink, audio, ceiling, false)) as Box<dyn Sink>
         }),
         Box::new(NoOpVolume),
     )
@@ -1720,8 +1691,6 @@ mod tests {
     fn device_id_is_stable_hex() {
         let config = EngineConfig {
             buffer_ms: crate::sink::DEFAULT_BUFFER_MS,
-            tap: AudioTap::new(),
-            eq: crate::eq::shared(),
             device_name: "Spotifast".into(),
             bitrate_kbps: 320,
             normalisation: false,

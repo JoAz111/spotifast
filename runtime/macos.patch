@@ -83,7 +83,7 @@ index 18d20a8..52e72a8 100644
 +`scripts/test-receiver.py`; they use synthetic lines and a private Unix socket,
 +with no account, key, audio server or real profile access.
 diff --git a/docs/PACKAGING.md b/docs/PACKAGING.md
-index b9b70db..f19e638 100644
+index b9b70db..cb93b8e 100644
 --- a/docs/PACKAGING.md
 +++ b/docs/PACKAGING.md
 @@ -99,8 +99,8 @@ Run on login setting uses macOS ServiceManagement for the main app, not a
@@ -110,7 +110,7 @@ index b9b70db..f19e638 100644
  
  The launcher persists a Spotify Connect device name and an optional CoreAudio
  output UID in app preferences. Without a selected UID, the private PulseAudio
-@@ -127,8 +123,10 @@ or system-default output during health checks and moves its stream when needed.
+@@ -127,8 +123,18 @@ or system-default output during health checks and moves its stream when needed.
  `audio outputs` and `audio select [--uid UID]` expose the same output controls to
  other local clients without changing the system-wide audio device.
  
@@ -126,6 +126,14 @@ index b9b70db..f19e638 100644
 +Use `--frontend /path/to/spotifast` to bundle a separately built client, `--name "Spotifast Soloist"` for the app name, and `--output-dir /path/to/output` for a local destination. The launcher owns both processes, waits for the private endpoint before launching the frontend, and stops the receiver when the frontend exits. Pair both interfaces using the same Spotify account; the local API lacks an identity for automatic cross-checking.
 +
 +See [local control](LOCAL_CONTROL.md) and [release gates](RELEASE_READINESS.md). The client must preserve local control across Internet loss without assuming every offline engine command will succeed.
++
++For a local frontend/launcher-only rebuild, `scripts/refresh-local-package.py`
++can copy an already verified installed app, compile the new launcher and replace
++the frontend. It checks that every signed helper file remains byte-identical,
++preserving the helper identity already approved in Keychain. Use this only when
++runtime helper source has not changed since the base app was built. It does not
++compile or qualify Python runtime changes. A complete runtime rebuild still uses
++`build-package.py`.
 diff --git a/docs/RELEASE_READINESS.md b/docs/RELEASE_READINESS.md
 index b8999f3..0880274 100644
 --- a/docs/RELEASE_READINESS.md
@@ -142,7 +150,7 @@ index b8999f3..0880274 100644
    the current local ad-hoc signature. No publishing is authorized by this work.
  
 diff --git a/packaging/QUICKSTART.md b/packaging/QUICKSTART.md
-index 3cf25c3..701ef7f 100644
+index 3cf25c3..cfd04f4 100644
 --- a/packaging/QUICKSTART.md
 +++ b/packaging/QUICKSTART.md
 @@ -1,92 +1,24 @@
@@ -161,7 +169,7 @@ index 3cf25c3..701ef7f 100644
 -4. Select **Soloist Runtime** in Spotify Connect to authenticate and play.
 +1. Download and extract the **Linux ARM64** executable from [Spotify’s official Soloist downloads](https://developer.spotify.com/documentation/soloist/reference/downloads-and-updates).
 +2. Get your personal API key from [Spotify’s Soloist dashboard](https://developer.spotify.com/dashboard/soloist).
-+3. Open **Spotifast Soloist.app**, use **Choose…** to select the extracted executable, enter the key in the secure field using **Edit → Paste** or **Cmd-V**, and click **Start**. The key stays masked and is saved in macOS Keychain. It is never accepted in command arguments or written to a standing plaintext key file. Saving clears the native field editor’s undo history.
++3. Open **Spotifast Soloist.app**, paste the key in the secure field using **Edit → Paste** or **Cmd-V**, and click **Continue**. On this configured Mac the official engine is already installed. The key is saved in macOS Keychain and reused automatically on later launches. Engine updates are available under **Settings → Update engine…**. Keys are never accepted in command arguments or written to a standing plaintext key file. Saving clears the native field editor's undo history.
 +4. In Spotify, select **Spotifast Soloist** in Spotify Connect and play a song to pair. Use the **same Spotify account** when signing into the Spotifast music interface. Soloist does not expose an account identifier that lets this preview check the account match automatically.
  
 -The **Spotify Connect device name** field controls how the receiver appears in
@@ -171,7 +179,7 @@ index 3cf25c3..701ef7f 100644
 -UID across launches. If that output is disconnected, playback falls back to the
 -current macOS default until it returns. Use **Refresh** after connecting a new
 -device. A selection made while the receiver is playing is applied immediately.
-+The official executable is copied into private Application Support storage after an ARM64/version check. That check does not establish publisher provenance: obtain it from Spotify’s official download page. The app shows expected expiry; official builds expire after 90 days. The engine and your key are never bundled into this app.
++The official executable is copied into private Application Support storage after an ARM64/version check. That check does not establish publisher provenance: obtain it from Spotify’s official download page. Receiver Settings shows expected expiry; official builds expire after 90 days. The engine and your key are never bundled into this app.
  
 -The launcher shows the installed version and expected expiry calculated from
 -Soloist's build timestamp plus its documented 90-day lifetime. Select a newer
@@ -179,7 +187,7 @@ index 3cf25c3..701ef7f 100644
 -Soloist's own expired-build exit code is authoritative. The **Get Soloist**
 -button opens the official downloads page; no Spotify archive or executable is
 -included in this package or its releases.
-+The bundled music interface opens after the owned receiver’s private control socket is ready. Closing the interface or clicking **Stop** stops the receiver; closing the launcher does likewise. A bounded pause is attempted before graceful termination. A crashed Mac may leave a stale discovery file; the next receiver launch replaces it under its exclusive profile lock.
++The bundled music interface opens after the owned receiver’s private control socket is ready. Closing the music interface stops the receiver. The initial key window hides automatically; **Audio & Receiver Settings** offers output selection and a stop control. A bounded pause is attempted before graceful termination. A crashed Mac may leave a stale discovery file; the next receiver launch replaces it under its exclusive profile lock.
  
 -Connect-only mode is the default. Enable **local WebSocket control** before
 -starting if you want a same-Mac client to use Soloist's documented API.
@@ -190,7 +198,7 @@ index 3cf25c3..701ef7f 100644
 -opens the app. The separate **Auto start on launch** preference starts the
 -configured receiver whenever the app opens, including at login if both options
 -are enabled.
-+An open music interface does not prove pairing. The setup window says **Waiting for pairing** until the official local API reports an authenticated session. Its first authentication health check occurs after the 30-second startup grace period; later checks occur every 10 seconds. The window reads the safe snapshot every five seconds.
++An open music interface does not prove pairing. Receiver status says **Waiting for pairing** until the official local API reports an authenticated session. Its first authentication health check occurs after the 30-second startup grace period; later checks occur every 10 seconds. The window reads the safe snapshot every five seconds.
  
 -Close the app or click Stop to shut down the receiver. No global audio daemon
 -is installed. This package contains the compatibility runtime and
@@ -215,7 +223,7 @@ index 3cf25c3..701ef7f 100644
 -an inherited, already-unlinked private file descriptor for Soloist's argument
 -loader; no persistent plaintext key file is created. Spotify receives
 -authentication requests when the receiver starts.
-+This Apple Silicon/macOS 27 preview is locally ad-hoc signed. Public notarization, redistribution review, authenticated playback and lossless validation of this fork remain separate checks. Do not disable Gatekeeper, SIP or grant Full Disk Access as a workaround.
++This Apple Silicon/macOS 27 preview is locally ad-hoc signed. Public notarization, redistribution review, source bit-depth and bit-perfect hardware validation remain separate checks. This Mac has decoded FLAC at 44.1 kHz, and song-change, pause/resume and smooth sound with a 500 ms buffer were confirmed by the user. Do not disable Gatekeeper, SIP or grant Full Disk Access as a workaround.
  
 -## Without the launcher, or from another application
 +The bundled helper is `Contents/Helpers/runtime-cli.app/Contents/MacOS/runtime-cli`. Its `describe`, `doctor`, `installation` and `run --help` commands expose safe setup diagnostics. `diagnostics` reads `state/receiver-diagnostics.json`, an owner-only current-run snapshot containing at most 64 fixed pairing/error events, typed authentication booleans and recognized codec/sample-rate/sample-format values. It excludes raw stdout/stderr, keys, account identity, music metadata, device names and server error text. Each run replaces the previous snapshot; pairing reset clears it. `status` returns authentication state promptly while logged out. A FLAC event demonstrates decoder selection, and does not by itself establish source bit depth, bit-perfect output or audible playback.
@@ -253,10 +261,10 @@ index 3cf25c3..701ef7f 100644
 -Developer ID signing/notarization need separate review before any public release.
 +`credential store` prompts without echo; `run --websocket on` uses the private Unix transport. A custom `SOLOIST_RUNTIME_HOME` must be a canonical dedicated private directory, explicitly initialized by configure/run. Reset never initializes a directory itself.
 diff --git a/packaging/launcher.m b/packaging/launcher.m
-index bd939f5..ebebb99 100644
+index bd939f5..c255c3b 100644
 --- a/packaging/launcher.m
 +++ b/packaging/launcher.m
-@@ -1,9 +1,42 @@
+@@ -1,11 +1,46 @@
  #import <AppKit/AppKit.h>
  #import <ServiceManagement/ServiceManagement.h>
  #include <string.h>
@@ -273,6 +281,7 @@ index bd939f5..ebebb99 100644
 +    NSMenuItem *application = [NSMenuItem new];
 +    [menu addItem:application];
 +    NSMenu *actions = [NSMenu new];
++    [actions addItemWithTitle:@"Audio & Receiver Settings…" action:@selector(showSettings:) keyEquivalent:@","];
 +    [actions addItemWithTitle:@"Reset Soloist Pairing and Cache" action:@selector(resetPairing:) keyEquivalent:@""];
 +    [actions addItemWithTitle:@"Quit Spotifast Soloist" action:@selector(terminate:) keyEquivalent:@"q"];
 +    application.submenu = actions;
@@ -298,10 +307,24 @@ index bd939f5..ebebb99 100644
 +
  @interface Launcher : NSObject <NSApplicationDelegate, NSTextFieldDelegate>
  @property NSWindow *window;
++@property NSWindow *settingsWindow;
  @property NSTextField *engine;
-@@ -25,12 +58,28 @@ static NSString *const KeyMask = @"••••••••";
+ @property NSTextField *deviceName;
+ @property NSTextField *key;
+@@ -13,7 +48,6 @@ static NSString *const KeyMask = @"••••••••";
+ @property NSTextField *expiry;
+ @property NSButton *websocket;
+ @property NSButton *runOnLogin;
+-@property NSButton *autoStartOnLaunch;
+ @property NSPopUpButton *audioOutput;
+ @property NSButton *start;
+ @property NSButton *stop;
+@@ -24,13 +58,31 @@ static NSString *const KeyMask = @"••••••••";
+ @property BOOL pendingStart;
  @property BOOL autoStart;
  @property BOOL credentialEdited;
++@property BOOL credentialCheckFailed;
++@property NSTask *credentialCheck;
  @property BOOL receiverRunning;
 +@property NSTask *frontend;
 +@property BOOL stopping;
@@ -328,7 +351,7 @@ index bd939f5..ebebb99 100644
  - (NSTextField *)label:(NSString *)text size:(CGFloat)size {
      NSTextField *label = [NSTextField wrappingLabelWithString:text];
      label.font = [NSFont systemFontOfSize:size];
-@@ -38,17 +87,11 @@ static NSString *const KeyMask = @"••••••••";
+@@ -38,120 +90,124 @@ static NSString *const KeyMask = @"••••••••";
  }
  - (void)applicationDidFinishLaunching:(NSNotification *)notification {
      (void)notification;
@@ -339,72 +362,195 @@ index bd939f5..ebebb99 100644
 -    [actions addItemWithTitle:@"Quit Soloist Runtime" action:@selector(terminate:) keyEquivalent:@"q"];
 -    application.submenu = actions;
 -    NSApp.mainMenu = menu;
+-    self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 620, 450)
 +    NSApp.mainMenu = StandardMainMenu();
-     self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 620, 450)
++    NSApp.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
++    self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 480, 250)
                                              styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable
                                                backing:NSBackingStoreBuffered defer:NO];
 -    self.window.title = @"Soloist Runtime";
-+    self.window.title = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: @"Spotifast Soloist";
++    self.window.title = @"Spotifast Soloist";
      self.window.releasedWhenClosed = NO;
      NSStackView *stack = [NSStackView new];
      stack.orientation = NSUserInterfaceLayoutOrientationVertical;
-@@ -60,7 +103,7 @@ static NSString *const KeyMask = @"••••••••";
+     stack.alignment = NSLayoutAttributeLeading;
+-    stack.spacing = 14;
++    stack.spacing = 16;
+     stack.translatesAutoresizingMaskIntoConstraints = NO;
+     [self.window.contentView addSubview:stack];
+     [NSLayoutConstraint activateConstraints:@[
          [stack.leadingAnchor constraintEqualToAnchor:self.window.contentView.leadingAnchor constant:24],
          [stack.trailingAnchor constraintEqualToAnchor:self.window.contentView.trailingAnchor constant:-24],
          [stack.topAnchor constraintEqualToAnchor:self.window.contentView.topAnchor constant:24]]];
 -    NSTextField *title = [self label:@"Soloist Runtime" size:24];
-+    NSTextField *title = [self label:self.window.title size:24];
-     NSView *spacer = [NSView new];
-     [spacer setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
-     NSButton *download = [NSButton buttonWithTitle:@"Get Soloist" target:self action:@selector(download:)];
-@@ -68,7 +111,7 @@ static NSString *const KeyMask = @"••••••••";
-     titleRow.spacing = 8;
-     [stack addArrangedSubview:titleRow];
-     [titleRow.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
+-    NSView *spacer = [NSView new];
+-    [spacer setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+-    NSButton *download = [NSButton buttonWithTitle:@"Get Soloist" target:self action:@selector(download:)];
+-    NSStackView *titleRow = [NSStackView stackViewWithViews:@[title, spacer, download]];
+-    titleRow.spacing = 8;
+-    [stack addArrangedSubview:titleRow];
+-    [titleRow.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
 -    self.deviceName = [NSTextField textFieldWithString:[[NSUserDefaults standardUserDefaults] stringForKey:@"deviceName"] ?: @"Soloist Runtime"];
-+    self.deviceName = [NSTextField textFieldWithString:[[NSUserDefaults standardUserDefaults] stringForKey:@"deviceName"] ?: @"Spotifast Soloist"];
-     self.deviceName.placeholderString = @"Name shown in Spotify Connect";
-     self.deviceName.accessibilityLabel = @"Spotify Connect device name";
-     self.deviceName.delegate = self;
-@@ -83,9 +126,10 @@ static NSString *const KeyMask = @"••••••••";
-     [stack addArrangedSubview:engineRow];
-     [engineRow.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
-     [browse.widthAnchor constraintEqualToConstant:128].active = YES;
+-    self.deviceName.placeholderString = @"Name shown in Spotify Connect";
+-    self.deviceName.accessibilityLabel = @"Spotify Connect device name";
+-    self.deviceName.delegate = self;
+-    [stack addArrangedSubview:self.deviceName];
+-    [self.deviceName.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
++    [stack addArrangedSubview:[self label:@"Your music, in lossless." size:24]];
++    // Receiver choices are implementation defaults, not a second setup form.
++    self.deviceName = [NSTextField textFieldWithString:@"Spotifast Soloist"];
+     self.engine = [NSTextField textFieldWithString:@""];
+-    self.engine.placeholderString = @"Linux ARM64 Soloist executable";
+-    self.engine.accessibilityLabel = @"Linux ARM64 Soloist executable";
+-    NSButton *browse = [NSButton buttonWithTitle:@"Choose…" target:self action:@selector(choose:)];
+-    NSStackView *engineRow = [NSStackView stackViewWithViews:@[self.engine, browse]];
+-    engineRow.spacing = 8;
+-    [stack addArrangedSubview:engineRow];
+-    [engineRow.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
+-    [browse.widthAnchor constraintEqualToConstant:128].active = YES;
 -    self.key = [NSTextField textFieldWithString:@""];
-+    self.key = [[NSSecureTextField alloc] initWithFrame:NSZeroRect];
-+    self.key.stringValue = @"";
-     self.key.placeholderString = @"Soloist API key";
+-    self.key.placeholderString = @"Soloist API key";
 -    self.key.accessibilityLabel = @"Soloist API key; visible while editing, hidden afterward";
+-    self.key.toolTip = @"Click to enter or replace the key. A saved key is never revealed.";
++    self.websocket = [NSButton checkboxWithTitle:@"" target:nil action:nil];
++    self.websocket.state = NSControlStateValueOn;
++    self.key = [[NSSecureTextField alloc] initWithFrame:NSZeroRect];
++    self.key.placeholderString = @"Paste your Soloist key";
 +    self.key.accessibilityLabel = @"Soloist API key; secure entry";
-     self.key.toolTip = @"Click to enter or replace the key. A saved key is never revealed.";
++    self.key.toolTip = @"Saved securely in macOS Keychain.";
      self.key.delegate = self;
-     NSButton *getKey = [NSButton buttonWithTitle:@"Get Soloist Key" target:self action:@selector(getKey:)];
-@@ -118,7 +162,11 @@ static NSString *const KeyMask = @"••••••••";
-     self.websocket = [NSButton checkboxWithTitle:@"Enable local WebSocket control" target:self action:@selector(websocketChanged:)];
-     self.websocket.state = [[NSUserDefaults standardUserDefaults] boolForKey:@"enableWebSocket"]
-         ? NSControlStateValueOn : NSControlStateValueOff;
+-    NSButton *getKey = [NSButton buttonWithTitle:@"Get Soloist Key" target:self action:@selector(getKey:)];
++    self.key.target = self;
++    self.key.action = @selector(start:);
++    NSButton *getKey = [NSButton buttonWithTitle:@"Get key" target:self action:@selector(getKey:)];
+     NSStackView *keyRow = [NSStackView stackViewWithViews:@[self.key, getKey]];
+     keyRow.spacing = 8;
+     [stack addArrangedSubview:keyRow];
+     [keyRow.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
+-    [getKey.widthAnchor constraintEqualToConstant:128].active = YES;
+-    NSTextField *outputLabel = [self label:@"Audio output" size:13];
++    [getKey.widthAnchor constraintEqualToConstant:85].active = YES;
++    self.status = [self label:@"Enter your Soloist key once. Spotify sign-in opens in your browser when needed." size:13];
++    [stack addArrangedSubview:self.status];
++    [self.status.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
++    self.start = [NSButton buttonWithTitle:@"Continue" target:self action:@selector(start:)];
++    self.start.keyEquivalent = @"\r";
++    self.stop = [NSButton buttonWithTitle:@"Stop receiver" target:self action:@selector(stop:)];
++    self.stop.enabled = NO;
++    NSButton *settingsButton = [NSButton buttonWithTitle:@"Settings…" target:self action:@selector(showSettings:)];
++    [stack addArrangedSubview:[NSStackView stackViewWithViews:@[self.start, settingsButton]]];
++
++    self.settingsWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 520, 270)
++        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
++        backing:NSBackingStoreBuffered defer:NO];
++    self.settingsWindow.title = @"Audio & Receiver Settings";
++    self.settingsWindow.releasedWhenClosed = NO;
++    NSStackView *settings = [NSStackView new];
++    settings.orientation = NSUserInterfaceLayoutOrientationVertical;
++    settings.alignment = NSLayoutAttributeLeading;
++    settings.spacing = 16;
++    settings.translatesAutoresizingMaskIntoConstraints = NO;
++    [self.settingsWindow.contentView addSubview:settings];
++    [NSLayoutConstraint activateConstraints:@[
++        [settings.leadingAnchor constraintEqualToAnchor:self.settingsWindow.contentView.leadingAnchor constant:24],
++        [settings.trailingAnchor constraintEqualToAnchor:self.settingsWindow.contentView.trailingAnchor constant:-24],
++        [settings.topAnchor constraintEqualToAnchor:self.settingsWindow.contentView.topAnchor constant:24]]];
+     self.audioOutput = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+     self.audioOutput.accessibilityLabel = @"Audio output";
+     [self.audioOutput setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+-    [self.audioOutput addItemWithTitle:@"Loading outputs…"];
+-    self.audioOutput.enabled = NO;
++    [self.audioOutput addItemWithTitle:@"System default"];
+     self.audioOutput.target = self;
+     self.audioOutput.action = @selector(audioOutputChanged:);
+-    NSButton *refreshOutputs = [NSButton buttonWithTitle:@"Refresh" target:self action:@selector(refreshAudioOutputs:)];
+-    NSStackView *outputRow = [NSStackView stackViewWithViews:@[outputLabel, self.audioOutput, refreshOutputs]];
+-    outputRow.spacing = 8;
+-    [stack addArrangedSubview:outputRow];
+-    [outputRow.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
+-    [outputLabel.widthAnchor constraintEqualToConstant:90].active = YES;
+-    [refreshOutputs.widthAnchor constraintEqualToConstant:80].active = YES;
+-    self.status = [self label:@"Choose the official executable and enter your Soloist API key, then Start." size:13];
+-    [stack addArrangedSubview:self.status];
+-    [self.status.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
+-    self.expiry = [self label:@"No Soloist build installed yet." size:13];
+-    [stack addArrangedSubview:self.expiry];
+-    [self.expiry.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
+-    self.websocket = [NSButton checkboxWithTitle:@"Enable local WebSocket control" target:self action:@selector(websocketChanged:)];
+-    self.websocket.state = [[NSUserDefaults standardUserDefaults] boolForKey:@"enableWebSocket"]
+-        ? NSControlStateValueOn : NSControlStateValueOff;
 -    self.websocket.toolTip = @"Unauthenticated API on this Mac only (127.0.0.1). Never expose it to a LAN or browser.";
-+    if (self.frontendURL) {
-+        self.websocket.state = NSControlStateValueOn;
-+        self.websocket.enabled = NO;
-+    }
-+    self.websocket.toolTip = @"Owner-only Unix socket for local clients. Browser pages and other macOS users cannot open it.";
-     [stack addArrangedSubview:self.websocket];
-     self.runOnLogin = [NSButton checkboxWithTitle:@"Run on login" target:self action:@selector(loginChanged:)];
+-    [stack addArrangedSubview:self.websocket];
+-    self.runOnLogin = [NSButton checkboxWithTitle:@"Run on login" target:self action:@selector(loginChanged:)];
++    NSButton *refresh = [NSButton buttonWithTitle:@"Refresh" target:self action:@selector(refreshAudioOutputs:)];
++    NSStackView *output = [NSStackView stackViewWithViews:@[[self label:@"Audio output" size:13], self.audioOutput, refresh]];
++    output.spacing = 8;
++    [settings addArrangedSubview:output];
++    [output.widthAnchor constraintEqualToAnchor:settings.widthAnchor].active = YES;
++    self.runOnLogin = [NSButton checkboxWithTitle:@"Open on login" target:self action:@selector(loginChanged:)];
      SMAppServiceStatus loginStatus = SMAppService.mainAppService.status;
-@@ -134,8 +182,7 @@ static NSString *const KeyMask = @"••••••••";
-     self.stop = [NSButton buttonWithTitle:@"Stop" target:self action:@selector(stop:)];
-     self.stop.enabled = NO;
-     [stack addArrangedSubview:[NSStackView stackViewWithViews:@[self.start, self.stop]]];
+-    self.runOnLogin.state = (loginStatus == SMAppServiceStatusEnabled ||
+-                             loginStatus == SMAppServiceStatusRequiresApproval)
++    self.runOnLogin.state = (loginStatus == SMAppServiceStatusEnabled || loginStatus == SMAppServiceStatusRequiresApproval)
+         ? NSControlStateValueOn : NSControlStateValueOff;
+-    [stack addArrangedSubview:self.runOnLogin];
+-    self.autoStartOnLaunch = [NSButton checkboxWithTitle:@"Auto start on launch" target:self action:@selector(autoStartChanged:)];
+-    self.autoStartOnLaunch.state = [[NSUserDefaults standardUserDefaults] boolForKey:@"autoStartOnLaunch"]
+-        ? NSControlStateValueOn : NSControlStateValueOff;
+-    [stack addArrangedSubview:self.autoStartOnLaunch];
+-    self.start = [NSButton buttonWithTitle:@"Start" target:self action:@selector(start:)];
+-    self.stop = [NSButton buttonWithTitle:@"Stop" target:self action:@selector(stop:)];
+-    self.stop.enabled = NO;
+-    [stack addArrangedSubview:[NSStackView stackViewWithViews:@[self.start, self.stop]]];
 -    NSURL *support = [[NSFileManager defaultManager] URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
 -    NSURL *config = [support URLByAppendingPathComponent:@"Soloist Runtime/state/installation.json"];
-+    NSURL *config = self.configurationURL;
-     NSData *data = [NSData dataWithContentsOfURL:config];
-     NSDictionary *settings = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
-     if ([settings[@"soloist"] isKindOfClass:NSString.class]) self.engine.stringValue = settings[@"soloist"];
-@@ -150,8 +197,7 @@ static NSString *const KeyMask = @"••••••••";
+-    NSData *data = [NSData dataWithContentsOfURL:config];
+-    NSDictionary *settings = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+-    if ([settings[@"soloist"] isKindOfClass:NSString.class]) self.engine.stringValue = settings[@"soloist"];
++    [settings addArrangedSubview:self.runOnLogin];
++    self.expiry = [self label:@"" size:12];
++    [settings addArrangedSubview:self.expiry];
++    [self.expiry.widthAnchor constraintEqualToAnchor:settings.widthAnchor].active = YES;
++    NSButton *replace = [NSButton buttonWithTitle:@"Replace Soloist key…" target:self action:@selector(showKey:)];
++    NSButton *choose = [NSButton buttonWithTitle:@"Update engine…" target:self action:@selector(choose:)];
++    NSButton *download = [NSButton buttonWithTitle:@"Get engine update" target:self action:@selector(download:)];
++    [settings addArrangedSubview:[NSStackView stackViewWithViews:@[replace, self.stop]]];
++    [settings addArrangedSubview:[NSStackView stackViewWithViews:@[choose, download]]];
+     [self refreshExpiry];
+-    self.autoStart = self.autoStartOnLaunch.state == NSControlStateValueOn && self.engine.stringValue.length > 0;
+-    if (loginStatus == SMAppServiceStatusRequiresApproval)
+-        self.status.stringValue = @"Approve Run on login in System Settings → Login Items.";
++    self.autoStart = self.engine.stringValue.length > 0;
++    [self.window center];
++    [self.settingsWindow center];
++    [self.window makeKeyAndOrderFront:nil];
+     [self refreshCredentialStatus];
++    [NSApp activate];
++}
++- (void)showSettings:(id)sender {
++    (void)sender;
+     [self refreshAudioOutputs:nil];
+-    [self.window center];
++    [self refreshExpiry];
++    [self.settingsWindow makeKeyAndOrderFront:nil];
++    [NSApp activate];
++}
++- (void)showKey:(id)sender {
++    (void)sender;
+     [self.window makeKeyAndOrderFront:nil];
++    [self.window makeFirstResponder:self.key];
      [NSApp activate];
  }
++- (void)application:(NSApplication *)application openURLs:(NSArray<NSURL *> *)urls {
++    (void)application;
++    for (NSURL *url in urls) {
++        if ([url.scheme isEqualToString:@"spotifast-soloist"] &&
++            [url.host isEqualToString:@"settings"] && !url.user.length &&
++            !url.password.length && !url.query.length && !url.fragment.length &&
++            (!url.path.length || [url.path isEqualToString:@"/"]))
++            [self showSettings:nil];
++    }
++}
  - (void)refreshExpiry {
 -    NSURL *support = [[NSFileManager defaultManager] URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
 -    NSURL *config = [support URLByAppendingPathComponent:@"Soloist Runtime/state/installation.json"];
@@ -412,7 +558,68 @@ index bd939f5..ebebb99 100644
      NSData *data = [NSData dataWithContentsOfURL:config];
      NSDictionary *settings = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
      if ([settings[@"soloist"] isKindOfClass:NSString.class]) self.engine.stringValue = settings[@"soloist"];
-@@ -312,11 +358,14 @@ static NSString *const KeyMask = @"••••••••";
+@@ -173,7 +229,9 @@ static NSString *const KeyMask = @"••••••••";
+         : [NSString stringWithFormat:@"Soloist %@ expected expiry: %@ (%ld days left).", version, date, (long)(remaining / 86400)];
+ }
+ - (void)refreshCredentialStatus {
++    if (self.credentialCheck.running) return;
+     NSTask *task = [NSTask new];
++    self.credentialCheck = task;
+     task.executableURL = self.helper;
+     task.arguments = @[@"credential", @"status"];
+     NSPipe *output = [NSPipe pipe];
+@@ -183,8 +241,16 @@ static NSString *const KeyMask = @"••••••••";
+         NSData *data = [output.fileHandleForReading readDataToEndOfFile];
+         NSDictionary *reply = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+         dispatch_async(dispatch_get_main_queue(), ^{
++            if (self.credentialCheck != finished) return;
++            self.credentialCheck = nil;
+             if (self.savingKey || self.credentialEdited) return;
+-            self.hasSavedKey = finished.terminationStatus == 0 && [reply[@"stored"] boolValue];
++            BOOL valid = finished.terminationStatus == 0 && [reply[@"stored"] isKindOfClass:NSNumber.class];
++            self.credentialCheckFailed = !valid;
++            if (!valid) {
++                self.status.stringValue = @"Could not check the saved key in macOS Keychain. Unlock your login Keychain and try Continue again.";
++                return;
++            }
++            self.hasSavedKey = [reply[@"stored"] boolValue];
+             if (!self.key.currentEditor && !self.key.stringValue.length && self.hasSavedKey)
+                 self.key.stringValue = KeyMask;
+             if (self.autoStart && self.hasSavedKey && !self.task) {
+@@ -194,8 +260,22 @@ static NSString *const KeyMask = @"••••••••";
+         });
+     };
+     NSError *error = nil;
+-    if (![task launchAndReturnError:&error])
+-        self.status.stringValue = @"Could not check macOS Keychain. Enter your API key before starting.";
++    if (![task launchAndReturnError:&error]) {
++        self.credentialCheck = nil;
++        self.credentialCheckFailed = YES;
++        self.status.stringValue = @"Could not start the macOS Keychain check. Try reopening this app.";
++        return;
++    }
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
++        if (self.credentialCheck == task && task.running) {
++            self.credentialCheck = nil;
++            if (!self.savingKey && !self.credentialEdited) {
++                self.credentialCheckFailed = YES;
++                self.status.stringValue = @"The macOS Keychain check timed out. Unlock your login Keychain and try Continue again.";
++            }
++            [task terminate];
++        }
++    });
+ }
+ - (void)controlTextDidBeginEditing:(NSNotification *)notification {
+     if (notification.object == self.key && [self.key.stringValue isEqualToString:KeyMask])
+@@ -212,6 +292,7 @@ static NSString *const KeyMask = @"••••••••";
+         if (self.hasSavedKey) self.key.stringValue = KeyMask;
+         return;
+     }
++    self.pendingStart = !self.task;
+     [self saveKey:value];
+ }
+ - (BOOL)saveDeviceName {
+@@ -312,11 +393,14 @@ static NSString *const KeyMask = @"••••••••";
          self.pendingStart = NO;
          self.status.stringValue = @"The API key must be one nonempty line of at most 4096 bytes.";
          self.key.stringValue = self.hasSavedKey ? KeyMask : @"";
@@ -427,7 +634,72 @@ index bd939f5..ebebb99 100644
      [self.window.undoManager removeAllActions];
      self.status.stringValue = @"Saving API key in macOS Keychain…";
      NSTask *task = [NSTask new];
-@@ -473,6 +522,7 @@ static NSString *const KeyMask = @"••••••••";
+@@ -334,6 +418,7 @@ static NSString *const KeyMask = @"••••••••";
+             self.savingKey = NO;
+             if (finished.terminationStatus == 0) {
+                 self.hasSavedKey = YES;
++                self.credentialCheckFailed = NO;
+                 if (self.pendingStart) {
+                     self.pendingStart = NO;
+                     [self start:nil];
+@@ -364,11 +449,6 @@ static NSString *const KeyMask = @"••••••••";
+     [[NSUserDefaults standardUserDefaults] setBool:self.websocket.state == NSControlStateValueOn forKey:@"enableWebSocket"];
+     if (self.task) self.status.stringValue = @"WebSocket setting saved; restart the receiver to apply it.";
+ }
+-- (void)autoStartChanged:(id)sender {
+-    (void)sender;
+-    [[NSUserDefaults standardUserDefaults] setBool:self.autoStartOnLaunch.state == NSControlStateValueOn
+-                                            forKey:@"autoStartOnLaunch"];
+-}
+ - (void)loginChanged:(id)sender {
+     (void)sender;
+     SMAppService *service = SMAppService.mainAppService;
+@@ -393,8 +473,11 @@ static NSString *const KeyMask = @"••••••••";
+     panel.canChooseDirectories = NO;
+     panel.allowsMultipleSelection = NO;
+     panel.message = @"Select the extracted official Linux ARM64 Soloist executable.";
+-    [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse result) {
+-        if (result == NSModalResponseOK) self.engine.stringValue = panel.URL.path;
++    [panel beginSheetModalForWindow:self.settingsWindow completionHandler:^(NSModalResponse result) {
++        if (result == NSModalResponseOK) {
++            self.engine.stringValue = panel.URL.path;
++            if (!self.task) [self start:nil];
++        }
+     }];
+ }
+ - (void)download:(id)sender {
+@@ -407,6 +490,7 @@ static NSString *const KeyMask = @"••••••••";
+ }
+ - (void)start:(id)sender {
+     (void)sender;
++    if (self.task) return;
+     if (![self saveDeviceName]) return;
+     if (self.savingKey) {
+         self.pendingStart = YES;
+@@ -418,8 +502,14 @@ static NSString *const KeyMask = @"••••••••";
+         [self saveKey:self.key.stringValue];
+         return;
+     }
++    if (self.credentialCheckFailed && !self.hasSavedKey) {
++        self.status.stringValue = @"Retrying macOS Keychain check…";
++        self.autoStart = YES;
++        [self refreshCredentialStatus];
++        return;
++    }
+     if (self.task || !self.engine.stringValue.length || !self.hasSavedKey) {
+-        self.status.stringValue = @"Choose a Soloist executable and enter your API key first.";
++        self.status.stringValue = @"Enter your Soloist key to continue. If the engine needs updating, open Settings.";
+         return;
+     }
+     self.start.enabled = NO;
+@@ -467,17 +557,18 @@ static NSString *const KeyMask = @"••••••••";
+         self.stop.enabled = YES;
+         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+             if (self.task == check && check.running) {
+-                self.status.stringValue = @"Setup is waiting for file access. Check macOS prompts, or Stop and select Soloist with Choose….";
++                self.status.stringValue = @"Setup is waiting for executable or Keychain access. Check macOS prompts and unlock your login Keychain, or click Stop to cancel.";
+             }
+         });
      }
  }
  - (void)launchReceiver {
@@ -435,11 +707,18 @@ index bd939f5..ebebb99 100644
      [[NSUserDefaults standardUserDefaults] setBool:self.websocket.state == NSControlStateValueOn forKey:@"enableWebSocket"];
      NSTask *task = [NSTask new];
      task.executableURL = self.helper;
-@@ -488,7 +538,12 @@ static NSString *const KeyMask = @"••••••••";
+     NSString *uid = [[NSUserDefaults standardUserDefaults] stringForKey:@"audioOutputUID"] ?: @"";
+-    task.arguments = @[@"run", @"--audio-latency-ms", @"100", @"--websocket",
++    task.arguments = @[@"run", @"--audio-latency-ms", @"500", @"--websocket",
+                        self.websocket.state == NSControlStateValueOn ? @"on" : @"off",
+                        @"--device-name", self.deviceName.stringValue, @"--audio-output-uid", uid];
+     task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+@@ -488,7 +579,13 @@ static NSString *const KeyMask = @"••••••••";
              self.receiverRunning = NO;
              self.start.enabled = YES;
              self.stop.enabled = NO;
 -            self.status.stringValue = finished.terminationStatus == 0 ? @"Receiver stopped." : @"Receiver stopped after an error. Run the bundled doctor command for diagnostics.";
++            if (!self.quitting) [self.window makeKeyAndOrderFront:nil];
 +            self.status.stringValue = finished.terminationStatus == 0 ? @"Receiver stopped." : @"Receiver stopped after an error. Run the bundled diagnostics command for pairing and codec evidence.";
 +            if (self.frontend.running) [self.frontend terminate];
 +            if (self.pendingReset) {
@@ -449,7 +728,7 @@ index bd939f5..ebebb99 100644
              if (self.quitting && !self.savingKey) [NSApp replyToApplicationShouldTerminate:YES];
          });
      };
-@@ -502,13 +557,168 @@ static NSString *const KeyMask = @"••••••••";
+@@ -502,13 +599,169 @@ static NSString *const KeyMask = @"••••••••";
      }
      self.stop.enabled = YES;
      self.receiverRunning = YES;
@@ -538,7 +817,7 @@ index bd939f5..ebebb99 100644
 +            (void)finished;
 +            dispatch_async(dispatch_get_main_queue(), ^{
 +                if (self.frontend == frontend) self.frontend = nil;
-+                if (self.receiverRunning && !self.stopping) [self stop:nil];
++                if (self.receiverRunning && !self.stopping) [NSApp terminate:nil];
 +            });
 +        };
 +        NSError *error = nil;
@@ -548,6 +827,7 @@ index bd939f5..ebebb99 100644
 +            [self stop:nil];
 +            self.status.stringValue = @"Spotifast could not start. Receiver is stopping.";
 +        } else {
++            [self.window orderOut:nil];
 +            self.status.stringValue = [NSString stringWithFormat:@"Spotifast is open. Waiting for Spotify Connect pairing: select “%@” using the same Spotify account and play a song.", self.deviceName.stringValue];
 +        }
 +        return;
@@ -620,7 +900,14 @@ index bd939f5..ebebb99 100644
  }
  - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
      (void)sender;
-@@ -525,6 +735,9 @@ static NSString *const KeyMask = @"••••••••";
+@@ -519,12 +772,15 @@ static NSString *const KeyMask = @"••••••••";
+ }
+ - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
+     (void)sender;
+-    return YES;
++    return !self.task && !self.frontend.running && !self.savingKey;
+ }
+ @end
  
  int main(void) {
      @autoreleasepool {
@@ -1733,7 +2020,7 @@ index 0000000..5d886a0
 +    syscall6(93, 0, 0, 0, 0, 0, 0);
 +}
 diff --git a/scripts/build-package.py b/scripts/build-package.py
-index 572e84a..ecbac12 100644
+index 572e84a..257b5b3 100644
 --- a/scripts/build-package.py
 +++ b/scripts/build-package.py
 @@ -17,7 +17,7 @@ import tempfile
@@ -1808,7 +2095,7 @@ index 572e84a..ecbac12 100644
      run("codesign", "--force", "--sign", "-", helper)
      manifest = {"version": args.version, "platform": "macos-arm64", "soloist_included": False,
                  "source_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-@@ -186,25 +209,35 @@ def main():
+@@ -186,25 +209,37 @@ def main():
      (resources / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
      macos = contents / "MacOS"
      macos.mkdir()
@@ -1827,7 +2114,10 @@ index 572e84a..ecbac12 100644
              "CFBundlePackageType": "APPL", "CFBundleVersion": args.version,
              "CFBundleShortVersionString": args.version,
              "LSMinimumSystemVersion": "27.0", "NSHighResolutionCapable": True,
-             "NSLocalNetworkUsageDescription": "Discover and pair your local Spotify Connect receiver."}
+-            "NSLocalNetworkUsageDescription": "Discover and pair your local Spotify Connect receiver."}
++            "NSLocalNetworkUsageDescription": "Discover and pair your local Spotify Connect receiver.",
++            "CFBundleURLTypes": [{"CFBundleURLName": "local.spotifast.soloist.settings",
++                                  "CFBundleURLSchemes": ["spotifast-soloist"]}]}
 +    if args.runtime_home is not None:
 +        info["SoloistRuntimeHome"] = str(args.runtime_home.resolve())
 +    if args.frontend is not None:
@@ -1884,6 +2174,112 @@ index 240730d..d85c872 100644
                                        max_size=1024 * 1024) as ws:
              if name != "get_auth_state":
                  while True:
+diff --git a/scripts/credentials.py b/scripts/credentials.py
+index 3de0538..a674f57 100644
+--- a/scripts/credentials.py
++++ b/scripts/credentials.py
+@@ -4,6 +4,7 @@ Only macOS Keychain is exercised by this package. Python keyring also supports
+ Windows Credential Locker and common Linux desktop secret stores for future
+ ports; those platforms still need runtime validation before release.
+ """
++import ctypes
+ import platform
+ 
+ SERVICE = "local.soloistcompat.runtime"
+@@ -37,16 +38,91 @@ def backend():
+     return keyring
+ 
+ 
++def _macos_api():
++    from keyring.backends.macOS import api
++    api._sec.SecItemUpdate.restype = api.OS_status
++    api._sec.SecItemUpdate.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
++    api._found.CFDataCreate.restype = ctypes.c_void_p
++    api._found.CFDataCreate.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long)
++    api._found.CFRelease.restype = None
++    api._found.CFRelease.argtypes = (ctypes.c_void_p,)
++    return api
++
++
++def _key_query(api, **extra):
++    return api.create_query(kSecClass=api.k_("kSecClassGenericPassword"),
++                            kSecAttrService=SERVICE, kSecAttrAccount=ACCOUNT, **extra)
++
++
++def _check_status(status):
++    if status == 0:
++        return
++    if status in (-128, -25293, -25308):
++        raise CredentialError("macOS Keychain access was denied or requires approval. Unlock your login Keychain and try Start again.")
++    raise CredentialError("macOS Keychain could not complete the request. Try again after unlocking your login Keychain.")
++
++
++def _macos_save(secret, api):
++    # Update in place: keyring's macOS set_password deletes before adding, which
++    # can lose a working saved key if the replacement fails.
++    encoded = secret.encode("utf-8")
++    buffer = ctypes.create_string_buffer(encoded)
++    data = ctypes.c_void_p(api._found.CFDataCreate(None, buffer, len(encoded)))
++    if not data:
++        raise CredentialError("Could not prepare the API key for macOS Keychain")
++    query = attributes = addition = None
++    try:
++        query = _key_query(api)
++        attributes = api.create_query(kSecValueData=data)
++        status = api._sec.SecItemUpdate(query, attributes)
++        if status == -25300:  # errSecItemNotFound
++            addition = _key_query(api, kSecValueData=data)
++            status = api.SecItemAdd(addition, None)
++            if status == -25299:  # Another save added the item meanwhile.
++                status = api._sec.SecItemUpdate(query, attributes)
++        _check_status(status)
++    finally:
++        for reference in (addition, attributes, query, data):
++            if reference:
++                api._found.CFRelease(reference)
++        ctypes.memset(buffer, 0, len(buffer))
++
++
+ def save(secret):
+-    backend().set_password(SERVICE, ACCOUNT, validate(secret))
++    secret = validate(secret)
++    if platform.system() == "Darwin":
++        _macos_save(secret, _macos_api())
++    else:
++        backend().set_password(SERVICE, ACCOUNT, secret)
+ 
+ 
+ def load():
+-    value = backend().get_password(SERVICE, ACCOUNT)
++    try:
++        value = backend().get_password(SERVICE, ACCOUNT)
++    except Exception as error:
++        raise CredentialError("Could not read the saved API key. Unlock your login Keychain, approve access locally if requested, and try Start again.") from error
+     if value is None:
+         raise CredentialError("No Soloist API key is saved in the system credential store")
+     return validate(value)
+ 
+ 
++def _macos_exists(api):
++    # Presence only: no password data, item attributes or identifiers returned.
++    # Fail this one query if authentication would be required; never change the
++    # process-wide or system-wide Keychain interaction setting.
++    query = _key_query(api, kSecMatchLimit=api.k_("kSecMatchLimitOne"),
++                       kSecUseAuthenticationUI=api.k_("kSecUseAuthenticationUIFail"))
++    try:
++        status = api.SecItemCopyMatching(query, None)
++        if status == -25300:
++            return False
++        _check_status(status)
++        return True
++    finally:
++        api._found.CFRelease(query)
++
++
+ def exists():
++    if platform.system() == "Darwin":
++        return _macos_exists(_macos_api())
+     return backend().get_password(SERVICE, ACCOUNT) is not None
 diff --git a/scripts/current_diagnostics.py b/scripts/current_diagnostics.py
 new file mode 100644
 index 0000000..f8a5b23
@@ -2553,6 +2949,91 @@ index b8630d4..6ca1f13 100644
          for number, handler in original_handlers.items():
              signal.signal(number, handler)
  
+diff --git a/scripts/refresh-local-package.py b/scripts/refresh-local-package.py
+new file mode 100644
+index 0000000..be3f93a
+--- /dev/null
++++ b/scripts/refresh-local-package.py
+@@ -0,0 +1,79 @@
++"""Rebuild only the launcher/frontend while preserving an approved local helper.
++
++Use this only when the runtime helper has not changed since --base was built.
++The helper's signed bytes and manifest must remain identical, preserving its
++macOS Keychain identity. This does not compile or qualify runtime Python edits.
++"""
++import argparse
++import hashlib
++import importlib.util
++import json
++import plistlib
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++
++ROOT = Path(__file__).resolve().parent.parent
++
++def run(*args):
++    subprocess.run([str(arg) for arg in args], check=True)
++
++def helper_hashes(app):
++    helper = app / 'Contents/Helpers/runtime-cli.app'
++    return {str(p.relative_to(helper)): hashlib.sha256(p.read_bytes()).hexdigest()
++            for p in helper.rglob('*') if p.is_file() and not p.is_symlink()}
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--base', type=Path, required=True)
++    parser.add_argument('--frontend', type=Path, required=True)
++    parser.add_argument('--output', type=Path, required=True)
++    args = parser.parse_args()
++    if args.output.exists():
++        parser.error('Output already exists; preserve the previous app')
++    spec = importlib.util.spec_from_file_location('package_audit', ROOT / 'scripts/verify-package.py')
++    verifier = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(verifier)
++    verifier.audit(args.base)
++    original = helper_hashes(args.base)
++    work = Path(tempfile.mkdtemp(prefix='spotifast-refresh-', dir='/private/tmp'))
++    app = work / args.output.name
++    shutil.copytree(args.base, app, symlinks=True)
++    macos = app / 'Contents/MacOS'
++    shutil.copy2(args.frontend, macos / 'Spotifast')
++    (macos / 'Spotifast').chmod(0o755)
++    run('codesign', '--force', '--sign', '-', macos / 'Spotifast')
++    run('xcrun', 'clang', '-fobjc-arc', '-Wall', '-Wextra', '-Werror', '-arch', 'arm64',
++        '-mmacosx-version-min=27.0', '-framework', 'AppKit', '-framework', 'ServiceManagement',
++        ROOT / 'packaging/launcher.m', '-o', macos / 'SoloistRuntime')
++    shutil.copy2(ROOT / 'packaging/QUICKSTART.md', app / 'Contents/Resources/QUICKSTART.md')
++    info_path = app / 'Contents/Info.plist'
++    info = plistlib.loads(info_path.read_bytes())
++    info['CFBundleURLTypes'] = [{'CFBundleURLName': 'local.spotifast.soloist.settings',
++                              'CFBundleURLSchemes': ['spotifast-soloist']}]
++    info_path.write_bytes(plistlib.dumps(info))
++    manifest_path = app / 'Contents/Resources/manifest.json'
++    manifest = json.loads(manifest_path.read_text())
++    manifest['local_frontend_refresh'] = {
++        'runtime_helper_rebuilt': False,
++        'runtime_helper_bytes_preserved': True,
++        'launcher_sha256': hashlib.sha256((ROOT / 'packaging/launcher.m').read_bytes()).hexdigest(),
++        'frontend_sha256': hashlib.sha256((macos / 'Spotifast').read_bytes()).hexdigest(),
++        'frontend_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'],
++                             cwd=args.frontend.parent.parent.parent, text=True).strip()
++    }
++    manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
++    for name in ('com.apple.ResourceFork', 'com.apple.FinderInfo'):
++        subprocess.run(['xattr', '-dr', name, str(app)], check=True,
++                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    run('codesign', '--force', '--sign', '-', app)
++    if helper_hashes(app) != original:
++        raise RuntimeError('Signed runtime helper changed; refusing replacement')
++    verifier.audit(app)
++    args.output.parent.mkdir(parents=True, exist_ok=True)
++    shutil.move(app, args.output)
++    print('Built local frontend/launcher refresh; approved runtime helper is byte-identical.')
++
++if __name__ == '__main__':
++    main()
 diff --git a/scripts/runtime_cli.py b/scripts/runtime_cli.py
 index 03a7f84..177c7f1 100644
 --- a/scripts/runtime_cli.py
@@ -2801,6 +3282,86 @@ index 25237ea..738b666 100644
              with self.assertRaises(OSError):
                  await client_api.request("skip_next")
              self.assertEqual(connect.call_count, 1)
+diff --git a/scripts/test-credentials.py b/scripts/test-credentials.py
+new file mode 100644
+index 0000000..0735959
+--- /dev/null
++++ b/scripts/test-credentials.py
+@@ -0,0 +1,74 @@
++"""Credential fixtures use synthetic values and never open the native store."""
++import ctypes
++from types import SimpleNamespace
++from unittest import TestCase, main
++from unittest.mock import Mock, patch
++import credentials
++
++
++class FakeAPI:
++    def __init__(self, *, matching=0, updates=(0,), addition=0):
++        self.queries = []
++        self._sec = SimpleNamespace(SecItemUpdate=Mock(side_effect=updates))
++        self._found = SimpleNamespace(CFDataCreate=Mock(return_value=123), CFRelease=Mock())
++        self.SecItemCopyMatching = Mock(return_value=matching)
++        self.SecItemAdd = Mock(return_value=addition)
++        self.k_ = lambda name: name
++
++    def create_query(self, **values):
++        self.queries.append(values)
++        return len(self.queries) + 1000
++
++
++class Tests(TestCase):
++    def test_presence_requests_no_secret_or_attributes_and_never_prompts(self):
++        api = FakeAPI()
++        self.assertTrue(credentials._macos_exists(api))
++        query = api.queries[0]
++        self.assertEqual(query['kSecAttrService'], credentials.SERVICE)
++        self.assertEqual(query['kSecAttrAccount'], credentials.ACCOUNT)
++        self.assertEqual(query['kSecUseAuthenticationUI'], 'kSecUseAuthenticationUIFail')
++        self.assertFalse(any(key.startswith('kSecReturn') for key in query))
++        self.assertIsNone(api.SecItemCopyMatching.call_args.args[1])
++        api._found.CFRelease.assert_called_once()
++
++    def test_only_item_not_found_is_reported_as_missing(self):
++        self.assertFalse(credentials._macos_exists(FakeAPI(matching=-25300)))
++        for status in (-128, -25293, -25308, -50):
++            with self.subTest(status=status), self.assertRaises(credentials.CredentialError):
++                credentials._macos_exists(FakeAPI(matching=status))
++
++    def test_replacement_updates_in_place_and_uses_cfdata_pointer(self):
++        api = FakeAPI()
++        credentials._macos_save('synthetic-key', api)
++        api._sec.SecItemUpdate.assert_called_once()
++        api.SecItemAdd.assert_not_called()
++        self.assertIsInstance(api.queries[1]['kSecValueData'], ctypes.c_void_p)
++        buffer = api._found.CFDataCreate.call_args.args[1]
++        self.assertEqual(bytes(buffer), b'\0' * len(buffer))
++
++    def test_failed_update_never_adds_or_deletes(self):
++        api = FakeAPI(updates=(-25293,))
++        with self.assertRaises(credentials.CredentialError):
++            credentials._macos_save('synthetic-key', api)
++        api.SecItemAdd.assert_not_called()
++        self.assertEqual(api._found.CFRelease.call_count, 3)
++
++    def test_first_save_adds_and_concurrent_first_save_retries_update(self):
++        api = FakeAPI(updates=(-25300,))
++        credentials._macos_save('synthetic-key', api)
++        api.SecItemAdd.assert_called_once()
++        api = FakeAPI(updates=(-25300, 0), addition=-25299)
++        credentials._macos_save('synthetic-key', api)
++        self.assertEqual(api._sec.SecItemUpdate.call_count, 2)
++
++    def test_read_failure_has_fixed_credential_safe_message(self):
++        with patch.object(credentials, 'backend') as backend:
++            backend.return_value.get_password.side_effect = RuntimeError('synthetic-private-text')
++            with self.assertRaises(credentials.CredentialError) as error:
++                credentials.load()
++        self.assertNotIn('synthetic-private-text', str(error.exception))
++
++
++if __name__ == '__main__':
++    main()
 diff --git a/scripts/test-current-diagnostics.py b/scripts/test-current-diagnostics.py
 new file mode 100644
 index 0000000..3c025a7
@@ -3249,10 +3810,10 @@ index 78f8da0..fab37d4 100644
  
  
 diff --git a/scripts/test.sh b/scripts/test.sh
-index 1bcef7a..09cf081 100644
+index 1bcef7a..8baddfa 100644
 --- a/scripts/test.sh
 +++ b/scripts/test.sh
-@@ -12,6 +12,8 @@ python3 "$runtime_root/scripts/test-pi-mutex.py"
+@@ -12,8 +12,11 @@ python3 "$runtime_root/scripts/test-pi-mutex.py"
  python3 "$runtime_root/scripts/test-host-termination.py"
  python3 "$runtime_root/scripts/test-lifecycle.py"
  python3 "$runtime_root/scripts/test-receiver.py"
@@ -3261,6 +3822,9 @@ index 1bcef7a..09cf081 100644
  python3 "$runtime_root/scripts/test-audio-routing.py"
  python3 "$runtime_root/scripts/test-client-api.py"
  python3 "$runtime_root/scripts/test-playback-cycles.py"
+ python3 "$runtime_root/scripts/test-package.py"
++python3 "$runtime_root/scripts/test-credentials.py"
+ python3 "$runtime_root/scripts/verify-startup.py"
 diff --git a/scripts/verify-control-latency.py b/scripts/verify-control-latency.py
 index 2ea7044..974276c 100644
 --- a/scripts/verify-control-latency.py

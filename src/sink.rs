@@ -26,6 +26,67 @@ use rodio::Source;
 
 use crate::resample::Resampler;
 
+/// Volume and clipping protection for the legacy local playback engine.
+/// Soloist owns its separate output path and does not use this wrapper.
+pub struct ControlledSink {
+    inner: Box<dyn Sink>,
+    control: Arc<AudioControl>,
+    volume: Box<dyn VolumeGetter + Send>,
+    applies_volume: bool,
+    limiter: crate::limiter::Limiter,
+}
+
+impl ControlledSink {
+    pub fn new(
+        inner: Box<dyn Sink>,
+        control: Arc<AudioControl>,
+        volume: Box<dyn VolumeGetter + Send>,
+        applies_volume: bool,
+    ) -> Self {
+        Self {
+            inner,
+            control,
+            volume,
+            applies_volume,
+            limiter: crate::limiter::Limiter::new(f64::from(SAMPLE_RATE)),
+        }
+    }
+}
+
+impl Sink for ControlledSink {
+    fn start(&mut self) -> SinkResult<()> {
+        self.inner.start()
+    }
+    fn stop(&mut self) -> SinkResult<()> {
+        self.inner.stop()
+    }
+    fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
+        if self.control.take_processing_reset() {
+            self.limiter = crate::limiter::Limiter::new(f64::from(SAMPLE_RATE));
+        }
+        match packet {
+            AudioPacket::Samples(mut samples) => {
+                let volume = self.volume.attenuation_factor();
+                if self.applies_volume {
+                    samples.iter_mut().for_each(|sample| *sample *= volume);
+                }
+                let ceiling = if self.applies_volume {
+                    Some(1.0)
+                } else if volume > f64::EPSILON {
+                    Some(1.0 / volume)
+                } else {
+                    None
+                };
+                if let Some(ceiling) = ceiling {
+                    self.limiter.process(&mut samples, ceiling);
+                }
+                self.inner.write(AudioPacket::Samples(samples), converter)
+            }
+            packet => self.inner.write(packet, converter),
+        }
+    }
+}
+
 /// The backend name Settings uses for this sink.
 pub const NAME: &str = "rodio";
 
@@ -1550,5 +1611,69 @@ mod tests {
         queued.wait_for_room(100);
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(queued.wake_at.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod controlled_sink_tests {
+    use super::*;
+    struct Recorded(Arc<Mutex<Vec<f64>>>);
+    impl Sink for Recorded {
+        fn start(&mut self) -> SinkResult<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> SinkResult<()> {
+            Ok(())
+        }
+        fn write(&mut self, packet: AudioPacket, _: &mut Converter) -> SinkResult<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .extend_from_slice(packet.samples().unwrap());
+            Ok(())
+        }
+    }
+    fn fixture() -> (ControlledSink, Arc<AudioControl>, Arc<Mutex<Vec<f64>>>) {
+        let control = AudioControl::new(DEFAULT_BUFFER_MS);
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let sink = ControlledSink::new(
+            Box::new(Recorded(Arc::clone(&samples))),
+            Arc::clone(&control),
+            Box::new(librespot_playback::mixer::NoOpVolume),
+            false,
+        );
+        (sink, control, samples)
+    }
+    fn write_level(sink: &mut ControlledSink, level: f64) {
+        sink.write(
+            AudioPacket::Samples(vec![level; 2048]),
+            &mut Converter::new(None),
+        )
+        .unwrap();
+    }
+    #[test]
+    fn replacing_a_track_discards_limiter_audio_before_a_silent_intro() {
+        let (mut sink, control, samples) = fixture();
+        write_level(&mut sink, 0.25);
+        control.interrupt();
+        write_level(&mut sink, 0.25);
+        control.interrupt();
+        control.track_changed();
+        samples.lock().unwrap().clear();
+        write_level(&mut sink, 0.0);
+        assert!(samples.lock().unwrap().iter().all(|sample| *sample == 0.0));
+    }
+    #[test]
+    fn natural_track_transition_preserves_the_limiter_tail() {
+        let (mut sink, control, samples) = fixture();
+        write_level(&mut sink, 0.25);
+        control.track_changed();
+        sink.stop().unwrap();
+        sink.start().unwrap();
+        samples.lock().unwrap().clear();
+        write_level(&mut sink, 0.0);
+        let samples = samples.lock().unwrap();
+        assert!(samples[..706].iter().all(|sample| *sample == 0.25));
+        assert!(samples[706..].iter().all(|sample| *sample == 0.0));
     }
 }

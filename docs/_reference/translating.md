@@ -76,7 +76,7 @@ cargo run --features demo -- --demo --demo-language de-DE --demo-show playing-ne
 cargo run --features demo -- --demo --demo-language ja --demo-show lyrics-follow
 ```
 
-Check a narrow and a normal window, light and dark themes, keyboard navigation,
+Check a narrow and a normal window, the fixed dark interface, keyboard navigation,
 and screen-reader names. `--demo-shot PATH` saves the preview and exits. When automating screenshots, give the process
 its own XDG config, data and state directories on Linux so framework window and
 scroll state do not carry between captures.

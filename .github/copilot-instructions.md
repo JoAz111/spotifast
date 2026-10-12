@@ -74,7 +74,7 @@ the application shell, window chrome, panel sizing, responsive breakpoints,
 spacing, or visual hierarchy as an interface redesign, not an internal
 refactor. Call this out even when the code is correct. A redesign requires
 explicit maintainer approval of its visual scope and before-and-after evidence
-at representative sizes in light and dark themes. Do not infer visual approval
+at representative sizes in the fixed dark interface. Do not infer visual approval
 from permission to assess code quality.
 
 Check that behavioural changes have focused tests and that user-visible

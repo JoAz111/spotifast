@@ -564,7 +564,6 @@ struct PlaylistCacheWrite {
 }
 
 pub enum Command {
-    OpenThemesFolder,
     ProxyRestored {
         lease: CredentialLease,
         result: Result<crate::credentials::Loaded, crate::credentials::Error>,
@@ -768,7 +767,6 @@ pub enum Command {
 pub struct LyricsRequest {
     /// The track the answer is for, so a stale one is ignored.
     pub uri: String,
-    pub query: crate::lyrics::Query,
 }
 
 pub enum Event {
@@ -915,6 +913,8 @@ pub struct Backend {
     thread: Option<std::thread::JoinHandle<()>>,
     offline: bool,
     #[cfg(test)]
+    api_requests: std::sync::Mutex<Vec<ApiRequest>>,
+    #[cfg(test)]
     network_statuses: std::sync::Mutex<Vec<bool>>,
     #[cfg(test)]
     playlist_item_requests: std::sync::Mutex<Vec<(String, u32, u64)>>,
@@ -1003,6 +1003,8 @@ impl Backend {
             thread: Some(thread),
             offline: false,
             #[cfg(test)]
+            api_requests: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
             network_statuses: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             playlist_item_requests: std::sync::Mutex::new(Vec::new()),
@@ -1074,6 +1076,11 @@ impl Backend {
     }
 
     pub fn api(&self, request: ApiRequest) {
+        #[cfg(test)]
+        self.api_requests
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(request.clone());
         #[cfg(test)]
         if matches!(
             request,
@@ -1156,6 +1163,11 @@ impl Backend {
                 ));
         }
         self.send(Command::Api(request));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_api_requests(&self) -> Vec<ApiRequest> {
+        std::mem::take(&mut *self.api_requests.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     #[cfg(test)]
@@ -1751,21 +1763,6 @@ impl Worker {
                 continue;
             }
             match command {
-                Command::OpenThemesFolder => {
-                    let directory = self.dirs.config.join("themes");
-                    let events = self.events.clone();
-                    let waker = self.waker.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if let Err(error) = std::fs::create_dir_all(&directory)
-                            .and_then(|()| crate::opener::open(&directory))
-                        {
-                            let _ = events.send(Event::Error(format!(
-                                "Couldn't open the themes folder: {error}"
-                            )));
-                            waker.wake();
-                        }
-                    });
-                }
                 Command::ProxyRestored { lease, result } => self.on_proxy_restored(lease, result),
                 Command::CredentialsRestored {
                     slot,
@@ -2358,8 +2355,10 @@ impl Worker {
                 } else {
                     ApiSource::Personal
                 };
-                if source == ApiSource::Shared
-                    || self.web_client_id.as_deref() == Some(token.client_id.as_str())
+                if (source == ApiSource::Shared
+                    && token.client_id == crate::auth::PRIMARY_WEB_CLIENT_ID)
+                    || (source == ApiSource::Personal
+                        && self.web_client_id.as_deref() == Some(token.client_id.as_str()))
                 {
                     if token.has_scopes(crate::auth::WEB_SCOPES) {
                         if !self.signed_in {
@@ -2412,6 +2411,16 @@ impl Worker {
     }
 
     fn on_web_signed_in(&mut self, source: ApiSource, token: crate::auth::StoredToken) {
+        let expected = match source {
+            ApiSource::Shared => Some(crate::auth::PRIMARY_WEB_CLIENT_ID),
+            ApiSource::Personal => self.web_client_id.as_deref(),
+        };
+        if !expected.is_some_and(|id| !id.is_empty() && id == token.client_id) {
+            self.emit(Event::Auth(AuthStatus::Failed(
+                "Spotify registration changed. Sign in again.".into(),
+            )));
+            return;
+        }
         let lease = self.credentials.lease(web_slot(source));
         let tokens = WebTokens::new(
             self.http.clone(),
@@ -2490,7 +2499,7 @@ impl Worker {
             self.api.clear(source);
         }
         let message = match source {
-            ApiSource::Shared => format!("Shared Spotify sign-in failed: {error}"),
+            ApiSource::Shared => format!("Spotify sign-in failed: {error}"),
             ApiSource::Personal => format!("Personal app authorization failed: {error}"),
         };
         let other_ready = match source {
@@ -2510,6 +2519,8 @@ impl Worker {
 
     fn on_web_verified(&mut self, source: ApiSource, token: crate::auth::StoredToken, user: User) {
         if !matches!(self.api.state(source), SessionState::Authorizing)
+            || (source == ApiSource::Shared
+                && token.client_id != crate::auth::PRIMARY_WEB_CLIENT_ID)
             || source == ApiSource::Personal
                 && self.web_client_id.as_deref() != Some(token.client_id.as_str())
         {
@@ -2600,7 +2611,13 @@ impl Worker {
             return;
         }
         let grant = match source {
-            ApiSource::Shared => crate::auth::Grant::shared_web_api(),
+            ApiSource::Shared => match crate::auth::Grant::primary_web_api() {
+                Ok(grant) => grant,
+                Err(error) => {
+                    self.emit(Event::Auth(AuthStatus::Failed(error.to_string())));
+                    return;
+                }
+            },
             ApiSource::Personal => {
                 let Some(client_id) = self.web_client_id.as_deref() else {
                     return;
@@ -3606,24 +3623,13 @@ impl Worker {
     }
 
     fn fetch_lyrics(&self, request: LyricsRequest) {
-        let http = self.http.client();
         let events = self.events.clone();
         let waker = self.waker.clone();
         let cache_dir = self.dirs.lyrics_cache_dir();
         let engine = self.engine.clone();
         tokio::spawn(async move {
-            // Spotify's own words go first: they follow the recording
-            // exactly. Everything else, a signed-out session included,
-            // falls back to LRCLIB.
-            let result = match spotify_lyrics(engine, &request.uri, &cache_dir).await {
-                Some(found) => Ok(Some(found)),
-                None => match http {
-                    Ok(http) => crate::lyrics::fetch(&http, &cache_dir, &request.query)
-                        .await
-                        .map_err(|error| format!("{error:#}")),
-                    Err(error) => Err(error),
-                },
-            };
+            // Lyrics and listening metadata stay with Spotify.
+            let result = Ok(spotify_lyrics(engine, &request.uri, &cache_dir).await);
             let _ = events.send(Event::Lyrics {
                 uri: request.uri,
                 result,
@@ -4616,8 +4622,7 @@ fn settle<T>(result: Result<T, session_reads::Failure>) -> Option<ApiResult<T>> 
 }
 
 /// Spotify's transcription of the track, when the local session can ask for
-/// one. Answers are cached like LRCLIB's, "none" included; `None` falls
-/// back to LRCLIB.
+/// one. Answers are cached locally, "none" included.
 async fn spotify_lyrics(
     engine: Option<Arc<Engine>>,
     uri: &str,
@@ -6106,7 +6111,7 @@ mod authorization_tests {
             verify(&mut worker, ApiSource::Shared, "alice");
             let old = worker.credentials.lease(CredentialSlot::Shared);
             let grant = StoredGrant::Web(crate::auth::StoredToken {
-                client_id: crate::auth::DEFAULT_WEB_CLIENT_ID.into(),
+                client_id: crate::auth::PRIMARY_WEB_CLIENT_ID.into(),
                 access_token: "dummy-expired-access".into(),
                 refresh_token: "dummy-rejected-refresh".into(),
                 ..Default::default()
@@ -6201,13 +6206,7 @@ mod authorization_tests {
             cache: root.join("cache"),
         };
         let settings = crate::settings::Settings::default();
-        let config = crate::app::engine_config(
-            &dirs,
-            &settings,
-            ProxyConfig::Off,
-            crate::vis::AudioTap::new(),
-            crate::eq::shared(),
-        );
+        let config = crate::app::engine_config(&dirs, &settings, ProxyConfig::Off);
         let http = Http::new(reqwest::Client::new());
         let art = ArtLoader::new(http.clone(), runtime.handle().clone(), dirs.art_cache_dir());
         let (sender, events) = std::sync::mpsc::channel();
@@ -6356,7 +6355,7 @@ mod authorization_tests {
             let lease = worker.credentials.lease(slot);
             let token = crate::auth::StoredToken {
                 client_id: if slot == CredentialSlot::Shared {
-                    crate::auth::DEFAULT_WEB_CLIENT_ID.into()
+                    crate::auth::PRIMARY_WEB_CLIENT_ID.into()
                 } else {
                     "personal".into()
                 },
@@ -6409,7 +6408,7 @@ mod authorization_tests {
         let attempt = worker.authorization_attempt;
         let album_type_session = worker.album_type_lookup.session_generation;
         let token = crate::auth::StoredToken {
-            client_id: crate::auth::DEFAULT_WEB_CLIENT_ID.into(),
+            client_id: crate::auth::PRIMARY_WEB_CLIENT_ID.into(),
             access_token: "dummy-access".into(),
             refresh_token: "dummy-refresh".into(),
             ..Default::default()
@@ -6602,7 +6601,7 @@ mod authorization_tests {
                 client_id: if source == ApiSource::Personal {
                     "personal"
                 } else {
-                    crate::auth::DEFAULT_WEB_CLIENT_ID
+                    crate::auth::PRIMARY_WEB_CLIENT_ID
                 }
                 .into(),
                 ..Default::default()

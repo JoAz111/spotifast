@@ -622,7 +622,7 @@ fn paint_expanded_art(app: &mut App, ui: &mut egui::Ui, rect: Rect) {
             offset: [0, 0],
             blur: 28,
             spread: 0,
-            color: egui::Color32::from_black_alpha(if palette.dark { 120 } else { 40 }),
+            color: egui::Color32::from_black_alpha(120),
         }
         .as_shape(rect, egui::CornerRadius::same(8)),
     );

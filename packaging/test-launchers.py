@@ -34,7 +34,6 @@ def payload(root):
         shutil.copyfile(shutil.which("true"), root / name)
     for name in ["LICENSE", "README.md"]:
         shutil.copyfile(ROOT / name, root / name)
-    shutil.copytree(ROOT / "contrib/omarchy", root / "contrib/omarchy")
     (root / "packaging/flatpak").mkdir()
     shutil.copyfile(ROOT / "packaging/flatpak/rocks.spotifast.Spotifast.metainfo.xml",
                     root / "packaging/flatpak/rocks.spotifast.Spotifast.metainfo.xml")

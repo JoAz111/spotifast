@@ -148,8 +148,6 @@ enum Control {
     },
     /// Bring the window of the running instance forward
     Show,
-    /// Reload local palette files without starting the app or interrupting playback
-    ReloadThemes,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -210,7 +208,6 @@ fn run_control(control: Control) -> i32 {
         Control::Transfer { device_id } => format!("transfer {device_id}"),
         Control::NowPlaying { .. } => "nowplaying".to_owned(),
         Control::Show => "show".to_owned(),
-        Control::ReloadThemes => "reload-themes".to_owned(),
     };
     let printed = match single_instance::send(&verb) {
         Ok(single_instance::Reply::Ok) => return 0,
@@ -342,15 +339,6 @@ pub(crate) fn run() -> eframe::Result<()> {
     // helper, which installs and exits; otherwise the receipt and error an
     // update relaunch carries are taken out of the arguments.
     let launch = fastframe_update::intercept(&spotifast::updates::CONFIG);
-    // A MilkDrop child launch is a bare visualiser window, not the app: it has
-    // its own event loop and OpenGL context, reads the sound from a shared
-    // buffer, and never touches the app's state. Handle it before anything
-    // else, including the argument parser, which does not know its flags.
-    #[cfg(feature = "milkdrop")]
-    if let Some(args) = spotifast::milkdrop::child::Args::parse() {
-        std::process::exit(spotifast::milkdrop::child::run(args));
-    }
-
     let cli = Cli::from_arg_matches(&Cli::command().get_matches_from(&launch.arguments))
         .unwrap_or_else(|error| error.exit());
     // Demo mode invents plays, settings, and a signed-in account. Without a
@@ -484,16 +472,6 @@ pub(crate) fn run() -> eframe::Result<()> {
     let desktop_surfaces = options.media_controls;
     #[allow(unused_mut)]
     let mut app = app::App::new(&waker, dirs, settings, options);
-    if guarded {
-        app.enable_desktop_themes();
-    }
-    #[cfg(feature = "demo")]
-    let load_themes = guarded || cli.demo_data.is_some();
-    #[cfg(not(feature = "demo"))]
-    let load_themes = true;
-    if load_themes {
-        app.load_custom_themes(&waker);
-    }
     app.update_receipt = launch.receipt;
     if let Some(error) = launch.error {
         app.report_update_failure(error);
@@ -556,18 +534,13 @@ pub(crate) fn run() -> eframe::Result<()> {
         let creator_waker = waker.clone();
         #[cfg(feature = "demo")]
         let creator_shot = shot.clone();
-        let mini = lease.peek(MiniWindow::wanted);
         let geometry = lease.peek(main_geometry);
         #[cfg(all(windows, target_arch = "aarch64"))]
         let locale = lease.peek(|app| app.locale);
         #[cfg(feature = "demo")]
         let options = {
-            let options = native_options(
-                shot.is_some() && mini.is_none() && demo_inner.is_none(),
-                mini,
-                demo_inner,
-                geometry,
-            );
+            let options =
+                native_options(shot.is_some() && demo_inner.is_none(), demo_inner, geometry);
             if demo {
                 demo_native_options(options, demo_storage.clone())
             } else {
@@ -575,12 +548,10 @@ pub(crate) fn run() -> eframe::Result<()> {
             }
         };
         #[cfg(not(feature = "demo"))]
-        let options = native_options(false, mini, None, geometry);
+        let options = native_options(false, None, geometry);
         let options = profile_options(options);
         #[cfg(windows)]
         let thumbbar_enabled = desktop_surfaces && options.viewport.taskbar != Some(false);
-        #[cfg(target_os = "linux")]
-        let hide_from_taskbar = options.viewport.taskbar == Some(false);
         eframe::run_native(
             "Spotifast",
             options,
@@ -614,24 +585,6 @@ pub(crate) fn run() -> eframe::Result<()> {
                     spotifast::notch::init();
                     let ctx_notch = cc.egui_ctx.clone();
                     spotifast::notch::set_waker(move || ctx_notch.request_repaint());
-                }
-                {
-                    use raw_window_handle::HasDisplayHandle;
-                    if let Ok(display) = cc.display_handle() {
-                        app.window_level_supported =
-                            spotifast::window::supports_window_level(display.as_raw());
-                        app.taskbar_hiding_supported =
-                            spotifast::window::supports_hiding_from_taskbar(display.as_raw());
-                    }
-                }
-                // winit hides a taskbar button on Windows only; X11 is
-                // asked here, while the window is still unmapped.
-                #[cfg(target_os = "linux")]
-                if hide_from_taskbar {
-                    use raw_window_handle::HasWindowHandle;
-                    if let Ok(handle) = cc.window_handle() {
-                        spotifast::window::skip_x11_taskbar(handle.as_raw());
-                    }
                 }
                 app.attach(&cc.egui_ctx);
                 #[cfg(windows)]
@@ -675,33 +628,6 @@ pub(crate) fn run() -> eframe::Result<()> {
             }
         })
     })
-}
-
-/// The Winamp mini player's window, when that is the window to open.
-struct MiniWindow {
-    /// A first size; the window corrects it once it knows the display.
-    size: egui::Vec2,
-    /// Where it was. Only the position is used: the skin sets the size,
-    /// and the mini player is never maximized.
-    geometry: Geometry,
-    on_top: bool,
-    taskbar: bool,
-    storage_path: std::path::PathBuf,
-}
-
-impl MiniWindow {
-    fn wanted(app: &app::App) -> Option<Self> {
-        app.settings.winamp_window.then(|| Self {
-            size: spotifast::ui::winamp::initial_size(&app.settings),
-            geometry: Geometry {
-                position: app.winamp.geometry.position,
-                ..Geometry::default()
-            },
-            on_top: app.settings.winamp_on_top,
-            taskbar: app.settings.winamp_show_taskbar,
-            storage_path: app.dirs.cache.join("winamp.ron"),
-        })
-    }
 }
 
 /// The main window's remembered geometry. A demo run opens at its default
@@ -759,100 +685,42 @@ fn parse_demo_drag(spec: &str) -> Result<[egui::Pos2; 2], String> {
     Ok([point(from)?, point(to)?])
 }
 
-/// The window to open: the mini player when `mini` says so, else the main
-/// window, at the demo's fixed `inner_size` or where `geometry` remembers.
+/// Opens the music window at its remembered geometry or a fixed demo size.
 fn native_options(
     fullscreen: bool,
-    mini: Option<MiniWindow>,
     inner_size: Option<[f32; 2]>,
     geometry: Geometry,
 ) -> eframe::NativeOptions {
-    // The app keeps the mini player's position and shaded size separately.
-    // Its closing window must not replace the main window's eframe geometry.
-    let persist_window = mini.is_none();
-    // Disabling saving does not disable eframe's startup restore. Give the
-    // mini player its own path, and Shell disables its egui-memory saving too,
-    // so it neither reads the main window's geometry nor creates a state file.
-    let persistence_path = mini.as_ref().map(|mini| mini.storage_path.clone());
-    #[cfg(target_os = "linux")]
-    let persistence_path = persistence_path.or_else(|| {
-        // Keep the native profile path even when Flatpak supplies its app ID.
-        eframe::storage_dir("spotifast").map(|dir| dir.join("app.ron"))
-    });
     #[cfg(target_os = "linux")]
     let app_id = desktop_entry();
     #[cfg(not(target_os = "linux"))]
     let app_id = "spotifast";
     let icon = if cfg!(target_os = "macos") {
-        // macOS takes the dock icon from the bundle's .icns, which is the
-        // 1024px drawing with the platform's rounding. Setting a window
-        // icon there replaces it with this flat 128px square.
         egui::IconData::default()
     } else {
         app_icon()
     };
+    let size = inner_size.unwrap_or([1240.0, 800.0]);
     let viewport = egui::ViewportBuilder::default()
         .with_title("Spotifast")
         .with_app_id(app_id)
         .with_taskbar(true)
-        .with_icon(icon);
-    let viewport = match mini {
-        Some(mini) => {
-            let level = app::on_top_window_level(mini.on_top);
-            // See-through, for skins that are not rectangles; the skin
-            // paints every pixel that is the window. MilkDrop runs in its own
-            // process, so nothing else shares this window's surface.
-            let viewport = viewport
-                .with_decorations(false)
-                .with_transparent(true)
-                .with_resizable(false)
-                .with_maximize_button(false)
-                .with_inner_size(mini.size)
-                .with_min_inner_size(mini.size)
-                .with_max_inner_size(mini.size)
-                .with_window_level(level);
-            // egui applies this native attribute on Windows only; the app
-            // creator asks X11 itself (window::skip_x11_taskbar).
-            let viewport = viewport.with_taskbar(mini.taskbar);
-            // Where it was, before the window exists. A position on no
-            // connected display is dropped on macOS, and moved back onto one
-            // on the first frame elsewhere (recover_offscreen).
-            Geometry {
-                position: mini.geometry.position,
-                ..Geometry::default()
-            }
-            .apply(viewport)
-        }
-        None => {
-            let size = inner_size.unwrap_or([1240.0, 800.0]);
-            let viewport = viewport
-                // macOS: no title bar strip above the app. The content runs to
-                // the top edge and the traffic lights float over it, the way
-                // every other music player on the platform looks; the interface
-                // leaves room for them with `theme::titlebar_inset`.
-                .with_fullsize_content_view(true)
-                .with_titlebar_shown(false)
-                .with_title_shown(false)
-                // Windows has no equivalent to macOS's floating traffic lights.
-                // Removing its decorations lets the app surface fill the window.
-                .with_decorations(main_window_decorated(spotifast::window::custom_titlebar()))
-                .with_inner_size(size)
-                .with_min_inner_size(inner_size.unwrap_or(spotifast::window::MAIN_MIN_SIZE))
-                .with_fullscreen(fullscreen);
-            if inner_size.is_some() {
-                viewport.with_max_inner_size(size)
-            } else {
-                // The size, position and maximized state it was left in,
-                // before the window exists. eframe's own saved window, where
-                // there is one, still wins over this.
-                geometry.apply(viewport)
-            }
-        }
+        .with_icon(icon)
+        .with_fullsize_content_view(true)
+        .with_titlebar_shown(false)
+        .with_title_shown(false)
+        .with_decorations(main_window_decorated(spotifast::window::custom_titlebar()))
+        .with_inner_size(size)
+        .with_min_inner_size(inner_size.unwrap_or(spotifast::window::MAIN_MIN_SIZE))
+        .with_fullscreen(fullscreen);
+    let viewport = if inner_size.is_some() {
+        viewport.with_max_inner_size(size)
+    } else {
+        geometry.apply(viewport)
     };
     eframe::NativeOptions {
         viewport,
-        persist_window,
-        persistence_path,
+        persist_window: true,
         ..Default::default()
     }
 }
@@ -900,54 +768,17 @@ mod native_window_tests {
 
     #[test]
     fn window_geometry_is_kept_without_touching_demo_storage() {
-        let main = profile_options(native_options(false, None, None, Geometry::default()));
+        let main = profile_options(native_options(false, None, Geometry::default()));
         assert_eq!(
             main.persistence_path,
             eframe::storage_dir("spotifast").map(|dir| dir.join("app.ron"))
         );
         let demo_path = std::path::PathBuf::from("temporary/demo.ron");
         let demo = profile_options(demo_native_options(
-            native_options(false, None, None, Geometry::default()),
+            native_options(false, None, Geometry::default()),
             demo_path.clone(),
         ));
         assert_eq!(demo.persistence_path, Some(demo_path));
-    }
-
-    #[test]
-    fn launcher_identity_preserves_main_and_mini_storage() {
-        let main = native_options(false, None, None, Geometry::default());
-        let mini_path = std::path::PathBuf::from("cache/winamp.ron");
-        let mini = native_options(
-            false,
-            Some(MiniWindow {
-                size: egui::vec2(550.0, 232.0),
-                geometry: Geometry::default(),
-                on_top: false,
-                taskbar: true,
-                storage_path: mini_path.clone(),
-            }),
-            None,
-            Geometry::default(),
-        );
-        #[cfg(target_os = "linux")]
-        {
-            let id = desktop_entry();
-            assert_eq!(main.viewport.app_id.as_deref(), Some(id.as_str()));
-            assert_eq!(mini.viewport.app_id, main.viewport.app_id);
-            assert_eq!(
-                main.persistence_path,
-                eframe::storage_dir("spotifast").map(|dir| dir.join("app.ron"))
-            );
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            assert_eq!(main.viewport.app_id.as_deref(), Some("spotifast"));
-            assert_eq!(mini.viewport.app_id, main.viewport.app_id);
-            assert_eq!(main.persistence_path, None);
-        }
-        assert_eq!(mini.persistence_path, Some(mini_path));
-        assert!(main.persist_window);
-        assert!(!mini.persist_window);
     }
 
     /// The main window opens with the size, position and maximized state it
@@ -959,81 +790,25 @@ mod native_window_tests {
             position: Some([100.0, 150.0]),
             maximized: true,
         };
-        let options = native_options(false, None, None, geometry);
+        let options = native_options(false, None, geometry);
         assert_eq!(options.viewport.inner_size, Some(egui::vec2(1100.0, 700.0)));
         assert_eq!(options.viewport.position, Some(egui::pos2(100.0, 150.0)));
         assert_eq!(options.viewport.maximized, Some(true));
 
-        let fresh = native_options(false, None, None, Geometry::default());
+        let fresh = native_options(false, None, Geometry::default());
         assert_eq!(fresh.viewport.inner_size, Some(egui::vec2(1240.0, 800.0)));
         assert_eq!(fresh.viewport.position, None);
         assert_eq!(fresh.viewport.maximized, None);
 
-        let demo = native_options(false, None, Some([760.0, 520.0]), geometry);
+        let demo = native_options(false, Some([760.0, 520.0]), geometry);
         assert_eq!(demo.viewport.inner_size, Some(egui::vec2(760.0, 520.0)));
         assert_eq!(demo.viewport.position, None);
         assert_eq!(demo.viewport.maximized, None);
     }
 
-    /// The mini player takes only its position from what was remembered: the
-    /// skin sets its size, and it is never maximized.
-    #[test]
-    fn the_mini_player_takes_only_its_position() {
-        let mini = MiniWindow {
-            size: egui::vec2(550.0, 232.0),
-            geometry: Geometry {
-                size: Some([1100.0, 700.0]),
-                position: Some([300.0, 200.0]),
-                maximized: true,
-            },
-            on_top: false,
-            taskbar: true,
-            storage_path: "cache/winamp.ron".into(),
-        };
-        let options = native_options(false, Some(mini), None, Geometry::default());
-        assert_eq!(options.viewport.inner_size, Some(egui::vec2(550.0, 232.0)));
-        assert_eq!(options.viewport.position, Some(egui::pos2(300.0, 200.0)));
-        assert_eq!(options.viewport.maximized, None);
-    }
-
-    #[test]
-    fn only_the_main_window_persists_framework_geometry() {
-        assert!(native_options(false, None, None, Geometry::default()).persist_window);
-        for shaded in [false, true] {
-            let settings = settings::Settings {
-                winamp_shaded: shaded,
-                skin_scale: Some(2),
-                ..Default::default()
-            };
-            let size = spotifast::ui::winamp::initial_size(&settings);
-            let options = native_options(
-                false,
-                Some(MiniWindow {
-                    size,
-                    geometry: Geometry {
-                        position: Some([300.0, 200.0]),
-                        ..Geometry::default()
-                    },
-                    on_top: false,
-                    taskbar: true,
-                    storage_path: std::path::PathBuf::from("cache/winamp.ron"),
-                }),
-                None,
-                Geometry::default(),
-            );
-            assert!(
-                !options.persist_window,
-                "mini geometry must not overwrite main"
-            );
-            assert_eq!(options.viewport.inner_size, Some(size));
-            assert_eq!(options.viewport.position, Some(egui::pos2(300.0, 200.0)));
-            assert!(options.persistence_path.is_some());
-        }
-    }
-
     #[test]
     fn main_window_uses_the_platform_decoration_policy() {
-        let options = native_options(false, None, None, Geometry::default());
+        let options = native_options(false, None, Geometry::default());
         assert_eq!(
             options.viewport.decorations,
             Some(!spotifast::window::custom_titlebar())
@@ -1041,60 +816,6 @@ mod native_window_tests {
         assert_eq!(options.viewport.fullsize_content_view, Some(true));
         assert_eq!(options.viewport.titlebar_shown, Some(false));
         assert_eq!(options.viewport.title_shown, Some(false));
-    }
-
-    /// Both windows ask for vsync: AppKit resize animations need it, and on
-    /// Wayland eframe paces frames by the compositor's frame callbacks
-    /// instead of waiting in the swap, so a hidden window cannot block (#266).
-    #[test]
-    fn windows_wait_for_vsync() {
-        assert!(
-            native_options(false, None, None, Geometry::default())
-                .glow_options
-                .vsync
-        );
-        let mini = MiniWindow {
-            size: egui::vec2(550.0, 232.0),
-            geometry: Geometry::default(),
-            on_top: false,
-            taskbar: true,
-            storage_path: "cache/winamp.ron".into(),
-        };
-        assert!(
-            native_options(false, Some(mini), None, Geometry::default())
-                .glow_options
-                .vsync
-        );
-    }
-
-    #[test]
-    fn hiding_the_mini_taskbar_button_never_hides_the_main_window_button() {
-        for taskbar in [false, true] {
-            let mini = MiniWindow {
-                size: egui::vec2(550.0, 232.0),
-                geometry: Geometry {
-                    position: Some([123.0, 456.0]),
-                    ..Geometry::default()
-                },
-                on_top: true,
-                taskbar,
-                storage_path: "cache/winamp.ron".into(),
-            };
-            let options = native_options(false, Some(mini), None, Geometry::default());
-            assert_eq!(options.viewport.taskbar, Some(taskbar));
-            assert_eq!(options.viewport.position, Some(egui::pos2(123.0, 456.0)));
-            assert_eq!(options.viewport.inner_size, Some(egui::vec2(550.0, 232.0)));
-            assert_eq!(
-                options.viewport.window_level,
-                Some(egui::WindowLevel::AlwaysOnTop)
-            );
-            assert_eq!(
-                native_options(false, None, None, Geometry::default())
-                    .viewport
-                    .taskbar,
-                Some(true)
-            );
-        }
     }
 
     #[cfg(feature = "demo")]
@@ -1131,7 +852,7 @@ mod native_window_tests {
     fn demo_size_parses_width_by_height() {
         assert_eq!(parse_demo_size("760x800").unwrap(), [760.0, 800.0]);
         assert!(parse_demo_size("wide").is_err());
-        let options = native_options(false, None, Some([760.0, 800.0]), Geometry::default());
+        let options = native_options(false, Some([760.0, 800.0]), Geometry::default());
         assert_eq!(options.viewport.inner_size, Some(egui::vec2(760.0, 800.0)));
         assert_eq!(
             options.viewport.min_inner_size,
@@ -1141,33 +862,6 @@ mod native_window_tests {
             options.viewport.max_inner_size,
             Some(egui::vec2(760.0, 800.0))
         );
-    }
-
-    #[test]
-    fn demo_window_storage_is_separate_and_never_saved() {
-        let cache = std::path::PathBuf::from("isolated-demo/cache");
-        for mini in [
-            None,
-            Some(MiniWindow {
-                size: egui::vec2(550.0, 232.0),
-                geometry: Geometry::default(),
-                on_top: false,
-                taskbar: true,
-                storage_path: cache.join("winamp.ron"),
-            }),
-        ] {
-            let options = demo_native_options(
-                native_options(false, mini, Some([760.0, 520.0]), Geometry::default()),
-                cache.join("demo-window.ron"),
-            );
-            assert_eq!(
-                options.persistence_path,
-                Some(cache.join("demo-window.ron"))
-            );
-            assert!(!options.persist_window);
-            // Shell keeps this policy in its own field, so it holds even
-            // after on_exit has handed the App back.
-        }
     }
 
     #[test]
@@ -1347,7 +1041,9 @@ impl eframe::App for Shell {
                 MenuCommand::Back => Action::Back,
                 MenuCommand::Forward => Action::Forward,
                 MenuCommand::OpenRepo => {
-                    ctx.open_url(egui::OpenUrl::new_tab("https://github.com/crmne/spotifast"));
+                    ctx.open_url(egui::OpenUrl::new_tab(
+                        "https://github.com/JoAz111/spotifast",
+                    ));
                     continue;
                 }
                 // Editing goes through egui, which owns the text field
@@ -1408,14 +1104,8 @@ impl eframe::App for Shell {
             .sync(app.thumb_state(ui.ctx().system_theme() != Some(egui::Theme::Light)));
     }
 
-    /// The mini player's window is see-through where the skin leaves it
-    /// out; the big window paints itself over eframe's own ground.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        if self.app.settings.winamp_window {
-            [0.0; 4]
-        } else {
-            egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180).to_normalized_gamma_f32()
-        }
+        self.app.palette.window.to_normalized_gamma_f32()
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

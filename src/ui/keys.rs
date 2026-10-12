@@ -14,8 +14,6 @@ pub(super) const fn platform_shortcut<'a>(ctrl: &'a str, cmd: &'a str) -> &'a st
 
 pub(super) const SIDEBAR_SHORTCUT: &str = platform_shortcut("Ctrl+B", "Cmd+B");
 pub(super) const QUIT_SHORTCUT: &str = platform_shortcut("Ctrl+Q", "Cmd+Q");
-pub(super) const WINAMP_SHORTCUT: &str = platform_shortcut("Ctrl+M", "Cmd+Shift+M");
-pub(super) const MILKDROP_SHORTCUT: &str = platform_shortcut("Ctrl+Shift+K", "Cmd+Shift+K");
 
 pub fn handle(app: &mut App, ctx: &egui::Context) {
     let typing = ctx.memory(|memory| memory.focused().is_some());
@@ -57,8 +55,7 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
         key(Modifiers::COMMAND, Key::Comma, Action::Open(Page::Settings));
         key(Modifiers::COMMAND, Key::Q, Action::Quit);
         // The platform's close key. macOS only closes a window from its
-        // menu, which winit does not install, and the mini player has no
-        // title bar for the system to close it by.
+        // menu, which winit does not install,
         key(Modifiers::COMMAND, Key::W, Action::CloseWindow);
         // winit installs its own macOS app menu, whose Hide item owns Cmd+H
         // before the window is offered the key.
@@ -72,22 +69,6 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             key(Modifiers::COMMAND, Key::H, Action::Open(Page::Home));
         }
         key(Modifiers::COMMAND, Key::L, Action::Open(Page::LikedSongs));
-        // Cmd+M minimises on macOS.
-        if cfg!(target_os = "macos") {
-            key(
-                Modifiers::COMMAND | Modifiers::SHIFT,
-                Key::M,
-                Action::ToggleWinampWindow,
-            );
-        } else {
-            key(Modifiers::COMMAND, Key::M, Action::ToggleWinampWindow);
-        }
-        // Winamp's key for starting and stopping the visualisation plug-in.
-        key(
-            Modifiers::COMMAND | Modifiers::SHIFT,
-            Key::K,
-            Action::ToggleWinampMilkdrop,
-        );
         key(
             Modifiers::COMMAND,
             Key::Slash,
@@ -264,26 +245,6 @@ pub fn shortcuts(locale: Locale) -> Vec<(Cow<'static, str>, Cow<'static, str>)> 
         (
             keys(platform_shortcut("Ctrl+Shift+B", "Cmd+Shift+B")),
             gettext(locale, "Go to the playing album"),
-        ),
-        (keys(WINAMP_SHORTCUT), gettext(locale, "Winamp mini player")),
-        (
-            keys(MILKDROP_SHORTCUT),
-            gettext(locale, "MilkDrop, under the mini player"),
-        ),
-        (
-            // Translators: Keep the key name F. Translate "or" and "double-click".
-            gettext(locale, "F  or  double-click"),
-            gettext(locale, "MilkDrop: fill the screen"),
-        ),
-        (keys("→  /  N"), gettext(locale, "MilkDrop: next preset")),
-        (
-            keys("←  /  P"),
-            gettext(locale, "MilkDrop: previous preset"),
-        ),
-        (keys("L"), gettext(locale, "MilkDrop: keep this preset")),
-        (
-            keys("Esc"),
-            gettext(locale, "MilkDrop: leave full screen, or close"),
         ),
         (
             keys(platform_shortcut("Ctrl+,", "Cmd+,")),
@@ -478,19 +439,11 @@ mod tests {
     #[test]
     fn shortcut_constants_name_the_platform_modifier() {
         let expected = if cfg!(target_os = "macos") {
-            ["Cmd+B", "Cmd+Q", "Cmd+Shift+M", "Cmd+Shift+K"]
+            ["Cmd+B", "Cmd+Q"]
         } else {
-            ["Ctrl+B", "Ctrl+Q", "Ctrl+M", "Ctrl+Shift+K"]
+            ["Ctrl+B", "Ctrl+Q"]
         };
-        assert_eq!(
-            [
-                SIDEBAR_SHORTCUT,
-                QUIT_SHORTCUT,
-                WINAMP_SHORTCUT,
-                MILKDROP_SHORTCUT,
-            ],
-            expected
-        );
+        assert_eq!([SIDEBAR_SHORTCUT, QUIT_SHORTCUT], expected);
     }
 
     #[test]
@@ -516,10 +469,8 @@ mod tests {
         };
         if cfg!(target_os = "macos") {
             assert_eq!(label("Home"), "Cmd+Shift+H");
-            assert_eq!(label("Winamp mini player"), "Cmd+Shift+M");
         } else {
             assert_eq!(label("Home"), "Ctrl+H");
-            assert_eq!(label("Winamp mini player"), "Ctrl+M");
         }
     }
 

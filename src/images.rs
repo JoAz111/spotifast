@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use egui::load::{Bytes, BytesLoadResult, BytesLoader, BytesPoll, ImagePoll, LoadError};
@@ -19,6 +19,9 @@ use crate::http::Http;
 /// Size-based eviction keeps visible images stable.
 const HELD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ART_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ART_REQUESTS: usize = 4;
+const FAILED_ART_RETRY: Duration = Duration::from_secs(60);
+const HELD_FAILURES: usize = 256;
 
 /// Decoded ColorImage plus the GPU texture, both RGBA.
 fn decoded_and_texture_bytes(width: usize, height: usize) -> usize {
@@ -31,6 +34,28 @@ fn is_http(uri: &str) -> bool {
     uri.starts_with("https://") || uri.starts_with("http://")
 }
 
+/// Only Spotify's artwork hosts are allowed to receive requests from the client.
+fn allowed_artwork_url(uri: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(uri) else {
+        return false;
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    #[cfg(test)]
+    if url.scheme() == "http" && url.host_str() == Some("127.0.0.1") {
+        return true;
+    }
+    url.scheme() == "https"
+        && url.port_or_known_default() == Some(443)
+        && url.host_str().is_some_and(|host| {
+            host == "scdn.co"
+                || host.ends_with(".scdn.co")
+                || host == "spotifycdn.com"
+                || host.ends_with(".spotifycdn.com")
+        })
+}
+
 enum Entry {
     Pending,
     Ready {
@@ -39,11 +64,19 @@ enum Entry {
         /// JPEG bytes still held, plus decoded image and texture once painted.
         retained: usize,
     },
-    Failed(String),
+    Failed {
+        error: String,
+        retry_at: Option<Instant>,
+        failed_at: Instant,
+    },
 }
+
+type ArtworkRequest = tokio::sync::Mutex<Option<Result<Arc<[u8]>, String>>>;
 
 struct Inner {
     entries: Mutex<HashMap<String, Entry>>,
+    requests: Mutex<HashMap<String, Weak<ArtworkRequest>>>,
+    slots: tokio::sync::Semaphore,
     http: Http,
     runtime: tokio::runtime::Handle,
     cache_dir: PathBuf,
@@ -60,6 +93,8 @@ impl ArtLoader {
         Self {
             inner: Arc::new(Inner {
                 entries: Mutex::new(HashMap::new()),
+                requests: Mutex::new(HashMap::new()),
+                slots: tokio::sync::Semaphore::new(MAX_ART_REQUESTS),
                 http: http.into(),
                 runtime,
                 cache_dir,
@@ -97,16 +132,15 @@ impl ArtLoader {
         }
     }
 
-    /// Evicts failed entries and the oldest artwork above the memory limit.
+    /// Evicts the oldest artwork above the memory limit and bounds failure history.
     pub fn evict(&self, ctx: &egui::Context) {
         let letting_go: Vec<String> = {
             let entries = self.inner.entries.lock().unwrap_or_else(|p| p.into_inner());
-            let mut failed: Vec<String> = Vec::new();
+            let mut failures = Vec::new();
             let mut held: Vec<(String, Instant, usize)> = Vec::new();
             for (url, entry) in entries.iter() {
                 match entry {
-                    // Forget failures so a later request can retry.
-                    Entry::Failed(_) => failed.push(url.clone()),
+                    Entry::Failed { failed_at, .. } => failures.push((url.clone(), *failed_at)),
                     Entry::Ready {
                         last_used,
                         retained,
@@ -117,8 +151,15 @@ impl ArtLoader {
                     Entry::Pending => {}
                 }
             }
-            failed.extend(over_budget(held, HELD_BYTES));
-            failed
+            failures.sort_by_key(|(_, at)| *at);
+            let overflow = failures.len().saturating_sub(HELD_FAILURES);
+            let mut letting_go: Vec<String> = failures
+                .into_iter()
+                .take(overflow)
+                .map(|(url, _)| url)
+                .collect();
+            letting_go.extend(over_budget(held, HELD_BYTES));
+            letting_go
         };
         for url in letting_go {
             ctx.forget_image(&url);
@@ -147,7 +188,7 @@ impl ArtLoader {
     /// Artwork already held, already on its way, or addressed by a scheme
     /// this loader does not answer for is left alone.
     pub fn prefetch(&self, ctx: &egui::Context, url: &str) -> bool {
-        if !is_http(url) {
+        if !allowed_artwork_url(url) {
             return false;
         }
         let mut entries = self.inner.entries.lock().unwrap_or_else(|p| p.into_inner());
@@ -221,6 +262,27 @@ fn over_budget(mut held: Vec<(String, Instant, usize)>, budget: usize) -> Vec<St
     letting_go
 }
 
+struct FetchError {
+    message: String,
+    retryable: bool,
+}
+
+impl FetchError {
+    fn transient(message: String) -> Self {
+        Self {
+            message,
+            retryable: true,
+        }
+    }
+
+    fn too_large() -> Self {
+        Self {
+            message: "artwork is too large".into(),
+            retryable: false,
+        }
+    }
+}
+
 impl Inner {
     fn cache_path(&self, url: &str) -> PathBuf {
         let digest = Sha1::digest(url.as_bytes());
@@ -232,55 +294,149 @@ impl Inner {
         self.cache_dir.join(name)
     }
 
-    async fn fetch(self: &Arc<Self>, url: &str) -> Result<Arc<[u8]>, String> {
-        if let Some(Entry::Ready {
-            bytes: Some(bytes), ..
-        }) = self
-            .entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(url)
-        {
-            return Ok(Arc::clone(bytes));
+    /// Serialize consumers of the same URL, including non-egui callers. The
+    /// weak registry does not retain work or image payloads after callers leave.
+    fn request_lock(&self, url: &str) -> Arc<ArtworkRequest> {
+        let mut requests = self.requests.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(request) = requests.get(url).and_then(Weak::upgrade) {
+            return request;
         }
+        if requests.len() >= HELD_FAILURES {
+            requests.retain(|_, request| request.strong_count() > 0);
+        }
+        let request = Arc::new(tokio::sync::Mutex::new(None));
+        requests.insert(url.to_string(), Arc::downgrade(&request));
+        request
+    }
+
+    async fn fetch(self: &Arc<Self>, url: &str) -> Result<Arc<[u8]>, String> {
+        if !allowed_artwork_url(url) {
+            return Err("Artwork host is outside Spotify".into());
+        }
+        let request = self.request_lock(url);
+        let mut request = request.lock().await;
+        if let Some(result) = &*request {
+            return result.clone();
+        }
+        {
+            let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+            match entries.get_mut(url) {
+                Some(Entry::Ready {
+                    bytes: Some(bytes),
+                    last_used,
+                    ..
+                }) => {
+                    *last_used = Instant::now();
+                    return Ok(Arc::clone(bytes));
+                }
+                Some(Entry::Failed {
+                    error, retry_at, ..
+                }) if retry_at.is_none_or(|at| Instant::now() < at) => {
+                    return Err(error.clone());
+                }
+                _ => {}
+            }
+        }
+        // Limit active disk/network payloads, rather than allowing an entire
+        // first screen of covers to download concurrently.
+        let _slot = self
+            .slots
+            .acquire()
+            .await
+            .map_err(|error| error.to_string())?;
+        let result = self.fetch_bytes(url).await;
+        let now = Instant::now();
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = match &result {
+            Ok(bytes) => {
+                let decoded = match entries.get(url) {
+                    Some(Entry::Ready {
+                        retained, bytes, ..
+                    }) => retained.saturating_sub(bytes.as_ref().map_or(0, |bytes| bytes.len())),
+                    _ => 0,
+                };
+                Entry::Ready {
+                    retained: decoded + bytes.len(),
+                    bytes: Some(Arc::clone(bytes)),
+                    last_used: now,
+                }
+            }
+            Err(error) => Entry::Failed {
+                error: error.message.clone(),
+                retry_at: error.retryable.then_some(now + FAILED_ART_RETRY),
+                failed_at: now,
+            },
+        };
+        entries.insert(url.to_string(), entry);
+        let result = result.map_err(|error| error.message);
+        *request = Some(result.clone());
+        result
+    }
+
+    async fn fetch_bytes(&self, url: &str) -> Result<Arc<[u8]>, FetchError> {
         let path = self.cache_path(url);
         let cached = tokio::task::spawn_blocking({
             let path = path.clone();
-            move || std::fs::read(path).ok()
+            move || {
+                use std::io::Read;
+                let file = std::fs::File::open(path).ok()?;
+                let mut bytes = Vec::new();
+                file.take(MAX_ART_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                (!bytes.is_empty() && bytes.len() <= MAX_ART_BYTES).then_some(bytes)
+            }
         })
         .await
         .ok()
         .flatten();
-        let bytes: Arc<[u8]> = match cached {
-            Some(bytes) if !bytes.is_empty() => Arc::from(bytes),
-            _ => {
-                let response = self
-                    .http
-                    .client()?
-                    .get(url)
-                    .send()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if !response.status().is_success() {
-                    return Err(format!("artwork request failed: {}", response.status()));
-                }
-                let bytes = response.bytes().await.map_err(|error| error.to_string())?;
-                if bytes.len() > MAX_ART_BYTES {
-                    return Err("artwork is too large".to_string());
-                }
-                // The loader and file worker share one immutable payload.
-                let bytes: Arc<[u8]> = Arc::from(bytes.as_ref());
-                let write_path = path.clone();
-                let payload = Arc::clone(&bytes);
-                self.runtime.spawn_blocking(move || {
-                    let temporary = write_path.with_extension("part");
-                    if std::fs::write(&temporary, &payload).is_ok() {
-                        let _ = std::fs::rename(&temporary, &write_path);
-                    }
-                });
-                bytes
+        if let Some(bytes) = cached {
+            return Ok(Arc::from(bytes));
+        }
+        let mut response = self
+            .http
+            .client()
+            .map_err(FetchError::transient)?
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| FetchError::transient(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(FetchError {
+                message: format!("artwork request failed: {}", response.status()),
+                retryable: response.status().is_server_error()
+                    || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS,
+            });
+        }
+        if response
+            .content_length()
+            .is_some_and(|size| size > MAX_ART_BYTES as u64)
+        {
+            return Err(FetchError::too_large());
+        }
+        let mut payload = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| FetchError::transient(error.to_string()))?
+        {
+            if chunk.len() > MAX_ART_BYTES.saturating_sub(payload.len()) {
+                return Err(FetchError::too_large());
             }
-        };
+            payload.extend_from_slice(&chunk);
+        }
+        // The loader and file worker share one immutable payload.
+        let bytes: Arc<[u8]> = Arc::from(payload);
+        let payload = Arc::clone(&bytes);
+        let _ = self
+            .runtime
+            .spawn_blocking(move || {
+                let temporary = path.with_extension("part");
+                if std::fs::write(&temporary, &payload).is_ok() {
+                    let _ = std::fs::rename(&temporary, &path);
+                }
+            })
+            .await;
         Ok(bytes)
     }
 
@@ -288,20 +444,7 @@ impl Inner {
         let loader = Arc::clone(self);
         let ctx = ctx.clone();
         self.runtime.spawn(async move {
-            let result = loader.fetch(&url).await;
-            let entry = match result {
-                Ok(bytes) => Entry::Ready {
-                    retained: bytes.len(),
-                    bytes: Some(bytes),
-                    last_used: Instant::now(),
-                },
-                Err(error) => Entry::Failed(error),
-            };
-            loader
-                .entries
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(url, entry);
+            let _ = loader.fetch(&url).await;
             ctx.request_repaint();
         });
     }
@@ -330,6 +473,9 @@ impl BytesLoader for ArtLoader {
         if !is_http(uri) {
             return Err(LoadError::NotSupported);
         }
+        if !allowed_artwork_url(uri) {
+            return Err(LoadError::NotSupported);
+        }
         let mut entries = self.inner.entries.lock().unwrap_or_else(|p| p.into_inner());
         match entries.get_mut(uri) {
             Some(Entry::Ready {
@@ -356,7 +502,15 @@ impl BytesLoader for ArtLoader {
                 Ok(BytesPoll::Pending { size: None })
             }
             Some(Entry::Pending) => Ok(BytesPoll::Pending { size: None }),
-            Some(Entry::Failed(error)) => Err(LoadError::Loading(error.clone())),
+            Some(Entry::Failed { retry_at, .. })
+                if retry_at.is_some_and(|at| Instant::now() >= at) =>
+            {
+                entries.insert(uri.to_string(), Entry::Pending);
+                drop(entries);
+                self.inner.start(ctx, uri.to_string());
+                Ok(BytesPoll::Pending { size: None })
+            }
+            Some(Entry::Failed { error, .. }) => Err(LoadError::Loading(error.clone())),
             None => {
                 entries.insert(uri.to_string(), Entry::Pending);
                 drop(entries);
@@ -454,7 +608,7 @@ pub struct LyricsBackdrop {
 }
 
 /// How long a backdrop whose artwork failed to download waits to ask again.
-const BACKDROP_RETRY: Duration = Duration::from_secs(3);
+const BACKDROP_RETRY: Duration = FAILED_ART_RETRY;
 
 impl LyricsBackdrop {
     /// The blurred backdrop for `uri`.
@@ -480,7 +634,7 @@ impl LyricsBackdrop {
         }
         let uri = uri?;
         let due = self.retry_at.is_none_or(|at| Instant::now() >= at);
-        if !self.requested && due && is_http(uri) {
+        if !self.requested && due && allowed_artwork_url(uri) {
             self.requested = true;
             self.retry_at = None;
             let (tx, rx) = std::sync::mpsc::channel();
@@ -691,7 +845,7 @@ mod tests {
                     assert!(request.len() < 8192);
                 }
                 socket.write_all(header.as_bytes()).await.unwrap();
-                socket.write_all(&bytes).await.unwrap();
+                let _ = socket.write_all(&bytes).await;
             })
             .await
             .expect("the owned artwork request completes");
@@ -822,6 +976,128 @@ mod tests {
     }
 
     #[test]
+    fn artwork_consumers_share_one_request_and_one_payload() {
+        let dir =
+            std::env::temp_dir().join(format!("spotifast-art-coalesced-{}", std::process::id()));
+        let runtime = artwork_test_runtime();
+        let loader = artwork_test_loader(&runtime, dir.clone());
+        runtime.block_on(async {
+            let (url, server) = serve_artwork("200 OK", vec![7; 32 * 1024]).await;
+            let ctx = egui::Context::default();
+            assert!(matches!(
+                loader.load(&ctx, &url),
+                Ok(BytesPoll::Pending { .. })
+            ));
+            assert!(!loader.prefetch(&ctx, &url));
+            let mut consumers = tokio::task::JoinSet::new();
+            for _ in 0..8 {
+                let loader = loader.clone();
+                let url = url.clone();
+                consumers.spawn(async move { loader.fetch(&url).await.unwrap() });
+            }
+            let first = consumers.join_next().await.unwrap().unwrap();
+            while let Some(result) = consumers.join_next().await {
+                assert!(
+                    Arc::ptr_eq(&first, &result.unwrap()),
+                    "consumers share the original allocation"
+                );
+            }
+            server.await.unwrap();
+            assert!(loader.is_ready(&url));
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_artwork_is_not_retried_by_frames_or_periodic_eviction() {
+        let dir =
+            std::env::temp_dir().join(format!("spotifast-art-negative-{}", std::process::id()));
+        let runtime = artwork_test_runtime();
+        let loader = artwork_test_loader(&runtime, dir.clone());
+        runtime.block_on(async {
+            let (url, server) = serve_artwork("404 Not Found", Vec::new()).await;
+            let first = loader.fetch(&url).await.unwrap_err();
+            server.await.unwrap();
+            let ctx = egui::Context::default();
+            for _ in 0..50 {
+                loader.evict(&ctx);
+                assert!(matches!(
+                    loader.load(&ctx, &url),
+                    Err(LoadError::Loading(_))
+                ));
+                assert!(!loader.prefetch(&ctx, &url));
+                assert_eq!(loader.fetch(&url).await.unwrap_err(), first);
+            }
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn transient_artwork_failures_retry_after_their_deadline() {
+        let dir =
+            std::env::temp_dir().join(format!("spotifast-art-transient-{}", std::process::id()));
+        let runtime = artwork_test_runtime();
+        let loader = artwork_test_loader(&runtime, dir.clone());
+        runtime.block_on(async {
+            let (url, server) = serve_artwork("503 Service Unavailable", Vec::new()).await;
+            let first = loader.fetch(&url).await.unwrap_err();
+            server.await.unwrap();
+            std::fs::write(loader.inner.cache_path(&url), b"recovered").unwrap();
+            assert_eq!(
+                loader.fetch(&url).await.unwrap_err(),
+                first,
+                "the cooldown remains in force"
+            );
+            match loader.inner.entries.lock().unwrap().get_mut(&url) {
+                Some(Entry::Failed { retry_at, .. }) => *retry_at = Some(Instant::now()),
+                _ => panic!("the failed request is remembered"),
+            }
+            assert_eq!(&*loader.fetch(&url).await.unwrap(), b"recovered");
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_artwork_headers_are_rejected_without_waiting_for_the_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(format!("spotifast-art-limit-{}", std::process::id()));
+        let runtime = artwork_test_runtime();
+        let loader = artwork_test_loader(&runtime, dir.clone());
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/cover", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                            MAX_ART_BYTES + 1
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                // Keep the connection open without a body. Rejection must be
+                // based on the header, before a large allocation or timeout.
+                let mut byte = [0];
+                let _ = socket.read(&mut byte).await;
+            });
+            let result = tokio::time::timeout(Duration::from_secs(2), loader.fetch(&url))
+                .await
+                .expect("the header is enough to reject the response");
+            assert_eq!(result.unwrap_err(), "artwork is too large");
+            server.abort();
+        });
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn transient_cover_load_errors_remain_retryable() {
         assert!(!terminal_art_error(&LoadError::Loading(
             "temporary network failure".into()
@@ -946,6 +1222,11 @@ mod tests {
         assert_eq!(backdrop.texture.as_ref().map(|t| t.id()), Some(shown));
 
         cached_png(&loader, second, [40, 40, 200]);
+        if let Some(Entry::Failed { retry_at, .. }) =
+            loader.inner.entries.lock().unwrap().get_mut(second)
+        {
+            *retry_at = Some(Instant::now());
+        }
         backdrop.retry_at = Some(Instant::now());
         backdrop_frames(
             &runtime,
@@ -1408,5 +1689,26 @@ mod tests {
         loader.forget_all();
         assert!(loader.inner.entries.lock().expect("lock").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::allowed_artwork_url;
+    #[test]
+    fn artwork_cannot_contact_external_hosts_or_smuggle_credentials() {
+        assert!(allowed_artwork_url("https://i.scdn.co/image/abc"));
+        assert!(allowed_artwork_url(
+            "https://image-cdn-ak.spotifycdn.com/image/abc"
+        ));
+        for url in [
+            "https://example.com/cover",
+            "https://i.scdn.co.evil.test/cover",
+            "http://i.scdn.co/image/abc",
+            "https://user@i.scdn.co/image/abc",
+            "https://i.scdn.co:8443/image/abc",
+        ] {
+            assert!(!allowed_artwork_url(url), "{url}");
+        }
     }
 }

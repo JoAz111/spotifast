@@ -64,6 +64,9 @@ impl From<reqwest::Client> for Http {
 
 pub fn build_client(proxy: &ProxyConfig) -> Result<reqwest::Client, String> {
     client_builder(proxy)?
+        // Spotify API/auth/artwork endpoints are direct. A metadata-provided
+        // redirect must not silently contact a different service.
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| error.without_url().to_string())

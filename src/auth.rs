@@ -2,7 +2,7 @@
 //!
 //! Three independent grants may exist because Spotify treats them differently:
 //!
-//! - The shared and optional personal **Web API grants** use separate
+//! - The private primary and legacy personal **Web API grants** use separate
 //!   registered application identities, protected entries, and request sessions.
 //! - The **playback grant** uses Spotify's desktop client identity, the one
 //!   librespot streams with. Its access token is exchanged once for a
@@ -30,9 +30,11 @@ use tokio::sync::watch;
 pub const PLAYBACK_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
 pub const PLAYBACK_REDIRECT_PORT: u16 = 8898;
 
-/// The public Web API application shared by spotify-player, ncspot, and
-/// Omarchy Spotify.
-pub const DEFAULT_WEB_CLIENT_ID: &str = "d420a117a32841c2b3474932e49fb54b";
+/// This machine's private build input. No upstream application is a fallback.
+#[cfg(not(test))]
+pub const PRIMARY_WEB_CLIENT_ID: &str = env!("SPOTIFAST_PRIVATE_WEB_CLIENT_ID");
+#[cfg(test)]
+pub const PRIMARY_WEB_CLIENT_ID: &str = "00000000000000000000000000000000";
 pub const WEB_REDIRECT_PORT: u16 = 8989;
 
 pub const REDIRECT_PATH: &str = "/login";
@@ -84,12 +86,17 @@ impl Grant {
         }
     }
 
-    pub fn shared_web_api() -> Self {
-        Self {
-            client_id: DEFAULT_WEB_CLIENT_ID.to_string(),
+    pub fn primary_web_api() -> Result<Self> {
+        if PRIMARY_WEB_CLIENT_ID.is_empty() {
+            bail!(
+                "This build needs its own Spotify application identity. Configure the local build input first."
+            );
+        }
+        Ok(Self {
+            client_id: PRIMARY_WEB_CLIENT_ID.to_string(),
             redirect_port: WEB_REDIRECT_PORT,
             scopes: WEB_SCOPES,
-        }
+        })
     }
 
     pub fn personal_web_api(client_id: &str) -> Result<Self> {
@@ -424,7 +431,7 @@ impl StoredToken {
         let Some(token) = Self::load(legacy) else {
             return Ok(());
         };
-        let target = if token.client_id == DEFAULT_WEB_CLIENT_ID {
+        let target = if token.client_id == PRIMARY_WEB_CLIENT_ID {
             shared
         } else {
             personal
@@ -576,13 +583,13 @@ mod tests {
 
     #[test]
     fn begin_produces_valid_pkce_material() {
-        let flow = begin(Grant::shared_web_api());
+        let flow = begin(Grant::primary_web_api().unwrap());
         assert!(flow.verifier.len() >= 43);
         assert!(flow.url.contains("code_challenge_method=S256"));
         assert!(flow.url.contains(&format!("state={}", flow.state)));
         assert!(
             flow.url
-                .contains(&format!("client_id={DEFAULT_WEB_CLIENT_ID}"))
+                .contains(&format!("client_id={PRIMARY_WEB_CLIENT_ID}"))
         );
         assert!(flow.url.contains("8989"));
         assert!(!flow.url.contains("show_dialog=true"));
@@ -660,7 +667,7 @@ mod tests {
         let shared = dir.join("shared.json");
         let personal = dir.join("personal.json");
         for (client_id, target) in [
-            (DEFAULT_WEB_CLIENT_ID, &shared),
+            (PRIMARY_WEB_CLIENT_ID, &shared),
             ("personal-client", &personal),
         ] {
             let token = StoredToken {

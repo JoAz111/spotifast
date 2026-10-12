@@ -2,8 +2,6 @@
 
 pub mod api;
 pub mod app;
-#[cfg(target_os = "linux")]
-pub mod appearance;
 pub mod auth;
 pub mod autoscroll;
 pub mod backend;
@@ -12,7 +10,6 @@ pub mod credentials;
 #[cfg(any(test, feature = "demo"))]
 pub mod demo;
 pub mod emoji;
-pub mod eq;
 pub mod history;
 pub mod http;
 pub mod i18n;
@@ -29,7 +26,6 @@ pub mod mac_menu;
 pub mod mac_notch;
 #[cfg(target_os = "macos")]
 pub mod mac_touchbar_crash_guard;
-pub mod milkdrop;
 pub mod model;
 pub mod notch;
 pub mod opener;
@@ -42,16 +38,12 @@ pub mod session_reads;
 pub mod settings;
 pub mod single_instance;
 pub mod sink;
-pub mod skin;
 pub mod soloist;
 pub mod sonos;
-pub mod system_fonts;
 pub mod theme;
 pub mod thumbbar;
 pub mod ui;
 pub mod updates;
 pub mod util;
-pub mod vis;
-pub mod winamp;
 pub mod window;
 pub mod zeroconf;

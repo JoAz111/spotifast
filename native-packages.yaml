@@ -38,14 +38,6 @@ nfpm:
     dst: "/usr/share/icons/hicolor/scalable/apps/"
     file_info:
       mode: 420
-  - src: contrib/omarchy/spotifast.json.tpl
-    dst: /usr/share/spotifast/omarchy/spotifast.json.tpl
-    file_info:
-      mode: 420
-  - src: contrib/omarchy/spotifast-theme
-    dst: /usr/share/spotifast/omarchy/spotifast-theme
-    file_info:
-      mode: 493
   overrides:
     # ELF inspection cannot discover the GUI's dlopen dependencies. Keep
     # these aligned with winit/glutin/rfd and packaging/check-runtime-libs.c.

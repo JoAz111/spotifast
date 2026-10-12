@@ -37,9 +37,8 @@ cannot play music through Spotifast on this computer or another device.
   result, to open that page.
 - **Background playback.** Closing the window keeps the music playing from
   the system tray. Use your keyboard's media keys to play, pause, and skip.
-- **Themes.** Choose light, dark, or your own colours. On Omarchy, Spotifast
-  can follow your desktop theme automatically. Pages can also take a colour
-  from album art.
+- **Focused appearance.** One dark music interface, with album artwork and no
+  skins, theme packs, visualizers or equalizer windows.
 
 <a id="account-safety"></a>
 

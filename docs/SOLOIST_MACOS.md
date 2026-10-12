@@ -15,10 +15,10 @@ Soloist's local protocol exposes neither the account ID nor the Connect device I
 ## Current limitations
 
 - Premium and a personal Soloist API key are required. Keys are entered locally in a native secure field and stored in Keychain, never in chat or source.
-- Official Soloist supports Premium lossless up to 24-bit/44.1 kHz. This build must still verify authenticated playback and the actual output format on the target Mac. A successful startup or float32 audio sink alone does not prove lossless or bit-perfect output.
+- Official Soloist supports Premium lossless up to 24-bit/44.1 kHz. This Mac has authenticated, decoded FLAC at 44.1 kHz and passed user tests for track changes, pause/resume and smooth sound with a 500 ms buffer. A successful startup or float32 audio sink alone does not prove lossless or bit-perfect output.
 - Queue clear, removal and reordering are disabled for Soloist because its documented local API does not provide them. Queue queries request at most 80 items. Unsolicited queue broadcasts can contain only 10; query and broadcast messages have no IDs, so a racing broadcast can be a current but shortened snapshot.
 - Crossfade/Automix and other engine capabilities do not automatically become interface controls. Smart Shuffle, Jam, DJ, offline downloads and full Spotify feature parity are not implemented here.
-- Spotifast's equalizer, audio-cache/bitrate controls and audio visualizers do not control external Soloist audio and are hidden in this mode.
+- Skins, custom themes, Winamp layouts, equalizer and visualizers are removed. There is one dark appearance. Soloist audio output selection lives under Settings → Audio output….
 - The compatibility runtime targets Apple Silicon. Intel Mac, Windows and Linux Soloist integration have not been qualified by this change.
 
 ## Local setup and lifecycle
@@ -27,7 +27,7 @@ The combined native launcher selects the official engine file stored separately 
 
 The packaged runtime uses a dedicated `~/Library/Application Support/Spotifast Soloist` profile. The Rust app also uses its own `spotifast-soloist` profile so it does not migrate or overwrite the original Spotifast profile. The key and each Spotify grant are separate credentials.
 
-Start the receiver, pair the named receiver using Spotify Connect, and sign into the music interface with that account. Optional **Playlist and lyrics access** in Settings opens the separate streaming-permission browser approval needed for internal metadata reads. Normal library and catalog access use the Web API grant.
+Paste the Soloist key once and continue. Later launches start the saved receiver and open the music window automatically. Initial Connect pairing and Spotify browser sign-in still require the same account. The Web API uses a locally embedded developer Client ID from the Git-ignored `.private/spotify-client-id` file; it never falls back to the upstream shared registration. Optional **Playlist and lyrics access** in Settings opens the separate streaming-permission browser approval needed for internal metadata reads. Normal library and catalog access use the Web API grant.
 
 Quitting the music interface stops its owned receiver. Spotifast sign-out cancels pending commands and requests an explicit pause; it does not revoke Soloist's independently paired session. The launcher's reset-pairing action clears only its initialized local receiver state and cache, retaining the API key. It does not revoke a cloud account grant.
 

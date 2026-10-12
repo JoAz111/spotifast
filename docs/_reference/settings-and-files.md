@@ -13,8 +13,6 @@ Spotifast follows each platform's conventions. On Linux:
 | What | Where | Safe to delete? |
 | --- | --- | --- |
 | Settings | `~/.config/spotifast/settings.json` | Yes, you lose preferences |
-| Winamp skins | `~/.config/spotifast/skins/` | Yes, you add them again |
-| MilkDrop presets | `~/.config/spotifast/milkdrop/` | Yes, you fetch them again |
 | Spotify grants (available since 0.8.0) | System credential store | Use Sign out in Settings |
 | Credential revocation markers (available since 0.8.0) | `~/.local/state/spotifast/credential-storage/` | Keep after a failed sign-out deletion |
 | Legacy shared Web API grant | `~/.local/state/spotifast/shared_web_api_token.json` | Removed after migration or sign-out |
@@ -157,18 +155,12 @@ their rows stay in memory until the write and its snapshot are confirmed,
 even if this temporarily exceeds the usual page limit. Track metadata is
 limited to 800 cached tracks; navigation and periodic cleanup trim old entries.
 
-The session remembers separate positions for the main window and the Winamp
-mini player, and the main window's size and whether it was maximized. Sizes
-and positions are in logical pixels, so they do not change with the interface
-zoom. Each window is created at its remembered place rather than moved there
-afterwards. The shade modes are kept in `settings.json`. Wayland compositors
-may ignore saved positions. A window that opens on no connected monitor (a
-display unplugged since) moves to the middle of the primary one on Windows
-and X11; on macOS, a position whose title bar would be on no screen is not
-used.
+The session remembers the main window's position, size and maximized state in
+logical pixels. Wayland compositors may ignore saved positions. Off-screen
+positions are corrected when a monitor has been disconnected.
 
 Since 0.8.0, a main window left maximized or full
-screen reopens that way, and comes back that way from the mini player. The
+screen reopens that way. The
 remembered size and position describe an ordinary window and are not applied
 to one that already fills the screen, because sizing or moving such a window
 restores it down.
@@ -230,14 +222,7 @@ main fields are:
 | `gapless` | `true` | Gapless playback |
 | `audio_backend` | platform | `pulseaudio` or `rodio` on Linux. `rodio` is Spotifast's own output, through ALSA; librespot's separate rodio backend is no longer built in, and a backend this build lacks plays through Spotifast's own output |
 | `audio_cache_mb` | `1024` | On-disk audio cache budget |
-| `theme` | `system` | Follow the system appearance by default; explicit `dark` and `light` choices remain available |
 | `language` | `system` | Since 0.10.0: the interface language. `system` follows the operating system's preferred languages and falls back to English; a tag such as `es`, `de-DE`, `pt-BR` or `zh-Hant` selects that language. An unknown tag follows the system |
-| `custom_theme` | `null` | Selected JSON filename from the `themes` folder |
-| `custom_theme_cache` | absent | Last accepted custom palette; preserves appearance if its file is missing or invalid |
-| `system_theme_cache` | absent | Last accepted Omarchy palette for Follow system; retained across restarts |
-| `accent_from_art` | `true` | Tint pages with album art |
-| `player_bar_vis` | `off` | Since 0.11.0: what moves behind the player bar while a song plays on this computer: `off`, `spectrum` or `waveform` |
-| `player_bar_vis_click` | `true` | Allow clicks on empty player bar space to cycle visualizer modes |
 | `library_sort` | `{}` | Per-section Library order overrides, since 0.8.0: `library`, `recently_played`, `name`, `recently_added`, `local`, or `spotify`, where supported |
 | `sidebar_order` | `[]` | Saved local playlist arrangement, including an unpinned Liked Songs, retained when another sort is selected |
 | `pinned_contexts` | `[]` | Local Library pin order; Liked Songs uses `spotifast:liked-songs`, a local key never sent to Spotify |
@@ -246,36 +231,11 @@ main fields are:
 | `sidebar_grid` | `false` | Library entries as responsive cover cards instead of rows |
 | `tracklist_compact` | `false` | One-line track rows without covers |
 | `middle_click_autoscroll` | `false` | Linux only: middle-click a list to autoscroll it. Windows always autoscrolls and macOS never does |
-| `winamp_window` | `false` | The window is the Winamp mini player |
-| `winamp_show_taskbar` | `true` | Windows since 0.8.0, and Linux X11 sessions: show the Winamp window's taskbar button; the main window always keeps its button. Wayland and macOS ignore it |
 | `custom_titlebar` | `false` | Windows and Linux: draw Spotifast's own title bar and window buttons instead of the desktop's |
-| `skin` | none | File or folder name in the skins folder; blank uses the built-in skin |
-| `random_skin` | `false` | Since 0.11.0: pick a different skin (built-in or installed) each time the mini player opens; `skin` holds the one picked |
-| `skin_scale` | by display | Screen pixels per skin pixel, 1 to 4 |
-| `winamp_on_top` | `false` | Keep the mini player above other windows |
-| `vis` | `bars` | The mini player's visualiser: `bars`, `scope`, or `off` |
-| `playlist_open` | `false` | The playlist window is open under the mini player |
-| `playlist_height` | `174` | The playlist window's height in skin pixels |
-| `eq_open` | `false` | The equalizer window is open under the mini player |
-| `eq_on` | `false` | The equalizer shapes local playback |
-| `eq_preamp_db` | `0` | The preamp, in decibels, -12 to 12 |
-| `eq_bands_db` | ten zeros | The bands from 60 Hz to 16 kHz, in decibels, -12 to 12 |
-| `balance` | `0` | Left to right, -1 to 1, for local playback |
-| `mono` | `false` | Play both channels the same |
-| `playlist_shaded` | `false` | The playlist window is rolled up to its title bar |
-| `winamp_shaded` | `false` | The main window is rolled up to its title bar |
-| `milkdrop_open` | `false` | The MilkDrop window is open |
-| `milkdrop_seconds` | `30` | How long each MilkDrop preset plays |
-| `milkdrop_fps` | `60` | MilkDrop frame rate; `0` is uncapped |
-| `milkdrop_screen_hz` | `0` | Last reported display refresh rate |
-| `milkdrop_fullscreen` | `false` | The MilkDrop window fills the screen |
-| `milkdrop_size` | `640, 480` | The MilkDrop window's size in points |
 | `keep_playing_in_background` | `true` | Close to tray |
 | `mac_notch_widget` | `false` | Show interactive Now Playing widget when hovering over the MacBook notch (macOS only) |
 | `check_for_updates` | `true` | Ask GitHub once a day for a newer release |
 | `web_client_id` | none | Optional personal Spotify app id used alongside shared coverage |
-| `personal_app_nudge_at` | none | Legacy daily-reminder timestamp, retained for older releases |
-| `personal_app_intro_seen` | `false` | Whether the Premium personal-app introduction was dismissed or followed (available since 0.8.0) |
 | `proxy_mode` | `system` | `off`, `system`, `http`, or `socks`. Older files without this field stay on `system` |
 | `proxy_host` | none | Host of a manual HTTP or SOCKS5 proxy. Ignored when the mode is `off` or `system` |
 | `proxy_port` | none | Port of a manual HTTP or SOCKS5 proxy |
@@ -308,21 +268,18 @@ settings.
 
 `--demo-page` opens a page, such as `home`, `playlist:pl1`, or `artist:art0`,
 and `--demo-show` adds surfaces on top of it: a comma separated list of
-`queue`, `playing-next`, `devices`, `shortcuts`, `premium`, `create`, `duplicate`, `light`,
-`focus`, `winamp`, `playlist`, `eq`, `eq-shade`, `compact`, `update`, `personal-app`,
+`queue`, `playing-next`, `devices`, `shortcuts`, `premium`, `create`, `duplicate`,
+`focus`, `compact`, `update`,
 `collection-loading`, `shuffle-selected`, `shuffle-started`, `library-list`,
 `library-list-narrow`, `library-list-wide`, `library-grid`, `library-grid-narrow`,
-`library-grid-wide`, `rtl`, `player-bar-spectrum`, `player-bar-waveform`,
+`library-grid-wide`, `rtl`,
 `lyrics-fullscreen-view`, `lyrics-fullscreen-instrumental`, `signed-out`, and `connecting`. The Library variants show the list or cover grid with
 a normal, narrow, or wide sidebar and collapsed artwork for matching captures.
 `shuffle-selected` and `shuffle-started` capture the selected-mode and
 playback-started outcomes of a collection Shuffle click. `update` shows a sample
-update badge for checking its layout. `personal-app` shows the personal Spotify
-app introduction.
+update badge for checking its layout.
 `signed-out` and `connecting` show the sign-in card before and while the
 session connects.
-`player-bar-spectrum` and `player-bar-waveform` play a fixed, music-like
-sound on this computer with that player bar visualizer on.
 `lyrics-fullscreen-view` and `lyrics-fullscreen-instrumental` draw full-screen
 lyrics, with words or without, at the window's own size.
 `rtl` gives the first songs of `playlist:pl1` invented Hebrew and Arabic
@@ -350,8 +307,6 @@ Since 0.8.0, demo windows ignore saved window geometry and do not
 read or save the normal window's framework state. Existing built-in appearance
 settings still apply. `--demo-data <DIRECTORY>` keeps demo caches and logs under
 that directory's `cache` and `state` folders, with settings read from `config`.
-Custom palettes and their cache are used only with an explicit `--demo-data`
-directory; the ordinary demo does not scan your real themes folder.
 
 ## Home shelves
 
@@ -371,144 +326,8 @@ preferences keep both shelves visible. Other Home sections keep their normal
 order and contents. This changes what is displayed; hidden shelves still
 refresh in the background.
 
-## Custom themes
+## Appearance
 
-Since 0.11.0, Spotifast puts eight palettes in the `themes` folder beside
-`settings.json` the first time it starts: Catppuccin, Catppuccin Latte,
-Nord, Ristretto, Rose Pine, Rose Pine Dawn, Rose Pine Moon and Tokyo
-Night. They are ordinary palette files: read them to see how a theme is
-written, change them, or delete the ones you do not want. Spotifast never
-rewrites them, and a deleted one stays deleted; `.installed-palettes` in
-the folder records which it has already put there.
-
-To make your own, add JSON files to the `themes` folder.
-Run `spotifast reload-themes` if the app is already open, then select it
-under **Settings → Appearance → Theme**, where it is listed by its filename
-without `.json`.
-The default is **Follow system**. It uses your desktop’s light/dark appearance,
-or the current Omarchy palette on an Omarchy desktop. On Linux,
-the light/dark appearance comes from the desktop portal's `color-scheme`
-setting (GNOME, KDE and Flatpak), and since 0.10.0, the app follows
-it when it changes. Saved Dark,
-Light and custom choices are preserved when updating. The picker starts with
-**Follow system**, **Light**, and **Dark**, then a separator. **Omarchy** comes
-next when the integration is available, followed by the other local palettes.
-Themes change colors and keep the app's existing fonts.
-**How to make a theme**, beside the picker, opens this section. The
-**Open themes folder** icon button beside the picker creates the folder if
-needed and opens it in your file
-manager, using the same button style as the Winamp skins folder.
-After adding or editing a JSON file on macOS or Windows, run
-`spotifast reload-themes` to refresh the list and the selected palette without
-restarting playback. Since 0.10.2, Spotifast on Linux notices changes to the
-themes folder by itself.
-Choosing a built-in theme clears the custom selection.
-Since 0.11.0, whenever the colours change (a theme picked here, Omarchy
-switching themes, or the system going light or dark), the new colours open
-from the middle of the window outwards, as Omarchy's own theme change does.
-
-For example, `themes/gruvbox.json`:
-
-```json
-{
-  "base": "dark",
-  "colors": {
-    "window": "#282828",
-    "panel": "#1d2021",
-    "surface": "#32302f",
-    "text": "#ebdbb2",
-    "accent": "#b8bb26"
-  }
-}
-```
-
-`base` is `dark` (the default) or `light`. Omitted colors inherit that palette.
-Supported colors are `window`, `panel`, `surface`, `surface_hover`,
-`surface_active`, `outline`, `text`, `secondary`, `dim`, `accent`,
-`accent_hover`, `on_accent`, `danger`, `warning`, `overlay`, and `shadow`.
-Values must be `#RRGGBB` or `#RRGGBBAA`.
-
-Files are read in the background at launch and when `spotifast reload-themes`
-is called. The command updates the selected palette without interrupting
-playback, changing your selection or showing the window. It does not start a
-stopped app. Repeated requests are combined while a scan is running. On Linux,
-filesystem notifications for the themes folder and Omarchy's current theme
-start the same reload, with no polling timer. Use regular UTF-8 `.json` files, not symbolic links or
-subdirectories. Each file is limited to 64 KiB. Keep at most 128 JSON files and
-512 total entries in the themes folder; the saved selection is still checked
-when a folder exceeds these limits.
-
-Invalid files are skipped with a warning in the log. Spotifast remembers the
-last accepted custom palette in `settings.json`. If the selected file is
-removed or becomes invalid, that appearance stays in place, including after
-a restart, and the Theme row explains the problem. Other preferences are
-preserved. A custom selection without any usable cached colors uses the
-built-in choice. Choosing Dark, Light or Follow system clears the custom
-selection and its cache. Editing or deleting the optional cache does not
-reset unrelated settings.
-
-A custom palette's `base` controls both its inherited colors and the light or
-dark styling of standard controls. Album-art tinting remains an independent
-setting; turn it off for fixed colors throughout. Palettes apply to the main
-window; Winamp skins remain separate. This first format controls colors only.
-
-### Follow an Omarchy theme
-
-Since 0.8.0, native Linux packages include the Omarchy integration.
-The first normal launch on an Omarchy desktop installs its template and
-theme-change hook in your user configuration, in the background. No copy
-commands or desktop restart are needed. A palette for the current theme is
-prepared without reapplying your desktop theme. New installations use
-**Follow system**, so Omarchy colours apply automatically on the first launch
-and track later theme changes. An existing explicit Dark, Light or custom
-choice stays selected. Choose **Follow system** or **Omarchy** under
-**Settings → Appearance → Theme** to follow Omarchy instead.
-
-Since 0.10.2, portable archives and Cargo builds follow Omarchy too: Spotifast
-reads the palette Omarchy rendered for it, or renders the template itself from
-the current theme's colours, and picks up theme changes without the hook.
-
-Setup never replaces an existing template, hook or palette, and never changes
-your selected theme. Other users are set up independently when they launch the
-app. Demo mode, portable archives and Cargo builds do not install the template
-or hook. A package uninstall removes the shared integration assets; your user
-configuration remains, like the rest of your preferences.
-
-For a manual installation, the repository includes an
-[Omarchy template](https://github.com/crmne/spotifast/blob/main/contrib/omarchy/spotifast.json.tpl)
-and a [theme-change hook](https://github.com/crmne/spotifast/blob/main/contrib/omarchy/spotifast-theme).
-Omarchy resolves its light/dark mode and colors through its
-[template system](https://omarchy.org/manual/making-your-own-theme/).
-The hook copies the result atomically into `themes/omarchy.json`, then asks a
-running Spotifast to reload it. It does not change your desktop theme or your
-Spotifast selection itself.
-
-For portable or Cargo installations, install the two files from a checkout:
-
-```sh
-mkdir -p ~/.config/omarchy/themed
-install -m 644 contrib/omarchy/spotifast.json.tpl ~/.config/omarchy/themed/
-omarchy hook install theme-set contrib/omarchy/spotifast-theme
-```
-
-Apply a theme through Omarchy's theme picker, then select **Omarchy** in
-Spotifast's **Settings → Appearance → Theme** once. Later Omarchy changes update
-that palette while music keeps playing. Turn off album-art tinting if every
-page should keep the theme's fixed colors.
-
-The hook uses Omarchy's current theme at
-`~/.local/state/omarchy/current/theme` and Spotifast's existing
-`${XDG_CONFIG_HOME:-~/.config}/spotifast/themes` directory. The shipped hook
-is updated automatically if its contents have not been customized. A custom profile can set
-`SPOTIFAST_THEMES_DIR` in the installed hook; this example uses the native
-`spotifast` command, not a Flatpak launcher. Themes without `colors.toml` need
-their own `spotifast.json` file. Missing or invalid palettes leave the last
-accepted appearance in place.
-
-To stop following Omarchy, choose Dark, Light or another custom theme in Spotifast.
-For a manual installation, remove only
-`~/.config/omarchy/hooks/theme-set.d/spotifast-theme` and
-`~/.config/omarchy/themed/spotifast.json.tpl`. Other hooks remain in place.
-Packaged launches recreate missing integration files. To disable the hook
-while keeping the package installed, leave that hook file empty instead;
-existing user files are preserved. Selecting Dark or Light is sufficient to stop following Omarchy's colors.
+This fork has a fixed dark interface. The old theme, skin, visualizer and
+equalizer settings are ignored when loading and omitted when saving. Music
+preferences, account state and window geometry continue to load normally.

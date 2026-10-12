@@ -98,11 +98,7 @@ pub(super) fn paint_cover_with_thumbnail(
         });
     if !loaded {
         let painter = ui.painter();
-        let fill = if palette.dark {
-            palette.surface_hover
-        } else {
-            palette.surface_active
-        };
+        let fill = palette.surface_hover;
         if radius >= rect.width() / 2.0 - 0.5 {
             painter.circle_filled(rect.center(), rect.width() / 2.0, fill);
         } else {
@@ -182,10 +178,7 @@ fn paint_cover_texture(
 }
 
 /// A soft drop shadow under a cover or card.
-pub fn paint_shadow(ui: &Ui, palette: &Palette, rect: Rect, radius: f32) {
-    if !palette.dark {
-        return;
-    }
+pub fn paint_shadow(ui: &Ui, _palette: &Palette, rect: Rect, radius: f32) {
     let shadow = egui::epaint::Shadow {
         offset: [0, 10],
         blur: 28,
@@ -1345,9 +1338,7 @@ fn track_row_contents(
         ui.painter().rect_filled(
             rect,
             CornerRadius::same(6),
-            palette
-                .surface_hover
-                .gamma_multiply(if palette.dark { 0.7 } else { 1.0 }),
+            palette.surface_hover.gamma_multiply(0.7),
         );
     }
     // The row highlight also shows keyboard focus. Do not add an outline
@@ -2370,9 +2361,7 @@ pub fn card(
             ui.painter().rect_filled(
                 rect,
                 CornerRadius::same(theme::RADIUS),
-                palette
-                    .surface_hover
-                    .gamma_multiply(if palette.dark { 0.8 } else { 1.0 }),
+                palette.surface_hover.gamma_multiply(0.8),
             );
         }
         let image_rect = Rect::from_min_size(rect.min + vec2(PAD, PAD), Vec2::splat(image_size));
@@ -2692,11 +2681,7 @@ pub fn thin_slider(
             || response.dragged()
             || dragging_value.is_some();
         let bar = Rect::from_center_size(rect.center(), vec2(rect.width(), 4.0));
-        let track_color = if palette.dark {
-            Color32::from_white_alpha(50)
-        } else {
-            Color32::from_black_alpha(40)
-        };
+        let track_color = Color32::from_white_alpha(50);
         ui.painter().rect_filled(bar, 2.0, track_color);
         let filled = Rect::from_min_max(
             bar.min,
@@ -2929,28 +2914,6 @@ pub fn switch(ui: &mut Ui, palette: &Palette, label: &str, on: &mut bool) -> egu
 }
 
 /// The author's website, linked from the credit line.
-pub const AUTHOR_URL: &str = "https://paolino.me";
-
-/// "Built with love by Carmine Paolino", with the name linking to
-/// [`AUTHOR_URL`]. Returns whether the name was clicked.
-pub fn credit(ui: &mut Ui, palette: &Palette, locale: Locale) -> bool {
-    // Translators: {name} is replaced by the author's name, shown as a link.
-    let sentence = gettext(locale, "Built with love by {name}");
-    let (before, after) = sentence.split_once("{name}").unwrap_or((&sentence, ""));
-    let mut clicked = false;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        theme::text(ui, "\u{2665}  ", theme::regular(13.0), palette.danger);
-        theme::text(ui, before, theme::regular(13.0), palette.secondary);
-        clicked = theme::link(ui, "Carmine Paolino", theme::medium(13.0), palette.text)
-            .on_hover_text(AUTHOR_URL)
-            .clicked();
-        if !after.is_empty() {
-            theme::text(ui, after, theme::regular(13.0), palette.secondary);
-        }
-    });
-    clicked
-}
 
 /// The width a settings row keeps for its control: switches, fields and
 /// buttons fit in it.
@@ -3767,7 +3730,8 @@ mod tests {
 
     #[test]
     fn track_row_selection_preserves_transparency_and_focus_without_an_outline() {
-        for mut palette in [Palette::dark(), Palette::light()] {
+        {
+            let mut palette = Palette::dark();
             // A vivid custom accent must not tint a selected row either.
             palette.accent = Color32::from_rgb(255, 0, 90);
             for (picked, focused) in [(true, false), (true, true), (false, true)] {
@@ -3839,9 +3803,7 @@ mod tests {
                             .secondary
                             .gamma_multiply(if focused { 0.30 } else { 0.20 })
                     } else {
-                        palette
-                            .surface_hover
-                            .gamma_multiply(if palette.dark { 0.7 } else { 1.0 })
+                        palette.surface_hover.gamma_multiply(0.7)
                     }]
                 );
                 if focused {

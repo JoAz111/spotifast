@@ -1,64 +1,45 @@
 ---
 title: Privacy
-description: What Spotifast stores on your computer, what it sends and to whom, and what it never collects.
+description: Local storage and outbound connections in this Soloist fork.
 nav_order: 4
 ---
 
-Spotifast is a desktop app that runs entirely on your computer. It has no
-account of its own, no server, no telemetry, no analytics, and no advertising.
-Its author receives nothing about you or how you use it.
+This fork runs locally. Source review found no analytics SDK, telemetry uploader,
+crash-report upload, advertising service, or hosted Spotifast backend. Logs stay
+on the Mac. This is a source-review conclusion, not proof about every packet or
+the internals of Spotify's closed-source Soloist executable.
 
-This page covers the Spotifast app, version 0.8.0 and later. Earlier versions
-kept sign-ins in files instead of the system credential store; update to a
-current release.
+## Local storage
 
-## What stays on your computer
+Spotify authorization grants and the Soloist key use macOS Keychain. Spotify
+passwords are entered on Spotify's website. Settings, library/history snapshots,
+artwork and Spotify lyrics are local. The receiver has a separate private
+Application Support profile for its installation, pairing state and audio cache.
+Never share that profile. Sign out removes the client authorization; resetting
+receiver pairing is a separate operation.
 
-- **Spotify sign-ins.** The grants Spotify issues when you sign in, and the
-  reusable playback credential, are kept in the system credential store:
-  Credential Manager on Windows, Keychain on macOS, and Secret Service on
-  Linux. Your Spotify password never passes through Spotifast; you sign in
-  on Spotify's own pages. A proxy password, if you set one, uses the same
-  store.
-- **Settings and history.** Settings, window positions, recent plays, the
-  last session, skins, themes and MilkDrop presets live in the config
-  directory.
-- **Caches.** Downloaded audio, artwork, lyrics and library metadata live in
-  the cache directory and can be deleted at any time.
-- **Log.** `spotifast.log` records errors and diagnostics. It stays on your
-  computer and never contains credentials; share it only if you choose to
-  attach it to a bug report.
+The developer Client ID is loaded at build time from the ignored local file
+`.private/spotify-client-id`. It is embedded in the local executable, not tracked
+source. A Client Secret is neither required nor accepted. A build without a local
+ID cannot silently fall back to the upstream registration.
 
-[Settings & Files](/settings-and-files/) lists every location and what is safe
-to delete. **Sign out** in Settings removes the stored credentials.
+## Outbound connections
 
-## What is sent, and to whom
+| Destination | Trigger and information |
+| --- | --- |
+| Spotify accounts/API/services | Sign-in, search, library, playlists, music metadata, lyrics and playback control under your Spotify account. |
+| Spotify artwork CDNs (`scdn.co`, `spotifycdn.com` and subdomains) | Visible/prefetched artwork. Other artwork hosts are refused. The shared asynchronous HTTP client does not follow redirects. |
+| Local Spotify Connect receivers | mDNS discovery and explicit pairing/control. The owned Soloist control socket is local and owner-only. |
+| GitHub (`api.github.com`, `github.com`, release asset hosts) | Optional update checks/downloads from `JoAz111/spotifast`, the user's fork. Automatic checks/downloads default off; existing preferences can be disabled in Settings. No listening metadata is attached by the updater. |
+| Configured proxy | If enabled, requests follow your proxy preference. The proxy operator can observe traffic appropriate to that proxy. |
 
-Spotifast connects only to the services below.
+The LRCLIB fallback was removed. Opening lyrics no longer sends song artist,
+title, album or duration to a third-party lyrics service. Skin/preset downloaders
+were removed along with Winamp and MilkDrop. Fonts and icons are bundled.
 
-- **Spotify.** Sign-in, your library, search, playlists, playback and Spotify
-  Connect all go to Spotify, under your account. Spotify's own
-  [privacy policy](https://www.spotify.com/legal/privacy-policy/) applies to
-  that data.
-- **LRCLIB.** When the lyrics panel is open and Spotify has no lyrics for the
-  song, Spotifast sends its artist, title, album and length to
-  [lrclib.net](https://lrclib.net). Nothing identifying you is included.
-- **GitHub.** Once a day, Spotifast asks GitHub for the latest release. You
-  can turn automatic checks off in Settings. Downloading an update, and the
-  first opening of MilkDrop, also fetch files from GitHub. No Spotify data is
-  sent.
-- **Your local network.** Spotifast looks for Spotify Connect speakers over
-  mDNS and talks to the ones you choose.
+Links deliberately opened in your browser are separate from background app
+traffic. Spotify controls its own service and CDN infrastructure and may use
+infrastructure providers; this source review is not a server-ownership guarantee.
 
-Links you open from the app, such as the Winamp Skin Museum or this website,
-open in your browser.
-
-## This website
-
-spotifast.rocks counts page visits with [Plausible](https://plausible.io/data-policy),
-which uses no cookies and collects no personal data. The app itself contains
-no analytics.
-
-## Questions
-
-Ask on [GitHub](https://github.com/crmne/spotifast/issues).
+Cargo, package managers and build scripts contact dependency registries and
+source/download hosts during development. Those are not music-client telemetry.

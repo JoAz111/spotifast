@@ -21,7 +21,6 @@ const SPINNER_SIZE: f32 = 15.0;
 /// A badge is as tall as its text plus this, and as wide as its text plus
 /// the padding its own label needs.
 const BADGE_PADDING_Y: f32 = 12.0;
-const DEVICE_BADGE_PADDING: f32 = 28.0;
 /// The text starts 24 px in; leave 8 px after it to match the space before
 /// the icon.
 const UPDATE_BADGE_PADDING: f32 = 32.0;
@@ -53,7 +52,7 @@ fn lead_id() -> egui::Id {
 
 /// The narrowest the bar, and so the page under it, can be before its
 /// controls run into each other: the narrowest field, with the spinner and
-/// both badges as icons. Counting them even while they are away keeps the
+/// the update badge as an icon. Counting them even while they are away keeps the
 /// panels and the window from changing width as they come and go.
 pub fn least_width(ctx: &egui::Context) -> f32 {
     let lead = ctx
@@ -67,7 +66,8 @@ fn least_width_after(lead: f32) -> f32 {
         + RIGHT_CONTROLS_WIDTH
         + SPINNER_SIZE
         + ITEM_SPACING
-        + 2.0 * (ITEM_SPACING + BADGE_CHIP)
+        + ITEM_SPACING
+        + BADGE_CHIP
 }
 
 /// How the top bar divides itself for one window width.
@@ -170,11 +170,7 @@ fn nav_button(
         },
     );
     if ui.is_rect_visible(rect) {
-        let fill = if palette.dark {
-            egui::Color32::from_black_alpha(90)
-        } else {
-            egui::Color32::from_black_alpha(20)
-        };
+        let fill = egui::Color32::from_black_alpha(90);
         ui.painter().circle_filled(rect.center(), 16.0, fill);
         let color = if !enabled {
             palette.dim
@@ -275,17 +271,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 
             // The badges sit at the right end but grow with their text, so
             // measure them here, before the search field takes its share.
-            let device_galley = app.now_playing().filter(|now| !now.local).map(|now| {
-                let label = match now.device_name {
-                    Some(device) => {
-                        // Translators: {device} is the name of the device playing the music.
-                        gettext(locale, "Playing on {device}").replace("{device}", &device)
-                    }
-                    None => gettext(locale, "Playing on another device").into_owned(),
-                };
-                ui.painter()
-                    .layout_no_wrap(label, theme::medium(12.5), palette.accent)
-            });
             let update = app.update.clone();
             let update_galley = update.as_ref().map(|update| {
                 let label = match &app.update_download {
@@ -309,10 +294,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 .backend
                 .activity()
                 .busy(std::time::Duration::from_millis(1000));
-            let badges = |labels: bool| {
-                badge_width(device_galley.as_ref(), DEVICE_BADGE_PADDING, labels)
-                    + badge_width(update_galley.as_ref(), UPDATE_BADGE_PADDING, labels)
-            };
+            let badges =
+                |labels: bool| badge_width(update_galley.as_ref(), UPDATE_BADGE_PADDING, labels);
             let controls = RIGHT_CONTROLS_WIDTH
                 + if !app.network_reachable {
                     ICON_BUTTON_SIZE + 4.0
@@ -487,15 +470,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         ui.allocate_exact_size(Vec2::splat(ICON_BUTTON_SIZE), Sense::hover());
                     if ui.is_rect_visible(rect) {
                         let fill = if response.hovered() {
-                            if palette.dark {
-                                egui::Color32::from_rgb(38, 110, 205)
-                            } else {
-                                egui::Color32::from_rgb(66, 133, 244)
-                            }
-                        } else if palette.dark {
-                            egui::Color32::from_rgb(28, 92, 178)
+                            egui::Color32::from_rgb(38, 110, 205)
                         } else {
-                            egui::Color32::from_rgb(41, 121, 255)
+                            egui::Color32::from_rgb(28, 92, 178)
                         };
                         ui.painter().circle_filled(rect.center(), 14.5, fill);
                         theme::paint_icon(
@@ -524,67 +501,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 {
                     app.actions.push(Action::Open(Page::Settings));
                 }
-                if theme::icon_button(
-                    ui,
-                    Icon::AudioLines,
-                    ICON_BUTTON_ICON,
-                    if app.settings.milkdrop_open {
-                        palette.accent
-                    } else {
-                        palette.secondary
-                    },
-                    palette.text,
-                    super::keys::platform_shortcut(
-                        &gettext(locale, "MilkDrop visualiser (Ctrl+Shift+K)"),
-                        &gettext(locale, "MilkDrop visualiser (Cmd+Shift+K)"),
-                    ),
-                )
-                .clicked()
-                {
-                    app.actions.push(Action::ToggleWinampMilkdrop);
-                }
-                if theme::icon_button(
-                    ui,
-                    Icon::Shrink,
-                    ICON_BUTTON_ICON,
-                    palette.secondary,
-                    palette.text,
-                    super::keys::platform_shortcut(
-                        &gettext(locale, "Winamp mini player (Ctrl+M)"),
-                        &gettext(locale, "Winamp mini player (Cmd+Shift+M)"),
-                    ),
-                )
-                .clicked()
-                {
-                    app.actions.push(Action::ToggleWinampWindow);
-                }
                 // A quiet spinner once the app has been talking to Spotify for a
                 // while, long enough that fast requests never flash it.
                 if busy {
                     theme::spinner(ui, SPINNER_SIZE, palette.secondary)
                         .on_hover_text(gettext(locale, "Waiting for Spotify…").as_ref());
-                }
-                // Where playback is.
-                if let Some(galley) = device_galley {
-                    let device = galley.text().to_owned();
-                    let response = badge(
-                        ui,
-                        &palette,
-                        Icon::Speaker,
-                        galley,
-                        DEVICE_BADGE_PADDING,
-                        fit.labels,
-                    );
-                    // Without its label the badge still has to say where
-                    // playback went.
-                    let response = if fit.labels {
-                        response
-                    } else {
-                        response.on_hover_text(device)
-                    };
-                    if response.clicked() {
-                        app.actions.push(Action::ToggleDevicesPopup);
-                    }
                 }
                 // A newer release. Most people never visit a releases page,
                 // so the app says so, quietly, until they do.
@@ -623,9 +544,7 @@ fn capitalize(text: &str) -> String {
 mod topbar_fit_tests {
     use super::*;
 
-    // What the badges measure on a bar showing "Playing on MacBook de Luis"
-    // and "Update to 0.7.1", each including the spacing before it.
-    const DEVICE: f32 = ITEM_SPACING + 176.0;
+    // The update badge's measured width, including the spacing before it.
     const UPDATE: f32 = ITEM_SPACING + 152.0;
     // Collapsed, a badge is a square chip as tall as its text.
     const CHIP: f32 = ITEM_SPACING + 15.0 + BADGE_PADDING_Y;
@@ -642,7 +561,7 @@ mod topbar_fit_tests {
 
     #[test]
     fn a_wide_bar_keeps_the_field_it_always_had() {
-        let fit = topbar_fit(2000.0, RIGHT_CONTROLS_WIDTH, DEVICE + UPDATE, CHIP * 2.0);
+        let fit = topbar_fit(2000.0, RIGHT_CONTROLS_WIDTH, UPDATE, CHIP);
         assert_eq!(fit.search, SEARCH_MAX);
         assert!(fit.labels);
         // Half the room, as before, while half still fits.
@@ -654,12 +573,7 @@ mod topbar_fit_tests {
     fn the_right_end_never_reaches_over_the_search_field() {
         let mut room = NARROWEST_BAR;
         while room <= 2400.0 {
-            for (labelled, icons) in [
-                (0.0, 0.0),
-                (DEVICE, CHIP),
-                (UPDATE, CHIP),
-                (DEVICE + UPDATE, CHIP * 2.0),
-            ] {
+            for (labelled, icons) in [(0.0, 0.0), (UPDATE, CHIP), (UPDATE, CHIP)] {
                 let over = right_end(room, labelled, icons);
                 assert!(
                     over <= 0.0,
@@ -672,39 +586,39 @@ mod topbar_fit_tests {
 
     #[test]
     fn a_right_panel_can_narrow_search_after_the_badges_collapse() {
-        let room = RIGHT_CONTROLS_WIDTH + CHIP * 2.0 + 100.0;
-        let fit = topbar_fit(room, RIGHT_CONTROLS_WIDTH, DEVICE + UPDATE, CHIP * 2.0);
+        let room = RIGHT_CONTROLS_WIDTH + CHIP + 100.0;
+        let fit = topbar_fit(room, RIGHT_CONTROLS_WIDTH, UPDATE, CHIP);
         assert!(!fit.labels);
         assert_eq!(fit.search, 100.0);
-        assert_eq!(right_end(room, DEVICE + UPDATE, CHIP * 2.0), 0.0);
+        assert_eq!(right_end(room, UPDATE, CHIP), 0.0);
     }
 
     #[test]
     fn a_narrow_bar_trades_the_badge_labels_for_their_icons() {
-        assert!(topbar_fit(1400.0, RIGHT_CONTROLS_WIDTH, DEVICE, CHIP).labels);
+        assert!(topbar_fit(1400.0, RIGHT_CONTROLS_WIDTH, UPDATE, CHIP).labels);
         // The 1080 px window of the report that started this.
-        assert!(topbar_fit(952.0, RIGHT_CONTROLS_WIDTH, DEVICE + UPDATE, CHIP * 2.0).labels);
-        assert!(!topbar_fit(NARROWEST_BAR, RIGHT_CONTROLS_WIDTH, DEVICE, CHIP).labels);
+        assert!(topbar_fit(952.0, RIGHT_CONTROLS_WIDTH, UPDATE, CHIP).labels);
+        assert!(!topbar_fit(NARROWEST_BAR, RIGHT_CONTROLS_WIDTH, UPDATE, CHIP).labels);
     }
 
     /// At the least width the panels leave it, the bar still holds the
-    /// spinner and both badges beside the narrowest field (#624).
+    /// spinner and the update badge beside the narrowest field (#624).
     #[test]
     fn the_least_width_holds_every_control_beside_the_field() {
         let lead = LEAD_GUESS;
         let room = least_width_after(lead) - lead;
         let controls = RIGHT_CONTROLS_WIDTH + SPINNER_SIZE + ITEM_SPACING;
-        let fit = topbar_fit(room, controls, DEVICE + UPDATE, CHIP * 2.0);
+        let fit = topbar_fit(room, controls, UPDATE, CHIP);
         assert!(!fit.labels);
         assert_eq!(fit.search, SEARCH_MIN);
-        assert!(controls + CHIP * 2.0 + fit.search <= room);
+        assert!(controls + CHIP + fit.search <= room);
     }
 
     #[test]
     fn the_field_stays_readable_however_tight_the_bar_gets() {
         let mut room = NARROWEST_BAR;
         while room <= 2400.0 {
-            let fit = topbar_fit(room, RIGHT_CONTROLS_WIDTH, DEVICE + UPDATE, CHIP * 2.0);
+            let fit = topbar_fit(room, RIGHT_CONTROLS_WIDTH, UPDATE, CHIP);
             assert!(fit.search >= SEARCH_FLOOR, "field is {} px", fit.search);
             assert!(fit.search <= SEARCH_MAX);
             room += 1.0;

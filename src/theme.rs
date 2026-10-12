@@ -1,21 +1,12 @@
 //! Shared palette, typography, icons, and base widgets.
 //!
 //! Inter provides real font weights, and Lucide provides a consistent icon set.
-//! All colors use [`Palette`] so light, dark, and album-art-tinted themes stay
-//! consistent.
+//! All colors use a single dark [`Palette`], with album-art colours for music imagery.
 
-use crate::i18n::{Locale, gettext};
 use egui::{Color32, CornerRadius, Response, Sense, Stroke, Vec2};
-use std::borrow::Cow;
 
-/// A palette file from the themes directory.
-pub type CustomTheme = fastframe_theme::CustomTheme<Palette>;
-/// The palette files, and the Omarchy palette where the desktop has one.
-pub type Catalog = fastframe_theme::Catalog<Palette>;
-
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Palette {
-    pub dark: bool,
     pub window: Color32,
     pub panel: Color32,
     pub surface: Color32,
@@ -37,7 +28,6 @@ pub struct Palette {
 impl Palette {
     pub fn dark() -> Self {
         Self {
-            dark: true,
             window: Color32::from_rgb(0x0f, 0x11, 0x14),
             panel: Color32::from_rgb(0x15, 0x18, 0x1c),
             surface: Color32::from_rgb(0x1d, 0x21, 0x27),
@@ -57,35 +47,13 @@ impl Palette {
         }
     }
 
-    pub fn light() -> Self {
-        Self {
-            dark: false,
-            window: Color32::from_rgb(0xf8, 0xf9, 0xfb),
-            panel: Color32::from_rgb(0xff, 0xff, 0xff),
-            surface: Color32::from_rgb(0xee, 0xf0, 0xf3),
-            surface_hover: Color32::from_rgb(0xe3, 0xe6, 0xeb),
-            surface_active: Color32::from_rgb(0xd7, 0xdb, 0xe1),
-            outline: Color32::from_rgb(0xdd, 0xe1, 0xe6),
-            text: Color32::from_rgb(0x14, 0x17, 0x1a),
-            secondary: Color32::from_rgb(0x53, 0x5b, 0x66),
-            dim: Color32::from_rgb(0x8b, 0x93, 0x9e),
-            accent: Color32::from_rgb(0x15, 0xa6, 0x4a),
-            accent_hover: Color32::from_rgb(0x12, 0x8f, 0x40),
-            on_accent: Color32::WHITE,
-            danger: Color32::from_rgb(0xd6, 0x3b, 0x4c),
-            warning: Color32::from_rgb(0xb8, 0x7a, 0x14),
-            overlay: Color32::from_rgb(0xff, 0xff, 0xff),
-            shadow: Color32::from_black_alpha(50),
-        }
-    }
-
     /// A colour derived from album art, softened so it can sit behind text.
     pub fn tint_from_art(&self, rgb: [u8; 3]) -> Color32 {
         let [r, g, b] = rgb.map(|c| c as f32 / 255.0);
         let max = r.max(g).max(b);
         let min = r.min(g).min(b);
         let lightness = (max + min) / 2.0;
-        let target = if self.dark { 0.30 } else { 0.72 };
+        let target = 0.30;
         let (r, g, b) = if lightness < 0.01 {
             (target, target, target)
         } else {
@@ -97,91 +65,6 @@ impl Palette {
             )
         };
         Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
-    }
-}
-
-impl fastframe_theme::Palette for Palette {
-    fn base(base: fastframe_theme::Base) -> Self {
-        match base {
-            fastframe_theme::Base::Dark => Self::dark(),
-            fastframe_theme::Base::Light => Self::light(),
-        }
-    }
-
-    fn set(&mut self, name: &str, color: Color32) -> bool {
-        match name {
-            "window" => self.window = color,
-            "panel" => self.panel = color,
-            "surface" => self.surface = color,
-            "surface_hover" => self.surface_hover = color,
-            "surface_active" => self.surface_active = color,
-            "outline" => self.outline = color,
-            "text" => self.text = color,
-            "secondary" => self.secondary = color,
-            "dim" => self.dim = color,
-            "accent" => self.accent = color,
-            "accent_hover" => self.accent_hover = color,
-            "on_accent" => self.on_accent = color,
-            "danger" => self.danger = color,
-            "warning" => self.warning = color,
-            "overlay" => self.overlay = color,
-            "shadow" => self.shadow = color,
-            _ => return false,
-        }
-        true
-    }
-}
-
-/// Adds the desktop's palettes to a normal launch: the eight shared palettes,
-/// installed into the themes folder as files on the first launch, and
-/// Omarchy's on Linux, with the packaged template and hook installed for the
-/// user.
-pub fn enable_desktop_themes(catalog: &mut Catalog) {
-    catalog.enable_desktop_themes(fastframe_theme::DesktopThemes {
-        slug: "spotifast",
-        omarchy_template: include_str!("../contrib/omarchy/spotifast.json.tpl"),
-        // The template has not changed since it first shipped.
-        omarchy_previous_templates: &[],
-        presets: true,
-    });
-}
-
-/// The status line under the Theme setting, empty when all is well.
-pub fn catalog_detail(
-    catalog: &Catalog,
-    locale: Locale,
-    selected: Option<&str>,
-) -> Cow<'static, str> {
-    use fastframe_theme::{Problem, Status};
-    let Some(status) = catalog.status(selected) else {
-        return Cow::Borrowed("");
-    };
-    match status {
-        Status::Loading => gettext(locale, "Loading local themes…"),
-        Status::SelectedUnavailable => gettext(
-            locale,
-            "The selected theme is unavailable. Keeping the last usable appearance. See the log for details.",
-        ),
-        Status::Problem(Problem::Unreadable) => gettext(
-            locale,
-            "The themes folder could not be read. See the log for details.",
-        ),
-        Status::Problem(Problem::TooManyEntries) => gettext(
-            locale,
-            "The themes folder has more than 512 entries. Keep fewer files there to list the custom palettes.",
-        ),
-        Status::Problem(Problem::TooManyThemes) => gettext(
-            locale,
-            "Only 128 custom palettes can be listed. Keep fewer JSON files in the themes folder to see the rest.",
-        ),
-        Status::Problem(Problem::OmarchyUnreadable) => gettext(
-            locale,
-            "The Omarchy palette could not be loaded. Keeping the last usable appearance. See the log for details.",
-        ),
-        Status::Problem(_) => gettext(
-            locale,
-            "Custom themes could not be loaded. Run spotifast reload-themes to try again.",
-        ),
     }
 }
 
@@ -247,6 +130,8 @@ pub fn text_rendering() -> fastframe_text::TextRendering {
 pub fn install(ctx: &egui::Context) {
     install_fonts(ctx);
     egui_extras::install_image_loaders(ctx);
+    #[cfg(any(test, feature = "demo"))]
+    crate::demo::install_art(ctx);
     fastframe_icons::install::<Icon>(ctx);
     // Colour emoji over every text egui draws (see `crate::emoji`).
     ctx.add_plugin(fastframe_emoji::EmojiPlugin::default());
@@ -267,14 +152,10 @@ pub fn apply_local(ui: &mut egui::Ui, palette: &Palette) {
 
 fn apply_to_style(style: &mut egui::Style, palette: &Palette) {
     let visuals = &mut style.visuals;
-    *visuals = if palette.dark {
-        egui::Visuals::dark()
-    } else {
-        egui::Visuals::light()
-    };
-    visuals.dark_mode = palette.dark;
+    *visuals = egui::Visuals::dark();
+    visuals.dark_mode = true;
     // Glyph coverage, hinting and sub-pixel positions as the desktop draws
-    // them: linear coverage in both themes on Linux, where egui's dark curve
+    // them: linear coverage in dark mode on Linux, where egui's dark curve
     // (2c - c²) made text heavier than GTK's.
     text_rendering().apply_to_visuals(visuals);
     visuals.panel_fill = palette.panel;
@@ -931,62 +812,18 @@ mod tests {
         output.textures_delta.clear();
     }
 
-    /// Palette files name the sixteen colours every app shares, and only
-    /// those: a typo is an invalid file, not an ignored colour.
-    #[test]
-    fn palette_files_set_every_base_colour() {
-        use fastframe_theme::Palette as _;
-        for name in fastframe_theme::BASE_COLORS {
-            let mut palette = Palette::dark();
-            assert!(palette.set(name, Color32::from_rgb(1, 2, 3)), "{name}");
-            assert_ne!(palette, Palette::dark(), "{name}");
-        }
-        assert!(!Palette::dark().set("typo", Color32::RED));
-        let light: Palette =
-            fastframe_theme::parse_palette(r##"{"base":"light","colors":{"accent":"#8c3fa5"}}"##)
-                .unwrap();
-        assert!(!light.dark);
-        assert_eq!(light.accent, Color32::from_rgb(140, 63, 165));
-        assert_eq!(light.window, Palette::light().window);
-    }
-
-    /// Compared line by line: a Windows checkout may turn the files' line
-    /// endings into CRLF, which no Linux package ships.
-    #[test]
-    fn the_shipped_omarchy_files_are_the_shared_ones() {
-        let lines = |text: &str| text.replace("\r\n", "\n");
-        assert_eq!(
-            lines(include_str!("../contrib/omarchy/spotifast-theme")),
-            lines(&fastframe_theme::omarchy::hook_script("spotifast"))
-        );
-        assert_eq!(
-            lines(include_str!("../contrib/omarchy/spotifast.json.tpl")),
-            lines(fastframe_theme::omarchy::BASE_TEMPLATE)
-        );
-    }
-
-    #[test]
-    fn every_catalog_problem_has_a_sentence() {
-        let catalog = Catalog::default();
-        assert_eq!(catalog_detail(&catalog, Locale::English, None), "");
-        assert!(
-            catalog_detail(&catalog, Locale::English, Some("gone.json")).contains("last usable")
-        );
-    }
-
     /// A palette replaces egui's visuals, which must not take back the
-    /// desktop's text rendering: on Linux, linear coverage in both themes.
+    /// desktop's text rendering: on Linux, linear coverage in dark mode.
     #[test]
     fn palettes_keep_the_desktops_text_rendering() {
-        for palette in [Palette::dark(), Palette::light()] {
+        {
+            let palette = Palette::dark();
             let ctx = egui::Context::default();
             apply(&ctx, &palette);
             let options = ctx.global_style().visuals.text_options;
             assert_eq!(
                 options.color_transfer_function,
-                text_rendering().color_transfer_function(palette.dark),
-                "dark: {}",
-                palette.dark
+                text_rendering().color_transfer_function(true)
             );
             if cfg!(target_os = "linux") {
                 assert_eq!(
@@ -1035,7 +872,9 @@ mod tests {
     #[test]
     fn a_local_palette_keeps_spotifasts_widget_style_local() {
         let ctx = egui::Context::default();
-        apply(&ctx, &Palette::light());
+        let mut global = Palette::dark();
+        global.accent = Color32::RED;
+        apply(&ctx, &global);
         let dark = Palette::dark();
         let mut output = ctx.run_ui(Default::default(), |ui| {
             apply_local(ui, &dark);
@@ -1052,7 +891,10 @@ mod tests {
             assert_eq!(style.spacing.button_padding, Vec2::new(12.0, 6.0));
         });
         output.textures_delta.clear();
-        assert!(!ctx.global_style().visuals.dark_mode);
+        assert_eq!(
+            ctx.global_style().visuals.selection.stroke.color,
+            Color32::RED
+        );
     }
 
     #[test]

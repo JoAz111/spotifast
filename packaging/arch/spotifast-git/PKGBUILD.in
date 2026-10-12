@@ -8,10 +8,7 @@ url="https://github.com/crmne/spotifast"
 license=('MIT')
 install="${pkgname}.install"
 depends=('dbus' 'alsa-lib' 'libpulse' 'libglvnd' 'libxkbcommon' 'wayland' 'libx11')
-# MilkDrop builds libprojectM from source at compile time: cmake drives
-# that build, and clang carries the libclang bindgen reads its headers
-# with. Build with --no-default-features to leave the visualiser out.
-makedepends=('git' 'cargo' 'cmake' 'clang')
+makedepends=('git' 'cargo')
 optdepends=('libxkbcommon-x11: keyboard handling in X11 sessions'
             'pipewire-pulse: PipeWire as the PulseAudio server')
 provides=("spotifast=$pkgver")
@@ -68,6 +65,4 @@ package() {
     "${pkgdir}/usr/share/applications/spotifast.desktop"
   install -Dm644 "packaging/icons/spotifast.svg" \
     "${pkgdir}/usr/share/icons/hicolor/scalable/apps/spotifast.svg"
-  install -Dm644 contrib/omarchy/spotifast.json.tpl "${pkgdir}/usr/share/spotifast/omarchy/spotifast.json.tpl"
-  install -Dm755 contrib/omarchy/spotifast-theme "${pkgdir}/usr/share/spotifast/omarchy/spotifast-theme"
 }

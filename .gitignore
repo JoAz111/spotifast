@@ -13,3 +13,6 @@ docs/.bundle/
 /.cache/
 
 /dist/
+
+# Machine-local Spotify application identity. Never publish.
+/.private/

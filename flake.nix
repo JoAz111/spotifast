@@ -46,10 +46,6 @@
               (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
               rust-analyzer
               pkg-config
-              # libprojectM (MilkDrop) is built from source by CMake, and its
-              # bindings by bindgen, which needs libclang.
-              cmake
-              rustPlatform.bindgenHook
             ]
             ++ lib.optionals stdenv.hostPlatform.isDarwin [
               apple-sdk
@@ -122,22 +118,10 @@
                 src = self;
                 hash = "sha256-vyoNsgfxM5lTFeQ+VZOrX9U1HHkn/wfngkc46Z8XEjA=";
               };
-              # projectm-sys only searches lib, while CMake may otherwise install to lib64.
-              postPatch = ''
-                substituteInPlace "$cargoDepsCopy"/source-git-*/projectm-sys-*/build.rs \
-                  --replace-fail \
-                  '.define("BUILD_SHARED_LIBS", build_shared_libs)' \
-                  '.define("CMAKE_INSTALL_LIBDIR", "lib").define("BUILD_SHARED_LIBS", build_shared_libs)'
-              '';
-
               nativeBuildInputs =
                 with pkgs;
                 [
                   pkg-config
-                  # libprojectM (MilkDrop) is built from source by CMake, and
-                  # its bindings by bindgen, which needs libclang.
-                  cmake
-                  rustPlatform.bindgenHook
                 ]
                 ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ makeWrapper ]
                 ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
@@ -153,8 +137,6 @@
                   [
                     alsa-lib
                     libpulseaudio
-                    # libprojectM links OpenGL directly and its GL loader needs
-                    # X11 headers while it is built.
                     libGL
                     libx11
                   ]
@@ -185,10 +167,6 @@
                     $out/share/applications/spotifast.desktop
                   install -Dm644 packaging/icons/spotifast.svg \
                     $out/share/icons/hicolor/scalable/apps/spotifast.svg
-                  install -Dm644 contrib/omarchy/spotifast.json.tpl \
-                    $out/share/spotifast/omarchy/spotifast.json.tpl
-                  install -Dm755 contrib/omarchy/spotifast-theme \
-                    $out/share/spotifast/omarchy/spotifast-theme
                 ''
                 + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
                   app="$out/Applications/Spotifast.app/Contents"

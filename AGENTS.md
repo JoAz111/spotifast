@@ -63,10 +63,9 @@ the story from before the user's action is stale, so hold the shown
 state and ask again rather than let the lagging answer undo what the
 user just did. Nothing the user did may ever flicker away and come back.
 
-Every visualiser, the spectrum analyser, the oscilloscope, and MilkDrop,
-shows the signal post-equalizer and pre-volume: the EQ shapes what is
-heard so the picture follows it, and the volume knob never moves the
-picture. Zero volume still dances.
+This fork has one fixed dark interface. Do not reintroduce skins, custom themes,
+visualizers, equalizers, or their settings and dependencies. Album-art colors
+remain part of music imagery, without changing the controls' appearance.
 
 ## Issue communication
 
@@ -102,7 +101,7 @@ picture. Zero volume still dances.
   interface redesign. Conditional approval to assess code quality is not
   approval of changed appearance or interaction.
 - Inspect before-and-after evidence at representative window sizes and in both
-  light and dark themes. If that evidence is missing, request it.
+  dark mode. If that evidence is missing, request it.
 - Use the HTML comparison format in `CONTRIBUTING.md` under "Visual reviews":
   matching captures, theme and size selectors, Before/After controls, and
   relevant interaction states. For a batch, provide one index with PR numbers,

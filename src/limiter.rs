@@ -1,6 +1,6 @@
 //! Look-ahead soft-knee limiter for final audio output.
 //!
-//! Equalizer and preamp boosts can exceed full scale. Hard clipping would add
+//! Normalization can exceed full scale. Hard clipping would add
 //! audible harmonics, so this limiter reduces gain before the output:
 //!
 //! - Both channels use the same gain to preserve the stereo image.

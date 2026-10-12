@@ -63,8 +63,8 @@ struct ApiProfile {
 impl ApiProfile {
     pub const SHARED: Self = Self {
         source: ApiSource::Shared,
-        search_limit: 20,
-        artist_albums_limit: 50,
+        search_limit: 10,
+        artist_albums_limit: 10,
     };
     pub const PERSONAL: Self = Self {
         source: ApiSource::Personal,

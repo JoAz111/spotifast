@@ -92,14 +92,13 @@ fn no_file_carries_the_old_name() {
 
 #[test]
 fn existing_preferences_and_custom_connect_names_survive_a_save() {
-    use spotifast::settings::{Settings, ThemeChoice};
+    use spotifast::settings::Settings;
 
     let scratch = Scratch::new();
     let path = scratch.0.join("settings.json");
     for name in ["Spotifast", "Living room", "Carmine's laptop"] {
         let saved = Settings {
             device_name: name.into(),
-            theme: ThemeChoice::Light,
             volume: 37,
             pinned_contexts: vec![
                 "spotify:playlist:123".into(),
@@ -163,9 +162,6 @@ fn the_command_forwards_links_to_the_existing_instance_on_a_private_bus() {
     }
 
     let scratch = Scratch::new();
-    let result = Command::new(COMMAND).arg("reload-themes").output().unwrap();
-    assert_eq!(result.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&result.stderr).contains("not running"));
     let result = Command::new(COMMAND).arg("like").output().unwrap();
     assert_eq!(result.status.code(), Some(1));
     assert!(
@@ -217,17 +213,6 @@ fn the_command_forwards_links_to_the_existing_instance_on_a_private_bus() {
             vec![ControlCommand::OpenLink(uri.into())]
         );
     }
-    let result = Command::new(COMMAND).arg("reload-themes").output().unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    assert_eq!(
-        std::mem::take(&mut *commands.lock().unwrap()),
-        vec![ControlCommand::ReloadThemes],
-        "a reload only asks for themes, never OpenLink or Show"
-    );
     let result = Command::new(COMMAND).arg("like").output().unwrap();
     assert!(
         result.status.success(),
